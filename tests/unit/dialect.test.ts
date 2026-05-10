@@ -6,7 +6,7 @@
  * SQL output the dialect generates for representative Cube measure/dimension
  * combinations.
  */
-import { describe } from 'vitest';
+import { describe, it } from 'vitest';
 
 describe('MongoSqlQuery dialect', () => {
   describe('identifier quoting', () => {

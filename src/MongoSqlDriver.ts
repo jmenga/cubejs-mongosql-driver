@@ -1,50 +1,309 @@
 /**
  * MongoSqlDriver — Cube data source driver for MongoDB via MongoSQL.
- * See SPEC.md FR-1 and ARCHITECTURE.md §2.1.
  *
- * Implementation arrives in T11. For now, throws Unimplemented from each method
- * to satisfy the failing-test phase of TDD.
+ * See SPEC.md FR-1 (driver protocol), FR-7 (env-var configuration), and
+ * ARCHITECTURE.md §2.1.
+ *
+ * BaseDriver method-list audit (against
+ * `@cubejs-backend/base-driver/dist/src/BaseDriver.d.ts`):
+ *
+ *  Required by DriverInterface (we override these):
+ *   - query(sql, values?, options?)        — REQUIRED, override (delegates + flattens)
+ *   - testConnection()                     — REQUIRED, override (lazy native init)
+ *   - release()                            — override (closes native client)
+ *   - tablesSchema()                       — override (delegate to native)
+ *   - downloadQueryResults(sql, ...)       — override → query() shape; we have no streaming
+ *   - capabilities()                       — override → no export bucket / streaming source
+ *   - nowTimestamp()                       — INHERIT (Date.now())
+ *
+ *  Schema-introspection helpers (BaseDriver default reads information_schema —
+ *  MongoSQL doesn't expose one, so we route to tablesSchema() / native):
+ *   - getSchemas()                         — N/A — we serve via tablesSchema()
+ *   - getTablesQuery(schema)               — N/A — runs SQL against information_schema
+ *   - getTablesForSpecificSchemas(...)     — N/A
+ *   - getColumnsForSpecificTables(...)     — N/A
+ *   - informationSchemaQuery()             — N/A (protected default)
+ *   - tableColumnTypes(table)              — INHERIT (uses query()); only needed for
+ *                                            uploadTableWithIndexes path which we reject
+ *
+ *  Mutation methods (read-only driver — explicit refusal beats silent no-op):
+ *   - createSchemaIfNotExists(schemaName)  — throw
+ *   - dropTable(tableName, options?)       — throw
+ *   - uploadTable(...)                     — throw
+ *   - uploadTableWithIndexes(...)          — throw
+ *   - createTable(...)                     — throw
+ *   - createTableRaw(...)                  — throw
+ *   - loadPreAggregationIntoTable(...)     — INHERIT default (delegates to query())
+ *                                            so partitioned/incremental pre-aggs work
+ *
+ *  Bucket-export (no MongoDB equivalent — SPEC FR-6 says EXPORT_BUCKET unsupported):
+ *   - downloadTable(...)                   — INHERIT (uses query(); fine for memory path)
+ *   - parseBucketUrl / extractFilesFromS3 / extractFilesFromGCS / extractFilesFromAzure
+ *                                          — N/A (only invoked via unload paths we don't expose)
+ *   - readOnly()                           — override → true (signals to Cube/Cube Store)
+ *
+ *  SQL-shape helpers used by Cube but irrelevant to MongoSQL (the dialect class
+ *  handles quoting; the driver does not echo SQL strings):
+ *   - quoteIdentifier(id)                  — INHERIT (default uses '"', dialect class
+ *                                            in MongoSqlQuery overrides to backticks)
+ *   - param(i)                             — INHERIT
+ *   - wrapQueryWithLimit({query, limit})   — INHERIT (mutates the object in place)
+ *
+ *  Static:
+ *   - dialectClass()                       — override → MongoSqlQuery
  */
-import { MongoSqlClient } from './native.js';
+
+import { BaseDriver } from '@cubejs-backend/base-driver';
+import type {
+  DownloadQueryResultsOptions,
+  DownloadQueryResultsResult,
+  DownloadTableData,
+  DriverCapabilities,
+  ExternalCreateTableOptions,
+  IndexesSQL,
+  QueryOptions,
+  TableColumn,
+  TableStructure,
+} from '@cubejs-backend/base-driver';
+
+import { MongoSqlClient, type TablesSchema } from './native.js';
 import { MongoSqlQuery } from './MongoSqlQuery.js';
-import type { MongoSqlConfig } from './types.js';
+import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
 
 /**
  * Cube driver class. Cube instantiates this when CUBEJS_DB_TYPE=mongosql.
  *
- * Note: this stub doesn't extend `@cubejs-backend/base-driver`'s BaseDriver
- * yet — that wiring is T11. Keeping this loosely typed here to unblock T01 → T10
- * without pulling the Cube dep into the type-check step.
+ * Construction is cheap and pure: env vars are read and validated, but no
+ * native client is created. The native client is created lazily on the first
+ * `testConnection()` / `query()` / `tablesSchema()` call so that throwing in
+ * the constructor reports config errors crisply (Cube wraps construction
+ * exceptions less helpfully than runtime ones).
  */
-export class MongoSqlDriver {
-  private readonly client: MongoSqlClient;
+export class MongoSqlDriver extends BaseDriver {
+  private readonly resolvedConfig: MongoSqlConfig;
 
-  constructor(config?: MongoSqlConfig) {
-    this.client = new MongoSqlClient(config ?? this.configFromEnv());
+  private client: MongoSqlClient | undefined;
+
+  constructor(config?: Partial<MongoSqlConfig>) {
+    super();
+    this.resolvedConfig = buildConfig(config, process.env);
   }
 
-  private configFromEnv(): MongoSqlConfig {
-    throw new Error('not implemented (T11)');
+  /** Test hook: surface the config the driver resolved from constructor + env. */
+  public _config(): Readonly<MongoSqlConfig> {
+    return this.resolvedConfig;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  query<R = unknown>(_sql: string, _values?: unknown[]): Promise<R[]> {
-    throw new Error('not implemented (T11)');
+  // ---------- BaseDriver overrides ----------
+
+  public override async testConnection(): Promise<void> {
+    const client = this.ensureClient();
+    await client.testConnection();
   }
 
-  testConnection(): Promise<void> {
-    throw new Error('not implemented (T11)');
+  public override async query<R = unknown>(sql: string, _values?: unknown[], _options?: QueryOptions): Promise<R[]> {
+    const client = this.ensureClient();
+    const raw = await client.query<Record<string, unknown>>(sql);
+    return flattenRows<R>(raw);
   }
 
-  tablesSchema(): Promise<unknown> {
-    throw new Error('not implemented (T11)');
+  public override async tablesSchema(): Promise<TablesSchema> {
+    const client = this.ensureClient();
+    return client.tablesSchema();
   }
 
-  release(): Promise<void> {
-    return this.client.close();
+  public override async release(): Promise<void> {
+    if (this.client) {
+      const c = this.client;
+      this.client = undefined;
+      await c.close();
+    }
   }
 
-  static dialectClass(): typeof MongoSqlQuery {
+  public override async downloadQueryResults(
+    sql: string,
+    values?: unknown[],
+    _options?: DownloadQueryResultsOptions,
+  ): Promise<DownloadQueryResultsResult> {
+    const rows = await this.query<Record<string, unknown>>(sql, values);
+    // BaseDriver consumers expect `{ rows, types }`. We don't have type
+    // metadata at row level (mongosql gives us a result-set schema from
+    // translation but we don't currently surface it through napi); leaving
+    // `types` as an empty array is the documented fallback for memory-mode
+    // downloads — Cube infers types from row values.
+    return { rows, types: [] };
+  }
+
+  public override capabilities(): DriverCapabilities {
+    return {
+      // No EXPORT_BUCKET, no streaming source, no incremental schema loading.
+      unloadWithoutTempTable: false,
+      streamingSource: false,
+      incrementalSchemaLoading: false,
+      csvImport: false,
+      streamImport: false,
+    };
+  }
+
+  public override readOnly(): boolean {
+    return true;
+  }
+
+  // ---------- Methods CubeJS expects but MongoSQL cannot fulfil ----------
+
+  public override async createSchemaIfNotExists(_schemaName: string): Promise<void> {
+    throw notSupported('createSchemaIfNotExists');
+  }
+
+  public override async dropTable(_tableName: string, _options?: QueryOptions): Promise<unknown> {
+    throw notSupported('dropTable');
+  }
+
+  public override async uploadTable(
+    _table: string,
+    _columns: TableStructure,
+    _tableData: DownloadTableData,
+  ): Promise<void> {
+    throw notSupported('uploadTable');
+  }
+
+  public override async uploadTableWithIndexes(
+    _table: string,
+    _columns: TableStructure,
+    _tableData: DownloadTableData,
+    _indexesSql: IndexesSQL,
+    _uniqueKeyColumns: string[] | null,
+    _queryTracingObj: unknown,
+    _externalOptions: ExternalCreateTableOptions,
+  ): Promise<void> {
+    throw notSupported('uploadTableWithIndexes');
+  }
+
+  public override async createTable(_quotedTableName: string, _columns: TableColumn[]): Promise<void> {
+    throw notSupported('createTable');
+  }
+
+  public override async createTableRaw(_query: string): Promise<void> {
+    throw notSupported('createTableRaw');
+  }
+
+  // ---------- Static ----------
+
+  public static dialectClass(): typeof MongoSqlQuery {
     return MongoSqlQuery;
   }
+
+  // ---------- Internals ----------
+
+  private ensureClient(): MongoSqlClient {
+    if (!this.client) {
+      this.client = new MongoSqlClient(this.resolvedConfig);
+    }
+    return this.client;
+  }
+}
+
+/**
+ * Mongosql wraps each result row in a per-collection envelope:
+ *   `[{ users: { _id, email, ... } }, ...]`
+ *
+ * Cube expects flat rows (`Record<string, unknown>`). Strategy:
+ *  - Single top-level key whose value is a plain object → unwrap.
+ *  - Multiple top-level keys (JOIN result) → merge with `<table>__<column>`.
+ *  - Anything else (scalar at top level, no envelope) → pass through.
+ *
+ * Discovery: see IMPLEMENTATION_PLAN.md → 2026-05-09 — T08 (mongosql per-
+ * collection envelope) for the pipeline-shape source.
+ */
+function flattenRows<R>(rows: Array<Record<string, unknown>>): R[] {
+  return rows.map((row) => flattenRow<R>(row));
+}
+
+function flattenRow<R>(row: Record<string, unknown>): R {
+  const keys = Object.keys(row);
+  if (keys.length === 1) {
+    const only = row[keys[0]];
+    if (isPlainObject(only)) return only as R;
+    return row as unknown as R;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [tbl, val] of Object.entries(row)) {
+    if (isPlainObject(val)) {
+      for (const [col, v] of Object.entries(val)) {
+        out[`${tbl}__${col}`] = v;
+      }
+    } else {
+      out[tbl] = val;
+    }
+  }
+  return out as R;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
+}
+
+// ---------- Config ----------
+
+type EnvLike = NodeJS.ProcessEnv;
+
+function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike): MongoSqlConfig {
+  const uri = override?.uri ?? env.CUBEJS_DB_URI;
+  if (!uri) throw configInvalid('uri (set CUBEJS_DB_URI or pass `uri` to the constructor)');
+
+  const database = override?.database ?? env.CUBEJS_DB_NAME;
+  if (!database) {
+    throw configInvalid('database (set CUBEJS_DB_NAME or pass `database` to the constructor)');
+  }
+
+  const schemaSource = override?.schemaSource ?? schemaSourceFromEnv(env);
+
+  return {
+    uri,
+    database,
+    schemaSource,
+    schemaRefreshSec: override?.schemaRefreshSec ?? numEnv(env.CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC),
+    schemaFailOpen: override?.schemaFailOpen ?? boolEnv(env.CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN),
+    queryTimeoutMs: override?.queryTimeoutMs ?? numEnv(env.CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS),
+    maxRows: override?.maxRows ?? numEnv(env.CUBEJS_MONGOSQL_MAX_ROWS),
+  };
+}
+
+function schemaSourceFromEnv(env: EnvLike): SchemaSource | undefined {
+  const kind = env.CUBEJS_MONGOSQL_SCHEMA_SOURCE;
+  if (!kind) return undefined;
+  if (kind === 'collection') return { kind: 'collection' };
+  if (kind === 'file') {
+    const path = env.CUBEJS_MONGOSQL_SCHEMA_FILE;
+    if (!path) {
+      throw configInvalid('CUBEJS_MONGOSQL_SCHEMA_FILE must be set when CUBEJS_MONGOSQL_SCHEMA_SOURCE=file');
+    }
+    return { kind: 'file', path };
+  }
+  throw configInvalid(`CUBEJS_MONGOSQL_SCHEMA_SOURCE must be 'collection' or 'file' (got '${kind}')`);
+}
+
+function numEnv(v: string | undefined): number | undefined {
+  if (v === undefined || v === '') return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  return n;
+}
+
+function boolEnv(v: string | undefined): boolean | undefined {
+  if (v === undefined || v === '') return undefined;
+  return v.toLowerCase() === 'true' || v === '1';
+}
+
+function configInvalid(detail: string): MongoSqlError {
+  const err = new Error(`MONGOSQL_CONFIG_INVALID: missing required config: ${detail}`) as MongoSqlError;
+  err.code = 'MONGOSQL_CONFIG_INVALID';
+  err.name = 'MongoSqlError';
+  return err;
+}
+
+function notSupported(method: string): Error {
+  return new Error(
+    `MongoSqlDriver: '${method}' is not supported by the MongoSQL driver (read-only / no EXPORT_BUCKET path)`,
+  );
 }
