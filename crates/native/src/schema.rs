@@ -1,8 +1,10 @@
 //! Schema loader and cache. See ARCHITECTURE.md §3 and SPEC.md §5.3.
 //!
-//! T04 implements Collection-mode loading. T05 will add File-mode loading and
-//! T06 will wire the refresh task. The cache type lives here so T05/T06 can
-//! land additively without a redesign.
+//! T04 implements Collection-mode loading. T05 adds File-mode loading. T06
+//! will wire the refresh task. The cache type lives here so T06 can land
+//! additively without a redesign.
+//!
+//! ## Collection-mode envelope
 //!
 //! The `__sql_schemas` collection holds one document per collection in the
 //! database, shaped like:
@@ -20,6 +22,37 @@
 //! `jsonSchema` is the per-collection JSON Schema (rooted at `bsonType: object`
 //! with the field-level `properties`). The version field is currently always
 //! 1; we accept it permissively but warn on mismatch (see `SUPPORTED_SCHEMA_VERSION`).
+//!
+//! ## File-mode envelope
+//!
+//! YAML or JSON, single document, top-level `schema.jsonSchema.properties` map
+//! whose keys are *collection names* and values are per-collection JSON
+//! Schemas (the same body that appears under `schema.jsonSchema` in
+//! Collection-mode). See SPEC.md §5.3 and ARCHITECTURE.md §3.4.
+//!
+//! ```yaml
+//! schema:
+//!   version: 1
+//!   jsonSchema:
+//!     bsonType: object
+//!     properties:
+//!       users:   { bsonType: object, properties: { ... } }
+//!       orders:  { bsonType: object, properties: { ... } }
+//! ```
+//!
+//! The file format does NOT carry a database name. File-mode loaders therefore
+//! key the resulting `Catalog` under [`FILE_MODE_DB_PLACEHOLDER`] (currently
+//! the empty string). The napi-rs surface (T09) MUST either pass that same
+//! placeholder as `current_db` to `mongosql::translate_sql` for file-mode
+//! callers, or rebuild the catalog under the configured database name before
+//! caching. See Discoveries 2026-05-09 — T05.
+//!
+//! ## Trust boundary
+//!
+//! `load_from_file` uses the caller-supplied path as-is. No path-traversal
+//! mitigation is performed by the loader; it is the caller's responsibility
+//! to validate the path against any policy (e.g. confining to a designated
+//! schema directory). The file is opened with the process's privileges.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -48,6 +81,11 @@ pub const SQL_SCHEMAS_COLLECTION: &str = "__sql_schemas";
 /// upstream sampler may evolve the wire format independently of the
 /// `jsonSchema` payload.
 pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+
+/// Database-name placeholder used when [`load_from_file`] builds a catalog
+/// from a file that has no database identifier in its envelope. See module
+/// docs ("File-mode envelope") and Discoveries.
+pub const FILE_MODE_DB_PLACEHOLDER: &str = "";
 
 /// Atomic schema cache. Reads clone an `Arc<MongoSqlCatalog>` cheaply; writes
 /// take a brief write lock to swap the inner pointer.
@@ -195,12 +233,235 @@ pub(crate) fn parse_schema_document(mut doc: Document) -> Result<(String, JsonSc
                 ),
             })?;
 
-    let json_schema =
-        json_schema::Schema::from_document(json_schema_doc).map_err(|e| Error::SchemaInvalid {
-            msg: format!("collection `{collection_name}`: jsonSchema parse failed: {e}"),
+    parse_collection_schema(&collection_name, json_schema_doc)
+}
+
+/// Parses a per-collection JSON Schema body into a typed `json_schema::Schema`.
+///
+/// Both the Collection-mode loader (`parse_schema_document`) and the
+/// File-mode loader (`load_from_file`) call this helper. The `name` argument
+/// is purely for error-message attribution; the returned `String` is
+/// `name.to_string()` so the call sites can shovel it directly into the
+/// `BTreeMap<collection, Schema>` without re-allocating from a foreign source.
+pub(crate) fn parse_collection_schema(
+    name: &str,
+    json_schema: &Document,
+) -> Result<(String, JsonSchema)> {
+    let schema =
+        json_schema::Schema::from_document(json_schema).map_err(|e| Error::SchemaInvalid {
+            msg: format!("collection `{name}`: jsonSchema parse failed: {e}"),
+        })?;
+    Ok((name.to_string(), schema))
+}
+
+/// Loads schema from a YAML or JSON file on disk. Format is detected by
+/// extension: `.yaml` / `.yml` → YAML; `.json` → JSON. Anything else errors
+/// with [`Error::ConfigInvalid`].
+///
+/// The returned `Catalog` is keyed under [`FILE_MODE_DB_PLACEHOLDER`] (see
+/// module docs).
+///
+/// Errors:
+/// - [`Error::SchemaFileNotFound`] — the path does not exist.
+/// - [`Error::ConfigInvalid`] — unsupported / missing extension.
+/// - [`Error::SchemaInvalid`] — file is unreadable, fails to parse, or has the
+///   wrong shape (missing `schema.jsonSchema.properties` etc).
+/// - [`Error::SchemaNotFound`] — `schema.jsonSchema.properties` is empty.
+#[allow(dead_code)] // wired in by T09 (napi surface); exercised by unit tests today
+pub fn load_from_file(path: &std::path::Path) -> Result<MongoSqlCatalog> {
+    if !path.exists() {
+        return Err(Error::SchemaFileNotFound {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+
+    let format = match ext.as_deref() {
+        Some("yaml") | Some("yml") => SchemaFileFormat::Yaml,
+        Some("json") => SchemaFileFormat::Json,
+        Some(other) => {
+            return Err(Error::ConfigInvalid {
+                field: "schema_file",
+                reason: format!("unsupported extension '{other}'; expected .yaml/.yml/.json",),
+            });
+        }
+        None => {
+            return Err(Error::ConfigInvalid {
+                field: "schema_file",
+                reason: format!(
+                    "missing file extension on `{}`; expected .yaml/.yml/.json",
+                    path.display(),
+                ),
+            });
+        }
+    };
+
+    // std::fs::read_to_string maps NotFound → io::ErrorKind::NotFound; via the
+    // From<io::Error> impl that becomes SchemaFileNotFound but with an empty
+    // path. We've already covered the missing-file case above with a populated
+    // path, so any io error here is a *read* failure (permission, etc.).
+    let raw = std::fs::read_to_string(path).map_err(|e| Error::SchemaInvalid {
+        msg: format!("failed to read `{}`: {e}", path.display()),
+    })?;
+
+    let envelope = parse_file_to_document(format, &raw, path)?;
+    let collections = extract_collections_from_envelope(&envelope, path)?;
+
+    if collections.is_empty() {
+        return Err(Error::SchemaNotFound {
+            msg: format!(
+                "schema file `{}` has no entries under schema.jsonSchema.properties",
+                path.display(),
+            ),
+        });
+    }
+
+    let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+    by_db.insert(FILE_MODE_DB_PLACEHOLDER.to_string(), collections);
+
+    build_catalog_from_catalog_schema(by_db).map_err(|e| Error::SchemaInvalid {
+        msg: format!("catalog build failed: {e}"),
+    })
+}
+
+#[derive(Copy, Clone)]
+enum SchemaFileFormat {
+    Yaml,
+    Json,
+}
+
+/// Parse the raw file text into a `bson::Document` envelope. Both YAML and
+/// JSON funnel through `serde_json::Value` first because:
+///
+/// 1. `bson::Bson::TryFrom<serde_json::Value>` is implemented and handles
+///    the JSON → BSON value mapping we want for schema documents.
+/// 2. `serde_yaml` deserializes into `serde_json::Value` cleanly for the
+///    string-keyed YAML our schema format uses (see SPEC §5.3 / ARCHITECTURE
+///    §3.4 — schema files only contain string keys and primitive scalars).
+///
+/// This guarantees byte-identical Catalogs for byte-identical content:
+/// content equivalent in YAML and JSON parses to the same `serde_json::Value`,
+/// which converts to the same `bson::Document`, which produces the same
+/// `Catalog`.
+fn parse_file_to_document(
+    format: SchemaFileFormat,
+    raw: &str,
+    path: &std::path::Path,
+) -> Result<Document> {
+    let json_value: serde_json::Value = match format {
+        SchemaFileFormat::Yaml => serde_yaml::from_str(raw).map_err(|e| Error::SchemaInvalid {
+            msg: format!("failed to parse YAML at `{}`: {e}", path.display()),
+        })?,
+        SchemaFileFormat::Json => serde_json::from_str(raw).map_err(|e| Error::SchemaInvalid {
+            msg: format!("failed to parse JSON at `{}`: {e}", path.display()),
+        })?,
+    };
+
+    // The top level of a schema file MUST be an object — anything else
+    // (array, scalar, null) is a malformed envelope.
+    if !json_value.is_object() {
+        return Err(Error::SchemaInvalid {
+            msg: format!(
+                "schema file `{}`: top level must be an object",
+                path.display(),
+            ),
+        });
+    }
+
+    let bson_value: bson::Bson =
+        bson::Bson::try_from(json_value).map_err(|e| Error::SchemaInvalid {
+            msg: format!(
+                "schema file `{}`: BSON conversion failed: {e}",
+                path.display(),
+            ),
         })?;
 
-    Ok((collection_name, json_schema))
+    match bson_value {
+        bson::Bson::Document(d) => Ok(d),
+        other => Err(Error::SchemaInvalid {
+            msg: format!(
+                "schema file `{}`: top level must be a document, got `{:?}`",
+                path.display(),
+                other.element_type(),
+            ),
+        }),
+    }
+}
+
+/// Walks the file envelope and produces the per-collection schema map.
+///
+/// The envelope shape (see module docs) is:
+/// `{ schema: { jsonSchema: { properties: { <coll>: <body> } } } }`.
+/// Each `<body>` is a per-collection JSON Schema, parsed via the same
+/// helper Collection-mode uses ([`parse_collection_schema`]).
+fn extract_collections_from_envelope(
+    envelope: &Document,
+    path: &std::path::Path,
+) -> Result<BTreeMap<String, JsonSchema>> {
+    let schema_block = envelope
+        .get_document("schema")
+        .map_err(|_| Error::SchemaInvalid {
+            msg: format!(
+                "schema file `{}`: missing or non-document top-level `schema`",
+                path.display(),
+            ),
+        })?;
+
+    // Permissive version handling — same convention as Collection-mode.
+    if let Ok(v) = schema_block.get_i64("version") {
+        if v != SUPPORTED_SCHEMA_VERSION {
+            tracing::warn!(
+                target: "mongosql_driver::schema",
+                file = %path.display(),
+                version = v,
+                expected = SUPPORTED_SCHEMA_VERSION,
+                "schema file version mismatch; attempting to parse jsonSchema anyway",
+            );
+        }
+    }
+
+    let json_schema =
+        schema_block
+            .get_document("jsonSchema")
+            .map_err(|_| Error::SchemaInvalid {
+                msg: format!(
+                    "schema file `{}`: missing or non-document `schema.jsonSchema`",
+                    path.display(),
+                ),
+            })?;
+
+    let properties = json_schema
+        .get_document("properties")
+        .map_err(|_| Error::SchemaInvalid {
+            msg: format!(
+                "schema file `{}`: missing or non-document `schema.jsonSchema.properties`",
+                path.display(),
+            ),
+        })?;
+
+    let mut by_collection: BTreeMap<String, JsonSchema> = BTreeMap::new();
+    for (coll_name, coll_body) in properties.iter() {
+        let coll_doc = match coll_body {
+            bson::Bson::Document(d) => d,
+            other => {
+                return Err(Error::SchemaInvalid {
+                    msg: format!(
+                        "schema file `{}`: collection `{coll_name}` body must be a document, got `{:?}`",
+                        path.display(),
+                        other.element_type(),
+                    ),
+                });
+            }
+        };
+        let (name, schema) = parse_collection_schema(coll_name, coll_doc)?;
+        by_collection.insert(name, schema);
+    }
+
+    Ok(by_collection)
 }
 
 #[cfg(test)]
@@ -421,6 +682,321 @@ mod tests {
                 assert!(msg.contains("broken"), "expected 'broken' in msg: {msg}");
             }
             other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // T05 — File-mode loader tests
+    // -----------------------------------------------------------------
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR points at crates/native; fixtures live at the
+        // repo root under tests/integration/fixtures/.
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate_dir
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("integration")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn assert_catalog_has(catalog: &Catalog, db: &str, collections: &[&str]) {
+        for coll in collections {
+            let ns = Namespace {
+                database: db.to_string(),
+                collection: (*coll).to_string(),
+            };
+            assert!(
+                catalog.get_schema_for_namespace(&ns).is_some(),
+                "expected catalog to contain `{db}.{coll}`",
+            );
+        }
+    }
+
+    #[test]
+    fn load_from_file_yaml_happy_path() {
+        let path = fixture_path("mongo-schema.yaml");
+        let catalog = load_from_file(&path).expect("yaml fixture loads");
+        assert_catalog_has(
+            &catalog,
+            FILE_MODE_DB_PLACEHOLDER,
+            &["users", "accounts", "orders"],
+        );
+    }
+
+    #[test]
+    fn load_from_file_json_happy_path() {
+        let path = fixture_path("mongo-schema.json");
+        let catalog = load_from_file(&path).expect("json fixture loads");
+        assert_catalog_has(
+            &catalog,
+            FILE_MODE_DB_PLACEHOLDER,
+            &["users", "accounts", "orders"],
+        );
+    }
+
+    #[test]
+    fn load_from_file_yaml_and_json_produce_equivalent_catalogs() {
+        // Same logical content in both formats → byte-identical Catalogs.
+        let yaml = load_from_file(&fixture_path("mongo-schema.yaml")).expect("yaml loads");
+        let json = load_from_file(&fixture_path("mongo-schema.json")).expect("json loads");
+
+        // Catalog isn't directly comparable; but per-namespace schema lookup
+        // *is*, and the two should return Some for the same namespaces and
+        // identical Schemas.
+        for coll in &["users", "accounts", "orders"] {
+            let ns = Namespace {
+                database: FILE_MODE_DB_PLACEHOLDER.to_string(),
+                collection: (*coll).to_string(),
+            };
+            let y = yaml.get_schema_for_namespace(&ns);
+            let j = json.get_schema_for_namespace(&ns);
+            assert!(y.is_some() && j.is_some(), "missing namespace `{coll}`");
+            // Schema is internally a recursive structure; Debug equality is a
+            // strong check (it includes every nested field).
+            assert_eq!(
+                format!("{:?}", y.unwrap()),
+                format!("{:?}", j.unwrap()),
+                "yaml/json schemas diverge for collection `{coll}`",
+            );
+        }
+    }
+
+    #[test]
+    fn load_from_file_missing_file() {
+        let path = std::path::PathBuf::from("/nonexistent/schema-missing-12345.yaml");
+        match load_from_file(&path) {
+            Err(Error::SchemaFileNotFound { path: p }) => {
+                assert_eq!(p, path);
+            }
+            other => panic!("expected SchemaFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_unsupported_extension() {
+        // Create a temp file with a bad extension; existence check happens
+        // *before* extension check, so the file must exist for the loader
+        // to reach the extension validation step.
+        let tmp = std::env::temp_dir().join("t05_unsupported_ext.txt");
+        std::fs::write(&tmp, b"unused").expect("write tmp");
+        let res = load_from_file(&tmp);
+        // Best-effort cleanup; ignore unlink errors.
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::ConfigInvalid { field, reason }) => {
+                assert_eq!(field, "schema_file");
+                assert!(
+                    reason.contains("txt"),
+                    "reason should mention bad ext: {reason}",
+                );
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_no_extension() {
+        let tmp = std::env::temp_dir().join("t05_no_ext_file");
+        std::fs::write(&tmp, b"unused").expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::ConfigInvalid { field, .. }) => {
+                assert_eq!(field, "schema_file");
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_malformed_yaml() {
+        let tmp = std::env::temp_dir().join("t05_malformed.yaml");
+        // Tab + colon ambiguity that serde_yaml rejects.
+        std::fs::write(&tmp, "schema:\n  version: 1\n  jsonSchema: : :\n").expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("yaml"),
+                    "msg should mention YAML: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_malformed_json() {
+        let tmp = std::env::temp_dir().join("t05_malformed.json");
+        std::fs::write(&tmp, b"{ not valid json").expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("json"),
+                    "msg should mention JSON: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_missing_properties_block() {
+        // Valid envelope shell with no `schema.jsonSchema.properties`.
+        let tmp = std::env::temp_dir().join("t05_no_props.yaml");
+        std::fs::write(
+            &tmp,
+            "schema:\n  version: 1\n  jsonSchema:\n    bsonType: object\n",
+        )
+        .expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(
+                    msg.contains("properties"),
+                    "msg should mention properties: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_empty_properties_yields_schema_not_found() {
+        let tmp = std::env::temp_dir().join("t05_empty_props.json");
+        std::fs::write(
+            &tmp,
+            br#"{"schema":{"version":1,"jsonSchema":{"bsonType":"object","properties":{}}}}"#,
+        )
+        .expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaNotFound { msg }) => {
+                assert!(
+                    msg.contains("properties"),
+                    "msg should mention properties: {msg}",
+                );
+            }
+            other => panic!("expected SchemaNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_top_level_not_object() {
+        let tmp = std::env::temp_dir().join("t05_top_level_array.json");
+        std::fs::write(&tmp, b"[1, 2, 3]").expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(
+                    msg.contains("top level"),
+                    "msg should mention top level: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_collection_body_not_document_includes_name() {
+        let tmp = std::env::temp_dir().join("t05_bad_coll_body.json");
+        std::fs::write(
+            &tmp,
+            br#"{"schema":{"version":1,"jsonSchema":{"bsonType":"object","properties":{"users":"oops"}}}}"#,
+        ).expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(msg.contains("users"), "msg should name collection: {msg}");
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_file_yml_extension_alias() {
+        // Same content as the YAML fixture, just with .yml extension.
+        let yaml_text = std::fs::read_to_string(fixture_path("mongo-schema.yaml")).expect("read");
+        let tmp = std::env::temp_dir().join("t05_yml_alias.yml");
+        std::fs::write(&tmp, &yaml_text).expect("write tmp");
+        let res = load_from_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let catalog = res.expect(".yml is a supported extension");
+        assert_catalog_has(
+            &catalog,
+            FILE_MODE_DB_PLACEHOLDER,
+            &["users", "accounts", "orders"],
+        );
+    }
+
+    #[test]
+    fn load_from_file_round_trip_matches_collection_mode_logic() {
+        // Take the file fixture and compare its catalog (per-namespace
+        // schemas) against a catalog built from the equivalent
+        // `__sql_schemas` documents via the Collection-mode helper.
+        // The two should yield equivalent per-collection JsonSchemas, since
+        // they share `parse_collection_schema`.
+        let file_catalog = load_from_file(&fixture_path("mongo-schema.yaml")).expect("yaml loads");
+
+        let docs = vec![
+            make_doc(
+                "users",
+                doc! {
+                    "_id":        { "bsonType": "objectId" },
+                    "email":      { "bsonType": "string" },
+                    "name":       { "bsonType": "string" },
+                    "account_id": { "bsonType": "string" },
+                    "created_at": { "bsonType": "date" },
+                },
+            ),
+            make_doc(
+                "accounts",
+                doc! {
+                    "_id":        { "bsonType": "string" },
+                    "name":       { "bsonType": "string" },
+                    "tier":       { "bsonType": "string" },
+                    "created_at": { "bsonType": "date" },
+                },
+            ),
+            make_doc(
+                "orders",
+                doc! {
+                    "_id":        { "bsonType": "objectId" },
+                    "account_id": { "bsonType": "string" },
+                    "amount":     { "bsonType": "decimal" },
+                    "status":     { "bsonType": "string" },
+                    "created_at": { "bsonType": "date" },
+                    "updated_at": { "bsonType": "date" },
+                },
+            ),
+        ];
+        // Mirror the file-mode db convention (placeholder) so namespaces line up.
+        let coll_catalog = build_catalog_from_docs(FILE_MODE_DB_PLACEHOLDER, docs)
+            .expect("collection-mode builds");
+
+        for coll in &["users", "accounts", "orders"] {
+            let ns = Namespace {
+                database: FILE_MODE_DB_PLACEHOLDER.to_string(),
+                collection: (*coll).to_string(),
+            };
+            let f = file_catalog.get_schema_for_namespace(&ns);
+            let c = coll_catalog.get_schema_for_namespace(&ns);
+            assert!(f.is_some() && c.is_some(), "missing namespace `{coll}`");
+            assert_eq!(
+                format!("{:?}", f.unwrap()),
+                format!("{:?}", c.unwrap()),
+                "file-mode and collection-mode schemas diverge for `{coll}`",
+            );
         }
     }
 
