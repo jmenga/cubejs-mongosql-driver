@@ -15,6 +15,9 @@
   },
   "napi": {
     "name": "cubejs-mongosql-driver-native",
+    "package": {
+      "name": "cubejs-mongosql-driver"
+    },
     "triples": {
       "defaults": false,
       "additional": [
@@ -29,8 +32,10 @@
   },
   "scripts": {
     "build": "pnpm build:rust && pnpm build:ts",
-    "build:rust": "napi build --platform --release crates/native",
-    "build:rust:debug": "napi build --platform crates/native",
+    "build:rust": "napi build --platform --release --cargo-cwd crates/native --cargo-name cubejs-mongosql-driver-native -p cubejs-mongosql-driver-native",
+    "build:rust:debug": "napi build --platform --cargo-cwd crates/native --cargo-name cubejs-mongosql-driver-native -p cubejs-mongosql-driver-native",
+    "artifacts": "napi artifacts --output-dir artifacts --npm-dir npm",
+    "prepublishOnly": "napi prepublish -t npm --skip-gh-release",
     "build:ts": "tsc -p tsconfig.build.json",
     "test": "pnpm test:unit && pnpm test:rust",
     "test:unit": "vitest run --config vitest.config.ts",
@@ -68,6 +73,14 @@
   },
   "dependencies": {
     "@node-rs/helper": "^1.6.0"
+  },
+  "optionalDependencies": {
+    "cubejs-mongosql-driver-linux-x64-gnu": "0.1.0-pre.0",
+    "cubejs-mongosql-driver-linux-arm64-gnu": "0.1.0-pre.0",
+    "cubejs-mongosql-driver-linux-x64-musl": "0.1.0-pre.0",
+    "cubejs-mongosql-driver-linux-arm64-musl": "0.1.0-pre.0",
+    "cubejs-mongosql-driver-darwin-x64": "0.1.0-pre.0",
+    "cubejs-mongosql-driver-darwin-arm64": "0.1.0-pre.0"
   },
   "devDependencies": {
     "@cubejs-backend/base-driver": "^1.6.26",

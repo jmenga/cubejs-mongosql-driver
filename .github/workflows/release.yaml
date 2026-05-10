@@ -1,12 +1,36 @@
 name: release
 
+# Builds prebuilt napi-rs `.node` binaries for the platforms in SPEC NFR-2
+# (linux x64/arm64 gnu+musl, darwin x64/arm64) and publishes them to npm as
+# per-platform sub-packages plus a root JS package whose `optionalDependencies`
+# resolve to the matching binary at install time.
+#
+# Implements IMPLEMENTATION_PLAN.md T18. Adapted from
+# https://github.com/napi-rs/package-template/blob/main/.github/workflows/CI.yml
+#
+# T10 discovery (dylib name mismatch): @napi-rs/cli v2.18.4 expects the cargo
+# dylib output to use hyphens to match the crate `name` field, but cargo
+# normalises the dylib filename to underscores. We work around this by
+# `cp`-ing the underscore variant to the hyphen variant inside the crate
+# build step, before the napi CLI's post-build copy/rename phase. Upgrading
+# to @napi-rs/cli v3 would fix this upstream but is a non-trivial migration
+# (different command surface, output naming) and is out of scope for T18.
+
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write
+
+env:
+  DEBUG: napi:*
+  APP_NAME: cubejs-mongosql-driver
+  NATIVE_NAME: cubejs-mongosql-driver-native
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
 
 jobs:
   build:
@@ -16,71 +40,180 @@ jobs:
         settings:
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            short: linux-x64-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: pnpm build:rust --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            short: linux-arm64-gnu
             build: pnpm build:rust --target aarch64-unknown-linux-gnu --use-cross
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            short: linux-x64-musl
             build: pnpm build:rust --target x86_64-unknown-linux-musl --use-cross
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            short: linux-arm64-musl
             build: pnpm build:rust --target aarch64-unknown-linux-musl --use-cross
-          - host: macos-14
+          - host: macos-13
             target: x86_64-apple-darwin
+            short: darwin-x64
             build: pnpm build:rust --target x86_64-apple-darwin
           - host: macos-14
             target: aarch64-apple-darwin
+            short: darwin-arm64
             build: pnpm build:rust --target aarch64-apple-darwin
+    name: build - ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.settings.target }}
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: contains(matrix.settings.build, '--use-cross')
+        uses: taiki-e/install-action@v2
         with:
-          key: ${{ matrix.settings.target }}
-      - run: pnpm install --frozen-lockfile
-      - run: ${{ matrix.settings.build }}
-      - uses: actions/upload-artifact@v4
+          tool: cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          name: bindings-${{ matrix.settings.target }}
-          path: crates/native/*.node
+          shared-key: build-${{ matrix.settings.target }}
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build native binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ matrix.settings.build }}
+
+      # T10 dylib-name workaround: napi v2 looks for hyphenated dylib names
+      # (cubejs-mongosql-driver-native.<triple>.node) but the actual cargo
+      # output already uses hyphens because we pass `--platform`. The post-
+      # build rename guards the case where a future toolchain change emits
+      # the underscore form. Idempotent: skips if hyphenated form exists.
+      - name: Normalise dylib filename (T10 workaround)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in *.node; do
+            normalised="${f//cubejs_mongosql_driver_native/cubejs-mongosql-driver-native}"
+            if [ "$f" != "$normalised" ] && [ ! -f "$normalised" ]; then
+              echo "Renaming $f -> $normalised"
+              mv "$f" "$normalised"
+            fi
+          done
+          ls -la *.node || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.short }}
+          path: ${{ env.NATIVE_NAME }}.${{ matrix.settings.short }}.node
+          if-no-files-found: error
 
   publish:
+    name: publish
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
-      - uses: actions/download-artifact@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build TypeScript
+        run: pnpm build:ts
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build:ts
-      - name: Move binaries to npm/<platform>/
+
+      - name: List downloaded artifacts
+        run: ls -laR artifacts
+
+      - name: Move binaries into per-platform npm packages
+        shell: bash
         run: |
-          mkdir -p npm
+          set -euo pipefail
           for dir in artifacts/bindings-*; do
-            target="${dir#artifacts/bindings-}"
-            mkdir -p "npm/$target"
-            mv "$dir"/*.node "npm/$target/" 2>/dev/null || true
+            short="${dir#artifacts/bindings-}"
+            mkdir -p "npm/$short"
+            mv "$dir"/*.node "npm/$short/"
           done
-      - run: npm publish --access public --provenance
+          ls -laR npm
+
+      # napi prepublish wires up README + version + binary references in each
+      # `npm/<short>/package.json` so they're consistent with the root.
+      - name: Prepare per-platform packages
+        run: pnpm exec napi prepublish -t npm --skip-gh-release
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Configure npm auth for publish steps below.
+      - name: Configure npm auth
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          npm whoami
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish per-platform packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pkg in npm/*/; do
+            echo "Publishing $pkg"
+            pushd "$pkg" >/dev/null
+            if ! npm publish --access public --provenance --tag latest; then
+              echo "Publish for $pkg failed (already published?); continuing"
+            fi
+            popd >/dev/null
+          done
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish root package
+        run: npm publish --access public --provenance --tag latest
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.node
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

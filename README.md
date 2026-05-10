@@ -12,11 +12,13 @@ Replacement for the `@cubejs-backend/mongobi-driver` path that depends on the **
 ## What this is and isn't
 
 **Is:**
+
 - A Cube.js driver — install via npm, configure via `CUBEJS_DB_TYPE=mongosql`.
 - Native: Rust + napi-rs, distributed as prebuilt binaries.
 - Direct to MongoDB: no proxy process, no Federation routing, no extra wire hops.
 
 **Isn't:**
+
 - Not a JDBC bridge.
 - Not a CDC-to-warehouse pipeline.
 - Not a schema sampler — schema population is up to your deployment (Atlas-managed sampler, EA Schema Builder CLI, or DIY).
@@ -59,6 +61,35 @@ The Rust shim caches schema in memory, refreshes it every 5 minutes in the backg
 ├── examples/docker/         # Cube image with the driver installed
 └── .github/workflows/       # CI (lint/test), E2E (compose), Release (prebuilt binaries)
 ```
+
+## Install
+
+```
+npm install cubejs-mongosql-driver
+# or
+pnpm add cubejs-mongosql-driver
+```
+
+The package ships a small JavaScript loader plus per-platform prebuilt native
+binaries published as separate npm packages. The root package declares each
+platform binary as an `optionalDependencies` entry; npm uses your runtime's
+`os`, `cpu`, and `libc` to install **only** the matching binary. No local
+Rust toolchain is required for end users.
+
+Supported platforms (per SPEC NFR-2):
+
+| Platform                | Sub-package                               |
+| ----------------------- | ----------------------------------------- |
+| Linux x64 (glibc)       | `cubejs-mongosql-driver-linux-x64-gnu`    |
+| Linux arm64 (glibc)     | `cubejs-mongosql-driver-linux-arm64-gnu`  |
+| Linux x64 (musl)        | `cubejs-mongosql-driver-linux-x64-musl`   |
+| Linux arm64 (musl)      | `cubejs-mongosql-driver-linux-arm64-musl` |
+| macOS x64 (Intel)       | `cubejs-mongosql-driver-darwin-x64`       |
+| macOS arm64 (Apple Si.) | `cubejs-mongosql-driver-darwin-arm64`     |
+
+Windows (`win32`) is not supported in v0.1.0. If `npm install` cannot find a
+matching binary it will fail with a clear "no native binary for your
+platform" error from the loader.
 
 ## Local development
 

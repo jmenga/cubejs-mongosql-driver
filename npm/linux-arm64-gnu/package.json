@@ -1,0 +1,26 @@
+{
+  "name": "cubejs-mongosql-driver-linux-arm64-gnu",
+  "version": "0.1.0-pre.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "cubejs-mongosql-driver-native.linux-arm64-gnu.node",
+  "files": [
+    "cubejs-mongosql-driver-native.linux-arm64-gnu.node"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "libc": [
+    "glibc"
+  ],
+  "description": "Linux arm64 (glibc) prebuilt binary for cubejs-mongosql-driver",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
+  }
+}
