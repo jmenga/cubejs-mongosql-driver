@@ -102,6 +102,16 @@ export class MongoSqlDriver extends BaseDriver {
   }
 
   public override async query<R = unknown>(sql: string, _values?: unknown[], _options?: QueryOptions): Promise<R[]> {
+    if (projectionHasNameCollision(sql)) {
+      throw translateFailed(
+        'JOIN projection contains two or more qualified columns with the same name ' +
+          '(e.g. `SELECT a.col, b.col` where the column names match). Mongosql ' +
+          'collapses these into an empty-string envelope `{"": {col, col}}` and BSON ' +
+          'document keys silently overwrite — losing data. Use `SELECT *` (returns ' +
+          '`<table>__<column>` prefixes) or alias each column explicitly ' +
+          '(`SELECT a.col AS a_col, b.col AS b_col`).',
+      );
+    }
     const client = this.ensureClient();
     const raw = await client.query<Record<string, unknown>>(sql);
     return flattenRows<R>(raw);
@@ -214,6 +224,26 @@ export class MongoSqlDriver extends BaseDriver {
  *
  * Discovery: see IMPLEMENTATION_PLAN.md → 2026-05-09 — T08 (mongosql per-
  * collection envelope) for the pipeline-shape source.
+ *
+ * **Critic v2 — Issue 2: empty-string envelope collision**.
+ *
+ * Mongosql emits `{"": {col: ..., col: ...}}` for explicit projections in
+ * JOINs (e.g. `SELECT users.col, orders.col FROM users JOIN orders ...`).
+ * If both sides project a column with the same name (`account_id`,
+ * `created_at`, `_id`), the BSON document keys collide and silently
+ * collapse — by the time JS has parsed the row we cannot detect the loss.
+ *
+ * Mitigation: input-side heuristic check in `query()` — if the SQL has a
+ * JOIN AND projects multiple qualified columns with the same trailing
+ * name, throw `MONGOSQL_TRANSLATE_FAILED` before executing. The flatten
+ * path itself stays permissive so single-collection queries with the
+ * naturally-occurring empty-string envelope (`SELECT col1, col2 FROM
+ * users` → `{"": {col1, col2}}`) keep working.
+ *
+ * Callers hitting the heuristic must either: (a) use `SELECT *` (multi-
+ * key envelope preserves `<table>__<col>` prefixes), or (b) alias the
+ * conflicting columns explicitly (`SELECT a.col AS a_col, b.col AS
+ * b_col`).
  */
 function flattenRows<R>(rows: Array<Record<string, unknown>>): R[] {
   return rows.map((row) => flattenRow<R>(row));
@@ -237,6 +267,49 @@ function flattenRow<R>(row: Record<string, unknown>): R {
     }
   }
   return out as R;
+}
+
+/**
+ * Heuristic detector for the empty-string-envelope column-collision risk
+ * (Critic v2 — Issue 2). Returns true iff `sql` contains a JOIN AND
+ * projects two or more *qualified* columns (`<ident>.<column>`) where
+ * the trailing column name appears more than once. False negatives are
+ * acceptable (we can only see source SQL, not the full algebra); false
+ * positives are bounded by the JOIN gate so plain single-table queries
+ * are never blocked.
+ *
+ * The check is deliberately conservative — it does not parse SQL,
+ * doesn't strip comments, and only flags the obvious shape. Cube's own
+ * generated SQL always uses aliases or `SELECT *`-via-cube-views; users
+ * writing raw SQL who hit this should add `AS <alias>` and re-run.
+ */
+function projectionHasNameCollision(sql: string): boolean {
+  if (!/\bjoin\b/i.test(sql)) return false;
+  const head = sql.match(/^\s*select\s+([\s\S]+?)\s+from\b/i);
+  if (!head) return false;
+  const projection = head[1];
+  if (projection.trim() === '*') return false;
+  // Strip parenthesised expressions (function args, subqueries) so we
+  // don't pick up nested column refs as projection items.
+  const flat = projection.replace(/\([^()]*\)/g, '');
+  const items = flat.split(',');
+  const trailingNames: string[] = [];
+  for (const raw of items) {
+    const item = raw.trim();
+    if (!item) continue;
+    // If the projection item has an alias (`AS xxx` or bare alias),
+    // collisions are no longer possible — skip.
+    if (/\bas\b/i.test(item)) continue;
+    // Look for `<ident>.<column>` at the end of the item.
+    const m = item.match(/[A-Za-z_][\w]*\.([A-Za-z_][\w]*)\s*$/);
+    if (m) trailingNames.push(m[1].toLowerCase());
+  }
+  const seen = new Set<string>();
+  for (const n of trailingNames) {
+    if (seen.has(n)) return true;
+    seen.add(n);
+  }
+  return false;
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -298,6 +371,13 @@ function boolEnv(v: string | undefined): boolean | undefined {
 function configInvalid(detail: string): MongoSqlError {
   const err = new Error(`MONGOSQL_CONFIG_INVALID: missing required config: ${detail}`) as MongoSqlError;
   err.code = 'MONGOSQL_CONFIG_INVALID';
+  err.name = 'MongoSqlError';
+  return err;
+}
+
+function translateFailed(detail: string): MongoSqlError {
+  const err = new Error(`MONGOSQL_TRANSLATE_FAILED: ${detail}`) as MongoSqlError;
+  err.code = 'MONGOSQL_TRANSLATE_FAILED';
   err.name = 'MongoSqlError';
   return err;
 }

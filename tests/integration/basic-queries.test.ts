@@ -153,6 +153,12 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     // Mongosql rejects `ORDER BY users.col` once the projection is flat
     // (the qualified-name datasource is gone post-projection), so we sort
     // client-side after the fact.
+    //
+    // Critic v2 — Issue 2 collision check: this projection is collision-
+    // safe (`email` ≠ `amount`), so the heuristic in `query()` lets it
+    // through. A colliding form (e.g. `SELECT users.account_id,
+    // orders.account_id`) would now throw MONGOSQL_TRANSLATE_FAILED;
+    // covered by the next test.
     const rows = await driver.query<{ email: string; amount: string }>(
       'SELECT users.email, orders.amount FROM users JOIN orders ' +
         'ON orders.account_id = users.account_id ' +
@@ -172,6 +178,34 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     // 2 users in acct_a (each paired with 2 paid orders = 150 + 200.5) +
     // 2 users in acct_b (each paired with 1 paid order = 320).
     expect(total).toBeCloseTo(2 * (150 + 200.5) + 2 * 320, 2);
+  });
+
+  it('JOIN with un-aliased colliding qualified columns is rejected (Critic v2 — Issue 2)', async () => {
+    // Both sides project `account_id` — the BSON envelope `{"": {account_id,
+    // account_id}}` would silently lose one column. The driver detects the
+    // collision risk from the SQL pre-execution and throws
+    // MONGOSQL_TRANSLATE_FAILED so callers know to alias.
+    const err = (await driver
+      .query<Record<string, unknown>>(
+        'SELECT users.account_id, orders.account_id FROM users JOIN orders ' +
+          'ON orders.account_id = users.account_id ' +
+          "WHERE orders.status = 'paid'",
+      )
+      .catch((e: unknown) => e)) as Error & { code?: string };
+    expect(err).toBeInstanceOf(Error);
+    expect(err.code).toBe('MONGOSQL_TRANSLATE_FAILED');
+
+    // Aliased form: same query but with explicit aliases on the colliding
+    // columns. The collision risk goes away → the query goes through and
+    // returns rows with the alias names.
+    const rows = await driver.query<Record<string, unknown>>(
+      'SELECT users.account_id AS u_acct, orders.account_id AS o_acct FROM users JOIN orders ' +
+        'ON orders.account_id = users.account_id ' +
+        "WHERE orders.status = 'paid'",
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]).toHaveProperty('u_acct');
+    expect(rows[0]).toHaveProperty('o_acct');
   });
 
   it('Aggregation — SUM over a Decimal128 field returns a string-form decimal', async () => {

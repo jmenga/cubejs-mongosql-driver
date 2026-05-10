@@ -245,6 +245,62 @@ describe('MongoSqlDriver — query() row flattening', () => {
     const err = (await d.query('SELECT 1 FROM users').catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_EXECUTE_FAILED');
   });
+
+  it('rejects JOIN projections with colliding qualified column names (Critic v2 — Issue 2)', async () => {
+    // mongosql emits `{"": {col: ..., col: ...}}` for explicit-projection
+    // JOINs without aliases. Two columns sharing a name silently collapse
+    // to one in the JS object. The driver detects the risk from the SQL
+    // pre-execution and throws MONGOSQL_TRANSLATE_FAILED so callers know
+    // to use `SELECT *` or aliased columns.
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const err = (await d
+      .query('SELECT users.account_id, orders.account_id FROM users JOIN orders ON 1=1')
+      .catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_TRANSLATE_FAILED');
+    expect(err.message).toMatch(/SELECT \*/);
+    expect(err.message).toMatch(/alias/i);
+    // Bypassed at the SQL gate — native client never created.
+    expect(createdClients).toBe(0);
+  });
+
+  it('allows JOIN projections where the colliding columns are aliased (Issue 2)', async () => {
+    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { u_id: 'u1', o_id: 'o1' } }]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>(
+      'SELECT users.account_id AS u_id, orders.account_id AS o_id FROM users JOIN orders ON 1=1',
+    );
+    expect(rows).toEqual([{ u_id: 'u1', o_id: 'o1' }]);
+  });
+
+  it('allows JOIN projections with non-colliding qualified column names (Issue 2)', async () => {
+    // Two qualified columns with different trailing names → no collision risk.
+    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { email: 'a@b', amount: '1.0' } }]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>(
+      'SELECT users.email, orders.amount FROM users JOIN orders ON 1=1',
+    );
+    expect(rows).toEqual([{ email: 'a@b', amount: '1.0' }]);
+  });
+
+  it('allows single-table empty-string envelope queries (no JOIN, no collision risk)', async () => {
+    // `SELECT col, col2 FROM users` produces a `{"": {col, col2}}` envelope
+    // but cannot collide because mongosql guarantees uniqueness within a
+    // single-table projection. The flatten path keeps unwrapping it.
+    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { email: 'a@b', name: 'A' } }]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>('SELECT email, name FROM users');
+    expect(rows).toEqual([{ email: 'a@b', name: 'A' }]);
+  });
+
+  it('regression: non-empty single-key envelope still unwraps cleanly', async () => {
+    installMockNative({
+      query: vi.fn().mockResolvedValue([{ users: { id: 'u1', email: 'a@b' } }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<{ id: string; email: string }>('SELECT * FROM users');
+    expect(rows).toEqual([{ id: 'u1', email: 'a@b' }]);
+  });
 });
 
 describe('MongoSqlDriver — testConnection / lifecycle', () => {
