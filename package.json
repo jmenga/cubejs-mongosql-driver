@@ -41,6 +41,7 @@
     "test:unit": "vitest run --config vitest.config.ts",
     "test:rust": "cargo test --workspace",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:cube-e2e": "vitest run --config vitest.cube-e2e.config.ts",
     "test:e2e": "make e2e",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

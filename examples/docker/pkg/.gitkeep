@@ -1,0 +1,3 @@
+# Build script `examples/docker/build-driver.sh` stages the npm-pack
+# tarball here. Tarballs are gitignored; only this placeholder is
+# committed.

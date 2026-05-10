@@ -1,0 +1,27 @@
+# Dockerignore for examples/docker/Dockerfile (build context is repo root).
+# Keep the context tight — the cube image build only needs Cargo + src + TS
+# config + the npm-pack tarball under examples/docker/pkg/.
+
+node_modules
+target
+dist
+coverage
+
+# Don't leak host-built native binaries into the build — the image
+# rebuilds them inside the builder stage for the container's libc.
+*.node
+
+# Generated artefacts that are excluded from npm pack but would bloat the
+# context.
+artifacts
+
+# Editor / OS detritus
+.DS_Store
+.idea
+.vscode
+
+# Git history (compose builds shouldn't depend on it)
+.git
+
+# Test outputs
+.vitest-cache

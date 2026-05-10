@@ -1,0 +1,103 @@
+# Docker Compose for cubejs-mongosql-driver E2E (IMPLEMENTATION_PLAN T19).
+#
+# Brings up:
+#   - atlas-local — MongoDB Atlas dev image (matches tests/integration
+#     fixture so the same seed scripts populate orders/users/accounts and
+#     `__sql_schemas`).
+#   - cube        — cubejs/cube:v1.6.x extended with our driver via the
+#     adjacent Dockerfile.
+#
+# Run via:
+#   examples/docker/build-driver.sh          # produces pkg/*.tgz
+#   docker compose -f examples/docker/docker-compose.yaml build
+#   docker compose -f examples/docker/docker-compose.yaml up -d
+#
+# Cube serves on http://localhost:4000 with `CUBEJS_DEV_MODE=true`
+# (no auth required for the playground / `/cubejs-api/v1/load`).
+#
+# This compose file is INTENTIONALLY separate from
+# `tests/integration/docker-compose.test.yml` because:
+#   * it adds a dependent `cube` service that depends on a built image,
+#   * we don't want the unit-integration suite to wait on cube startup,
+#   * the volume names are scoped here so simultaneous unit-integration +
+#     E2E runs don't fight over shared state.
+services:
+  atlas-local:
+    image: mongodb/mongodb-atlas-local:8.0
+    container_name: cubejs-mongosql-e2e-atlas
+    ports:
+      - '27017:27017'
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: admin
+      MONGODB_INITDB_ROOT_PASSWORD: admin
+    volumes:
+      - atlas-data:/data/db
+      # Reuse the integration test fixtures verbatim so the cube model
+      # in cube/model/orders.js operates against the same `__sql_schemas`
+      # row that `tests/integration/basic-queries.test.ts` already pins.
+      - ../../tests/integration/fixtures/seed-data.js:/docker-entrypoint-initdb.d/01-seed-data.js:ro
+      - ../../tests/integration/fixtures/seed-schemas.js:/docker-entrypoint-initdb.d/02-seed-schemas.js:ro
+    networks:
+      - cube-e2e
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  cube:
+    build:
+      # Build context is the repo root so the builder stage can COPY
+      # the Rust crates / src/ / pnpm-lock to compile the native binary
+      # in-image. Dockerfile path is relative to the context.
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+      args:
+        CUBE_VERSION: v1.6.44
+    image: cubejs-mongosql-driver-e2e:latest
+    container_name: cubejs-mongosql-e2e-cube
+    depends_on:
+      atlas-local:
+        condition: service_healthy
+    ports:
+      - '4000:4000'
+    environment:
+      # Cube tags this data source as 'mongosql' for caching/orchestration
+      # paths that key off the string. The driver-class lookup is bypassed
+      # by the `driverFactory` + `dialectFactory` overrides in cube.js.
+      CUBEJS_DB_TYPE: mongosql
+      # Cube container talks to atlas-local over the docker network.
+      # `directConnection=true` + `authSource=admin` matches the
+      # integration setup (atlas-local is a single-node replica set whose
+      # internal hostname isn't resolvable cross-container).
+      CUBEJS_DB_URI: 'mongodb://admin:admin@atlas-local:27017/?authSource=admin&directConnection=true'
+      CUBEJS_DB_NAME: mongosql_test
+      # Dev mode: disables JWT auth on the HTTP API so /cubejs-api/v1/load
+      # doesn't need a bearer token. CUBEJS_API_SECRET is still required
+      # by Cube startup even though dev mode bypasses the check.
+      CUBEJS_DEV_MODE: 'true'
+      CUBEJS_API_SECRET: e2e-test-secret-not-for-prod
+      # Force schema discovery to use the seeded `__sql_schemas` collection.
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: collection
+      # Snappier refresh for the test run; production default is 300 s.
+      CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '60'
+      # Verbose logs help diagnose the integration test if Cube fails to
+      # resolve our driver. Comment out for a quieter run.
+      CUBEJS_LOG_LEVEL: trace
+      # Cube reads cube.js from /cube/conf — set explicitly to be safe.
+      NODE_ENV: production
+    networks:
+      - cube-e2e
+    healthcheck:
+      # Cube exposes /readyz once schema compiles + driver loads.
+      test: ['CMD-SHELL', 'wget -q -O- http://localhost:4000/readyz || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  atlas-data:
+
+networks:
+  cube-e2e:
+    driver: bridge

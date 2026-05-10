@@ -37,3 +37,6 @@ build
 .nyc_output
 playwright-report
 test-results
+
+# T19 E2E artefacts (npm pack output staged for the docker build)
+examples/docker/pkg/*.tgz
