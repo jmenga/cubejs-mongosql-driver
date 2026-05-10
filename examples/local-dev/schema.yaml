@@ -1,0 +1,39 @@
+# File-mode schema for the local-dev example.
+#
+# This is the YAML envelope the driver loads when
+# CUBEJS_MONGOSQL_SCHEMA_SOURCE=file. The shape mirrors the document the
+# Atlas SQL Interface sampler writes to `__sql_schemas` in collection mode,
+# so file-mode and collection-mode catalogs are interchangeable for any
+# given set of collections.
+#
+# Edits land within CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC (30 s in
+# docker-compose.yaml here) — no container restart needed.
+schema:
+  version: 1
+  jsonSchema:
+    bsonType: object
+    properties:
+      orders:
+        bsonType: object
+        properties:
+          _id: { bsonType: objectId }
+          account_id: { bsonType: string }
+          amount: { bsonType: decimal }
+          status: { bsonType: string }
+          created_at: { bsonType: date }
+          updated_at: { bsonType: date }
+      users:
+        bsonType: object
+        properties:
+          _id: { bsonType: objectId }
+          email: { bsonType: string }
+          name: { bsonType: string }
+          account_id: { bsonType: string }
+          created_at: { bsonType: date }
+      accounts:
+        bsonType: object
+        properties:
+          _id: { bsonType: string }
+          name: { bsonType: string }
+          tier: { bsonType: string }
+          created_at: { bsonType: date }

@@ -1,0 +1,79 @@
+# Local development loop for mongosql-cubejs-driver.
+#
+# Differences from examples/docker/docker-compose.yaml:
+#   - File-mode schema (no `__sql_schemas` seeding required)
+#   - Bind-mounted cube.js + model directory for hot-reload
+#   - Bind-mounted schema.yaml so dialect tweaks land without rebuild
+#   - Faster refresh interval (30 s) for tighter feedback
+#
+# Run via:
+#   ./examples/docker/build-driver.sh           # one-time per driver change
+#   docker compose -f examples/docker/docker-compose.yaml build
+#   docker compose -f examples/local-dev/docker-compose.yaml up -d
+services:
+  atlas-local:
+    image: mongodb/mongodb-atlas-local:8.0
+    container_name: cubejs-mongosql-localdev-atlas
+    ports:
+      - '27017:27017'
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: admin
+      MONGODB_INITDB_ROOT_PASSWORD: admin
+    volumes:
+      - atlas-data:/data/db
+      - ./seed-data.js:/docker-entrypoint-initdb.d/01-seed-data.js:ro
+    networks:
+      - localdev
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  cube:
+    # Reuse the image built by examples/docker/Dockerfile so we don't
+    # maintain two builders. Build it once with:
+    #   docker compose -f examples/docker/docker-compose.yaml build
+    image: mongosql-cubejs-driver-e2e:latest
+    container_name: cubejs-mongosql-localdev-cube
+    depends_on:
+      atlas-local:
+        condition: service_healthy
+    ports:
+      - '4000:4000'
+    environment:
+      CUBEJS_DB_TYPE: mongosql
+      # directConnection=true + authSource=admin matches atlas-local's
+      # single-node-replica-set quirk (see README → Connection issues).
+      CUBEJS_DB_URI: 'mongodb://admin:admin@atlas-local:27017/?authSource=admin&directConnection=true'
+      CUBEJS_DB_NAME: mongosql_localdev
+
+      # File-mode schema — no __sql_schemas required.
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: file
+      CUBEJS_MONGOSQL_SCHEMA_FILE: /cube/conf/schema.yaml
+      # Snappy refresh for the dev loop — production should keep 300+.
+      CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '30'
+
+      CUBEJS_DEV_MODE: 'true'
+      CUBEJS_API_SECRET: localdev-not-for-prod
+      CUBEJS_LOG_LEVEL: trace
+      NODE_ENV: development
+    volumes:
+      # Hot-reload for cube model + dialect-config-style edits.
+      - ./cube/cube.js:/cube/conf/cube.js:ro
+      - ./cube/model:/cube/conf/model:ro
+      - ./schema.yaml:/cube/conf/schema.yaml:ro
+    networks:
+      - localdev
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O- http://localhost:4000/readyz || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  atlas-data:
+
+networks:
+  localdev:
+    driver: bridge
