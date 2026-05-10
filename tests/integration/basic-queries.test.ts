@@ -216,6 +216,37 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     expect(rows[0].total).toBe(PAID_ORDER_TOTAL);
   });
 
+  it('Decimal128 string contract — pins precision (Critic v2 — Issue 3)', async () => {
+    // Lock the Decimal128 → string contract end-to-end: the driver MUST NOT
+    // emit a JSON number for Decimal128 columns. JS Number (IEEE 754
+    // double) tops out at ~15-17 significant digits; Decimal128 carries up
+    // to 34. Returning a number would silently lose precision past the
+    // double-safe range, AND would drop the quantum (`4521.50` becomes
+    // `4521.5` — an accounting-grade bug for monetary columns).
+    //
+    // PAID_ORDER_TOTAL is the seeded sum `150.00 + 200.50 + 320.00 =
+    // 670.50` — note the preserved trailing zero. `Number(r.total)`
+    // would yield `670.5`, losing the cents-scale digit. This test
+    // asserts the string form matches byte-for-byte.
+    const rows = await driver.query<{ total: string }>(
+      "SELECT SUM(amount) AS total FROM orders WHERE status = 'paid'",
+    );
+    expect(rows).toHaveLength(1);
+    expect(typeof rows[0].total).toBe('string');
+    expect(rows[0].total).toBe('670.50');
+    // Trailing-zero preservation: must NOT be the JS-doubleified form.
+    expect(rows[0].total).not.toBe('670.5');
+    // Per-row decimal columns also stay as strings.
+    const orderRows = await driver.query<{ amount: string }>(
+      "SELECT amount FROM orders WHERE status = 'paid' ORDER BY amount ASC",
+    );
+    for (const r of orderRows) expect(typeof r.amount).toBe('string');
+    // Seeded values include `150.00`, `200.50`, `320.00` — every value
+    // carries at least one decimal place; the canonical to-string form
+    // must include the `.` for accounting-shape inputs.
+    for (const r of orderRows) expect(r.amount).toContain('.');
+  });
+
   it('Date filter using CAST(... AS TIMESTAMP) returns rows in range', async () => {
     // CAST(... AS TIMESTAMP) is the canonical date-literal form (mongosql
     // does NOT accept SQL-92 `TIMESTAMP 'literal'`; see T07 discovery).

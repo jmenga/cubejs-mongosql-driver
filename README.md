@@ -91,6 +91,36 @@ Windows (`win32`) is not supported in v0.1.0. If `npm install` cannot find a
 matching binary it will fail with a clear "no native binary for your
 platform" error from the loader.
 
+## Type handling notes
+
+### Decimal128 values are returned as strings
+
+MongoDB Decimal128 columns are returned as JSON strings — never as JSON
+numbers. This is intentional: a JS `Number` (IEEE 754 double) can only
+represent ~15-17 significant decimal digits, while Decimal128 carries up
+to 34. Returning a number would silently lose precision past the
+double-safe range AND would drop the input quantum (e.g. an accounting
+balance `"4521.50"` would become `4521.5`, losing the cents-scale digit).
+
+Convert to a number only after deciding your precision strategy. Common
+options:
+
+```ts
+// Display-only (precision loss acceptable):
+const n = Number(row.amount);            // "4521.50" → 4521.5
+
+// Preserve scale, do arithmetic in fixed-point (recommended for money):
+import Decimal from 'decimal.js';
+const d = new Decimal(row.amount);       // exact
+
+// Server-side aggregation (no JS arithmetic at all):
+//   SELECT SUM(amount) ... ← MongoSQL keeps Decimal128 throughout.
+```
+
+The string form is the canonical IEEE 754-2008 representation produced by
+`bson::Decimal128::to_string`; trailing zeros and scientific notation
+faithfully reflect the value as stored.
+
 ## Local development
 
 ```

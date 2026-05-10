@@ -376,6 +376,51 @@ mod tests {
     }
 
     #[test]
+    fn decimal128_with_full_34_digit_precision_round_trips_losslessly() {
+        // Critic v2 — Issue 3: lock the precision contract. Decimal128
+        // supports up to 34 significant decimal digits per IEEE 754-2008;
+        // a JS `Number` (IEEE 754 double) can only represent ~15-17
+        // significant digits, so callers MUST consume the value as the
+        // returned string and choose their own conversion strategy.
+        // 30 significant digits is well past the JS-double safe range.
+        let raw = "1234567890123456789012345678.901";
+        let d = Decimal128::from_str(raw).expect("parse 30-digit decimal");
+        let v = bson_to_json(Bson::Decimal128(d));
+        match v {
+            Value::String(s) => assert_eq!(s, raw, "Decimal128 must round-trip byte-for-byte"),
+            other => panic!("expected JSON string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_preserves_trailing_zeros_in_quantum() {
+        // BSON Decimal128 carries a quantum (scale) — `4521.50` is NOT the
+        // same value as `4521.5` for accounting use cases (scale=2 vs
+        // scale=1). bson::Decimal128::to_string preserves the input
+        // quantum exactly. Lock that contract: a regression to scale-
+        // normalising would silently re-scale every monetary column.
+        let inputs_with_quantum = ["4521.50", "0.00", "100.000", "1E+3"];
+        for raw in inputs_with_quantum {
+            let d = Decimal128::from_str(raw).expect("parse");
+            let v = bson_to_json(Bson::Decimal128(d));
+            // We don't assert exact byte-equality for "1E+3" because bson's
+            // canonical form may render scientific notation differently;
+            // we DO assert that the round-trip is reversible (re-parsing
+            // gives the same Decimal128).
+            let s = match &v {
+                Value::String(s) => s.clone(),
+                other => panic!("expected JSON string for `{raw}`, got {other:?}"),
+            };
+            let reparsed = Decimal128::from_str(&s).expect("reparse driver output");
+            assert_eq!(
+                reparsed.to_string(),
+                Decimal128::from_str(raw).unwrap().to_string(),
+                "round-trip must preserve quantum for `{raw}`",
+            );
+        }
+    }
+
+    #[test]
     fn objectid_serializes_as_24_char_hex_string() {
         let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").expect("known good oid");
         let v = bson_to_json(Bson::ObjectId(oid));
