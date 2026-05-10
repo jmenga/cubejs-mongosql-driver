@@ -134,6 +134,153 @@ describe('MongoSqlQuery dialect (T12a — static syntax)', () => {
     });
   });
 
+  describe('autoPrefixWithCubeName — full Cube compiler pipeline (T19a)', () => {
+    // These tests drive Cube's actual `prepareCompiler` end-to-end so we
+    // assert the FINAL emitted SQL — the only source of truth that mongosql
+    // sees. A pure-prototype test (below) covers the override mechanism;
+    // this block proves the override actually flows through the BaseQuery
+    // dimension/measure builders that produce the SELECT projection.
+    //
+    // We import lazily inside `it` so the schema-compiler bootstrap (which
+    // touches the heavy NativeInstance / YamlCompiler stack) only runs when
+    // these tests are selected — keeps the rest of the suite at sub-100 ms.
+    /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires, global-require */
+    interface CompilerLike {
+      compiler: { compile: () => Promise<void> };
+    }
+    async function buildSql(opts: { cubes: string; query: Record<string, unknown> }): Promise<string> {
+      const { prepareCompiler } = require('@cubejs-backend/schema-compiler/dist/src/compiler/PrepareCompiler.js') as {
+        prepareCompiler: (repo: unknown, options?: unknown) => CompilerLike;
+      };
+      const repo = {
+        localPath: () => __dirname,
+        dataSchemaFiles: async () => [{ fileName: 'cubes.js', content: opts.cubes }],
+      };
+      const compilers = prepareCompiler(repo) as unknown as ConstructorParameters<typeof MongoSqlQuery>[0];
+      await (compilers as unknown as CompilerLike).compiler.compile();
+      const q = new MongoSqlQuery(compilers, opts.query);
+      const [sql] = q.buildSqlAndParams() as [string, unknown[]];
+      return sql;
+    }
+    /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires, global-require */
+
+    it('single-cube SELECT emits unqualified column refs (mongosql Error 3008 fix)', async () => {
+      const sql = await buildSql({
+        cubes: `cube('orders', {
+          sql_table: 'orders',
+          measures: { count: { type: 'count' } },
+          dimensions: {
+            accountId: { sql: 'account_id', type: 'string' },
+            status: { sql: 'status', type: 'string' },
+          },
+        });`,
+        query: {
+          measures: ['orders.count'],
+          dimensions: ['orders.accountId', 'orders.status'],
+          timezone: 'UTC',
+        },
+      });
+      // The pre-fix SQL was `\`orders\`.account_id` — mongosql v1.8.5 rejects
+      // this (Error 3008). Post-fix MUST emit the bare column name.
+      expect(sql).toContain('account_id `orders__account_id`');
+      expect(sql).toContain('status `orders__status`');
+      expect(sql).not.toMatch(/`orders`\.account_id/);
+      expect(sql).not.toMatch(/`orders`\.status/);
+    });
+
+    it('multi-cube JOIN keeps qualified refs (mongosql accepts them in JOIN scope)', async () => {
+      const sql = await buildSql({
+        cubes: `cube('users', {
+          sql_table: 'users',
+          joins: { orders: { relationship: 'one_to_many', sql: \`\${users.accountId} = \${orders.accountId}\` } },
+          measures: { count: { type: 'count' } },
+          dimensions: {
+            accountId: { sql: 'account_id', type: 'string', primary_key: true },
+            email: { sql: 'email', type: 'string' },
+          },
+        });
+        cube('orders', {
+          sql_table: 'orders',
+          measures: { count: { type: 'count' } },
+          dimensions: {
+            orderId: { sql: '_id', type: 'string', primary_key: true },
+            accountId: { sql: 'account_id', type: 'string' },
+            status: { sql: 'status', type: 'string' },
+          },
+        });`,
+        query: {
+          measures: ['orders.count'],
+          dimensions: ['users.email', 'orders.status'],
+          timezone: 'UTC',
+        },
+      });
+      // Multi-cube — mongosql accepts qualified refs here. The override must
+      // NOT strip the alias prefix when JOIN is in scope.
+      expect(sql).toMatch(/`users`\.email/);
+      expect(sql).toMatch(/`orders`\.status/);
+      // FROM clause introduces the JOIN.
+      expect(sql).toMatch(/JOIN\s+orders/i);
+    });
+  });
+
+  describe('autoPrefixWithCubeName (T19a — qualified-ref suppression)', () => {
+    // Background: mongosql v1.8.5 rejects `<alias>.<col>` qualified refs in
+    // single-cube projections (Error 3008). BaseQuery's default emits the
+    // prefix unconditionally for any bare-identifier dimension SQL; we
+    // override to suppress the prefix when there are no joins, and keep the
+    // base behaviour when a JOIN brings additional cubes into scope.
+    function withJoin(joins: unknown[]): MongoSqlQuery {
+      const q = makeDialect();
+      // The override reads `this.join.joins.length`. Stub the minimum shape.
+      Object.assign(q as unknown as { join: unknown; cubeAlias?: unknown }, {
+        join: { joins },
+        // Stub `cubeAlias` so the super.* path returns a deterministic
+        // qualified form. BaseQuery's super.autoPrefixWithCubeName() calls
+        // `this.cubeAlias(cubeName)` to produce the prefix.
+        cubeAlias: (cubeName: string) => `\`${cubeName}\``,
+      });
+      return q;
+    }
+
+    it('strips alias prefix on bare identifiers when there are zero joins', () => {
+      const q = withJoin([]);
+      expect(q.autoPrefixWithCubeName('users', 'email')).toBe('email');
+      expect(q.autoPrefixWithCubeName('users', 'account_id')).toBe('account_id');
+    });
+
+    it('keeps alias prefix when JOIN brings additional cubes into scope', () => {
+      const q = withJoin([
+        {
+          /* one join */
+        },
+      ]);
+      // Multi-cube — mongosql ACCEPTS qualified refs in JOIN scope, so we
+      // pass through to base behaviour.
+      expect(q.autoPrefixWithCubeName('users', 'email')).toBe('`users`.email');
+    });
+
+    it('does not strip when isMemberExpr=true (member-expression SQL)', () => {
+      const q = withJoin([]);
+      // Member expressions bypass the regex match in base; we mirror that.
+      expect(q.autoPrefixWithCubeName('users', 'email', true)).toBe('email');
+    });
+
+    it('does not transform non-bare expressions (already complex SQL)', () => {
+      const q = withJoin([]);
+      // Base returns these as-is because they don't match the bare-ident regex.
+      expect(q.autoPrefixWithCubeName('users', 'LOWER(email)')).toBe('LOWER(email)');
+      expect(q.autoPrefixWithCubeName('users', 'a.b.c')).toBe('a.b.c');
+    });
+
+    it('falls through to base when this.join is unset (pre-build path)', () => {
+      const q = makeDialect();
+      // No `join` set → can't tell single-vs-multi; defer to base which
+      // would prefix. Stub cubeAlias so super.* runs deterministically.
+      (q as unknown as { cubeAlias: (n: string) => string }).cubeAlias = (n) => `\`${n}\``;
+      expect(q.autoPrefixWithCubeName('users', 'email')).toBe('`users`.email');
+    });
+  });
+
   describe('end-to-end SQL emission (smoke)', () => {
     // NOTE: a true round-trip assertion (mongosql-cli parses the SQL string)
     // requires the native binary, fixtures, and a running MongoDB. That

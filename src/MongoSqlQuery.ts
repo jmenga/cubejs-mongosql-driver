@@ -43,6 +43,7 @@
  * |-------------------------------------------|-------------------|---------------------------------------------------------------------|
  * | escapeColumnName(name)                    | OVERRIDE (T12a)   | Default emits double-quoted ident; MongoSQL uses backticks.         |
  * | quoteIdentifier(name)                     | ADD (alias) (T12a)| Not on BaseQuery, but task spec + driver doc-comment expect it.     |
+ * | autoPrefixWithCubeName(c, sql, isExpr)    | OVERRIDE (T19a)   | mongosql v1.8.5 rejects `<alias>.<col>` outside JOIN scope (3008).  |
  * | timeStampCast(value)                      | OVERRIDE (T12a)   | Base emits `value::timestamptz` (Postgres). Mongosql has no `::`.   |
  * | dateTimeCast(value)                       | OVERRIDE (T12a)   | Base emits `value::timestamp` (Postgres) — invalid in MongoSQL.     |
  * | timeStampParam(td)                        | INHERIT           | Default delegates to timeStampCast — fine once we override that.    |
@@ -171,6 +172,52 @@ export class MongoSqlQuery extends BaseQuery {
 
   public quoteIdentifier(identifier: string): string {
     return this.escapeColumnName(identifier);
+  }
+
+  /**
+   * Suppress the cube-alias prefix on bare column references when the query
+   * has only one cube in scope.
+   *
+   * Background (T19 discovery): mongosql v1.8.5's algebrizer rejects qualified
+   * `<table_alias>.<col>` references in projections when only one collection
+   * is in scope — Error 3008 "Field `orders` in the `SELECT` clause at the 0
+   * scope level not found". Cube's BaseQuery emits `${cubeAlias}.${sql}` for
+   * every dimension that is a bare identifier (see BaseQuery.js:2508
+   * `autoPrefixWithCubeName`), which makes every realistic Cube query against
+   * a single cube fail translation.
+   *
+   * Strategy:
+   *   - Single-cube query (`this.join.joins.length === 0`): drop the prefix
+   *     — emit a bare column reference (`SELECT email FROM users`).
+   *   - Multi-cube / JOIN: keep the prefix (`SELECT users.email`) — mongosql
+   *     accepts qualified refs in JOIN scope (verified end-to-end in
+   *     tests/integration/basic-queries.test.ts).
+   *   - `this.join` may be `null` during pre-build / collect-cube-names paths
+   *     before `prebuildJoin` runs; treat that as "not enough info, keep
+   *     BaseQuery's behaviour" so we don't drop a prefix Cube actually needed.
+   *   - `isMemberExpr` (member-expression SQL) bypasses the prefix entirely
+   *     in BaseQuery; keep that semantics for forward compat.
+   *
+   * The conditional fall-through to `super` keeps every other code path
+   * (non-bare expressions like `LOWER(email)` already escape the regex match
+   * and are returned verbatim by the base implementation) unchanged.
+   */
+  public override autoPrefixWithCubeName(cubeName: string, sql: string, isMemberExpr = false): string {
+    // Single-cube projection: mongosql rejects `<alias>.<col>`. Strip the
+    // alias prefix only when (a) we'd otherwise emit it (bare identifier,
+    // not a member-expression) and (b) the query truly has no joins.
+    const join: { joins: unknown[] } | null | undefined = (this as unknown as { join?: { joins: unknown[] } | null })
+      .join;
+    if (
+      join &&
+      Array.isArray(join.joins) &&
+      join.joins.length === 0 &&
+      !isMemberExpr &&
+      /^[_a-zA-Z][_a-zA-Z0-9]*$/.test(sql)
+    ) {
+      return sql;
+    }
+    return super.autoPrefixWithCubeName(cubeName, sql, isMemberExpr);
   }
 
   /**
