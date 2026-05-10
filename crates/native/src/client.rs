@@ -35,6 +35,7 @@
 //! when the source is file mode, so consumers see a single coherent database
 //! name regardless of how the schema was loaded.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +74,17 @@ pub struct MongoSqlClient {
     /// Handle to the background refresh task; populated by `test_connection`,
     /// taken (and `shutdown().await`-ed) by `close`.
     refresh_handle: Mutex<Option<SchemaRefreshHandle>>,
+    /// Init-once guard for the schema-load + refresh-spawn stage of
+    /// [`Self::test_connection`]. Concurrent callers block on the first
+    /// caller's load; subsequent callers (after success) short-circuit.
+    /// On `Err` the OnceCell stays uninitialised so a retry can re-attempt.
+    init_once: OnceCell<()>,
+    /// Total number of times the refresh task has been spawned for this
+    /// client. Concurrent `test_connection()` calls must not race-spawn —
+    /// after `test_connection` succeeds this is exactly 1, regardless of
+    /// caller count. Always-on (single relaxed atomic increment) so tests
+    /// can observe it without a `#[cfg(test)]` field.
+    refresh_spawn_count: AtomicUsize,
 }
 
 #[napi]
@@ -92,7 +104,17 @@ impl MongoSqlClient {
             schema_cache: SchemaCache::new_empty(),
             table_columns: Arc::new(Mutex::new(TableColumns::new())),
             refresh_handle: Mutex::new(None),
+            init_once: OnceCell::new(),
+            refresh_spawn_count: AtomicUsize::new(0),
         }
+    }
+
+    /// Test-observability hook: how many times this client has spawned a
+    /// refresh task. With the `init_once` guard in place this is at most 1
+    /// across any number of concurrent `test_connection()` callers.
+    #[doc(hidden)]
+    pub fn refresh_spawn_count(&self) -> usize {
+        self.refresh_spawn_count.load(Ordering::SeqCst)
     }
 
     /// Verify cluster connectivity and load initial schema, then spawn the
@@ -112,7 +134,9 @@ impl MongoSqlClient {
         let client = self.ensure_client().await.map_err(napi::Error::from)?;
 
         // Bounded ping. mongodb's own server-selection has a 30s default that
-        // we want to avoid for a connectivity probe.
+        // we want to avoid for a connectivity probe. Ping always runs (every
+        // caller) so a transient network issue surfaces consistently across
+        // callers — only schema-load + refresh-spawn is init-once-guarded.
         let ping = async {
             client
                 .database("admin")
@@ -131,20 +155,25 @@ impl MongoSqlClient {
             }
         }
 
-        // Initial schema load.
-        let LoadedSchema { catalog, columns } = self
-            .load_schema(client.as_ref())
+        // Initial schema load + refresh spawn — guarded by `init_once` so
+        // concurrent callers do this exactly once. Subsequent callers (after
+        // success) short-circuit; if the first attempt fails the OnceCell
+        // stays empty so a retry by any caller can re-attempt the work.
+        // Without this guard, two concurrent callers would each spawn a
+        // refresh task and the second would orphan the first's handle.
+        self.init_once
+            .get_or_try_init(|| async {
+                let LoadedSchema { catalog, columns } = self.load_schema(client.as_ref()).await?;
+                self.schema_cache.write(Arc::new(catalog));
+                *self.table_columns.lock().await = columns;
+
+                let handle = self.spawn_refresh(Arc::clone(&client));
+                self.refresh_spawn_count.fetch_add(1, Ordering::SeqCst);
+                *self.refresh_handle.lock().await = Some(handle);
+                Ok::<(), Error>(())
+            })
             .await
             .map_err(napi::Error::from)?;
-        self.schema_cache.write(Arc::new(catalog));
-        *self.table_columns.lock().await = columns;
-
-        // Spawn the refresh task. The loader closure clones `Arc<Client>` and
-        // calls back into `Self::load_schema_inner` (the catalog-only flavour
-        // is enough for the cache; the column map is updated separately on
-        // each successful refresh by the closure body).
-        let handle = self.spawn_refresh(client);
-        *self.refresh_handle.lock().await = Some(handle);
         Ok(())
     }
 

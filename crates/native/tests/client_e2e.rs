@@ -17,6 +17,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::env;
+use std::sync::Arc;
 
 use cubejs_mongosql_driver_native::config::{ClientConfig, SchemaSource};
 use cubejs_mongosql_driver_native::MongoSqlClient;
@@ -161,6 +162,39 @@ async fn file_mode_query_against_real_cluster() {
         Value::Array(rows) => assert!(!rows.is_empty(), "expected at least one orders row"),
         other => panic!("expected JSON array, got {other:?}"),
     }
+    client.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn concurrent_test_connection_spawns_refresh_task_exactly_once() {
+    // Critic v2 — Issue 1: prior to the `init_once` guard, two concurrent
+    // `test_connection()` callers each spawned a refresh task and the second
+    // overwrote `refresh_handle`, orphaning the first task forever. Spawn 8
+    // concurrent callers and assert exactly one refresh task was registered.
+    let client = Arc::new(MongoSqlClient::new(collection_mode_config()));
+    assert_eq!(client.refresh_spawn_count(), 0, "no spawn before init");
+
+    let mut handles = Vec::with_capacity(8);
+    for _ in 0..8_u32 {
+        let c = Arc::clone(&client);
+        handles.push(tokio::spawn(async move { c.test_connection().await }));
+    }
+    for h in handles {
+        h.await
+            .expect("join")
+            .expect("test_connection should succeed");
+    }
+    assert_eq!(
+        client.refresh_spawn_count(),
+        1,
+        "init_once must collapse concurrent callers to a single refresh-task spawn",
+    );
+
+    // Idempotent: a subsequent test_connection after success must NOT spawn.
+    client.test_connection().await.expect("post-init reconnect");
+    assert_eq!(client.refresh_spawn_count(), 1, "no extra spawn on retry");
+
     client.close().await.expect("close");
 }
 
