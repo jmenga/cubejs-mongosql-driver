@@ -132,7 +132,7 @@ const INTERVAL_UNIT_TO_DATE_PART: Readonly<Record<string, string>> = Object.free
 });
 
 /** A single component of a parsed Cube interval, mapped to MongoSQL units. */
-interface IntervalComponent {
+export interface IntervalComponent {
   value: number;
   unit: string; // MongoSQL DatePart token, uppercase.
 }
