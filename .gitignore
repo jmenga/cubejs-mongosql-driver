@@ -13,6 +13,9 @@ Cargo.lock
 # napi-rs
 *.node
 !npm/**/*.node
+# napi-rs auto-generated bindings at project root (overwritten by `napi build`)
+/index.js
+/index.d.ts
 
 # Build output
 dist

@@ -20,6 +20,8 @@ export interface MongoSqlConfig {
   schemaFailOpen?: boolean;
   /** Per-query timeout in milliseconds. Defaults to 60000. */
   queryTimeoutMs?: number;
+  /** Max rows returned per query (buffered). Defaults to 100000. */
+  maxRows?: number;
 }
 
 /**
@@ -35,6 +37,7 @@ export const ERROR_CODES = [
   'MONGOSQL_TRANSLATE_FAILED',
   'MONGOSQL_EXECUTE_FAILED',
   'MONGOSQL_TIMEOUT',
+  'MONGOSQL_RESULT_TOO_LARGE',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
