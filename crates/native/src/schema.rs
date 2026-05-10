@@ -62,7 +62,7 @@ use futures_util::TryStreamExt;
 use mongosql::{
     build_catalog_from_catalog_schema,
     catalog::Catalog,
-    json_schema::{self, Schema as JsonSchema},
+    json_schema::{self, BsonType, BsonTypeName, Schema as JsonSchema},
 };
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -72,6 +72,35 @@ use crate::error::{Error, Result};
 /// Re-export of the upstream catalog so other modules don't import `mongosql`
 /// directly. T07 (translate wrapper) consumes this.
 pub type MongoSqlCatalog = Catalog;
+
+/// One column descriptor as exposed in Cube's `tablesSchema` shape.
+/// `name` is the field key from the per-collection JSON Schema; `sql_type`
+/// is the BSON-type → SQL-type mapping (see [`bson_type_to_sql_type`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    /// Column name as it appears in the JSON Schema `properties` map.
+    pub name: String,
+    /// SQL-equivalent type label (e.g. `"string"`, `"int"`, `"timestamp"`).
+    pub sql_type: String,
+}
+
+/// Per-`(db, collection)` ordered list of [`ColumnInfo`]. Used by the napi-rs
+/// surface (T09) to produce Cube's nested `{db: {tbl: [...]}}` introspection
+/// payload without having to introspect the opaque [`Catalog`].
+pub type TableColumns = BTreeMap<(String, String), Vec<ColumnInfo>>;
+
+/// Loaded schema bundle: the catalog the translator consumes plus the
+/// parallel column-info structure the napi-rs `tables_schema` method renders.
+///
+/// Both are derived from the same `BTreeMap<db, BTreeMap<coll, JsonSchema>>`
+/// so they cannot drift; clients only see them via `MongoSqlClient`.
+#[derive(Debug)]
+pub struct LoadedSchema {
+    /// Catalog for `mongosql::translate_sql`.
+    pub catalog: MongoSqlCatalog,
+    /// Column descriptors keyed by `(db, collection)`.
+    pub columns: TableColumns,
+}
 
 /// Name of the collection that holds the per-collection JSON Schemas.
 /// Matches what the Atlas SQL Interface sampler and EA Schema Builder write.
@@ -128,6 +157,218 @@ impl SchemaCache {
             Err(poisoned) => *poisoned.into_inner() = new,
         }
     }
+}
+
+/// Maps a BSON type from a `json_schema::Schema` field declaration to the
+/// SQL-type label exposed via Cube's `tablesSchema`. Cube doesn't enforce a
+/// fixed vocabulary here, but its measure/dimension type-coercion code knows
+/// the labels below — `string`, `int`, `decimal`, `timestamp`, `boolean`,
+/// `double`, `object`, `array` — so we hew to that set.
+///
+/// - `Null` and unknown / missing types fall back to `"string"` (the safest
+///   coercion for downstream SQL emission).
+/// - Multiple-typed fields (e.g. `["string", "null"]`) collapse to the first
+///   non-`null` entry; if all entries are `null`, returns `"string"`.
+pub(crate) fn bson_type_to_sql_type(bt: Option<&BsonType>) -> String {
+    match bt {
+        None => "string".to_string(),
+        Some(BsonType::Single(name)) => bson_type_name_to_sql(*name).to_string(),
+        Some(BsonType::Multiple(names)) => {
+            // Pick the first non-null variant; default to `"string"` if the
+            // list is empty or all-null.
+            for name in names {
+                if !matches!(name, BsonTypeName::Null) {
+                    return bson_type_name_to_sql(*name).to_string();
+                }
+            }
+            "string".to_string()
+        }
+    }
+}
+
+fn bson_type_name_to_sql(name: BsonTypeName) -> &'static str {
+    match name {
+        BsonTypeName::String => "string",
+        BsonTypeName::ObjectId => "string",
+        BsonTypeName::Symbol => "string",
+        BsonTypeName::Regex => "string",
+        BsonTypeName::Javascript => "string",
+        BsonTypeName::JavascriptWithScope => "string",
+        BsonTypeName::DbPointer => "string",
+        BsonTypeName::BinData => "string",
+        BsonTypeName::Int => "int",
+        BsonTypeName::Long => "int",
+        BsonTypeName::Double => "double",
+        BsonTypeName::Decimal => "decimal",
+        BsonTypeName::Bool => "boolean",
+        BsonTypeName::Date => "timestamp",
+        BsonTypeName::Timestamp => "timestamp",
+        BsonTypeName::Object => "object",
+        BsonTypeName::Array => "array",
+        // `null`, `undefined`, `minKey`, `maxKey` — degenerate / legacy.
+        BsonTypeName::Null
+        | BsonTypeName::Undefined
+        | BsonTypeName::MinKey
+        | BsonTypeName::MaxKey => "string",
+    }
+}
+
+/// Walks `properties` on a per-collection JSON Schema and produces the
+/// ordered column list. Order is alphabetical (BTreeMap iteration) for
+/// determinism — the upstream `HashMap` has no defined order, but Cube's
+/// consumers don't care about column ordering for introspection.
+fn columns_from_collection_schema(schema: &JsonSchema) -> Vec<ColumnInfo> {
+    let mut by_name: BTreeMap<String, ColumnInfo> = BTreeMap::new();
+    if let Some(props) = &schema.properties {
+        for (name, sub) in props {
+            by_name.insert(
+                name.clone(),
+                ColumnInfo {
+                    name: name.clone(),
+                    sql_type: bson_type_to_sql_type(sub.bson_type.as_ref()),
+                },
+            );
+        }
+    }
+    by_name.into_values().collect()
+}
+
+/// Build the `(catalog, columns)` pair from a `BTreeMap<db, BTreeMap<coll, Schema>>`.
+/// Both branches of `load_*_with_columns` share this so the two outputs are
+/// always derived from the same source map.
+fn build_loaded_schema(
+    by_db: BTreeMap<String, BTreeMap<String, JsonSchema>>,
+) -> Result<LoadedSchema> {
+    let mut columns: TableColumns = BTreeMap::new();
+    for (db, by_coll) in &by_db {
+        for (coll, schema) in by_coll {
+            columns.insert(
+                (db.clone(), coll.clone()),
+                columns_from_collection_schema(schema),
+            );
+        }
+    }
+    let catalog = build_catalog_from_catalog_schema(by_db).map_err(|e| Error::SchemaInvalid {
+        msg: format!("catalog build failed: {e}"),
+    })?;
+    Ok(LoadedSchema { catalog, columns })
+}
+
+/// Like [`load_from_collection`] but also returns the [`TableColumns`] map
+/// the napi surface uses for `tables_schema()`. Tests for the catalog-only
+/// loader continue to use [`load_from_collection`] unchanged.
+pub async fn load_from_collection_with_columns(
+    client: &mongodb::Client,
+    db_name: &str,
+) -> Result<LoadedSchema> {
+    let by_db = collect_collection_docs(client, db_name).await?;
+    build_loaded_schema(by_db)
+}
+
+/// Like [`load_from_file`] but also returns the [`TableColumns`] map. The
+/// catalog is keyed under [`FILE_MODE_DB_PLACEHOLDER`] (no db name in file
+/// envelope); the same key is used in the returned `TableColumns`. Callers
+/// (T09) re-key under `config.database` before exposing through `tables_schema()`.
+pub fn load_from_file_with_columns(path: &std::path::Path) -> Result<LoadedSchema> {
+    let by_db = collect_file_docs(path)?;
+    build_loaded_schema(by_db)
+}
+
+/// Read `__sql_schemas` from `db_name` and produce the same
+/// `BTreeMap<db, BTreeMap<coll, Schema>>` shape `load_from_collection`
+/// builds internally. Factored out so `load_from_collection_with_columns`
+/// can reuse the I/O without duplicating it.
+async fn collect_collection_docs(
+    client: &mongodb::Client,
+    db_name: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, JsonSchema>>> {
+    if db_name.trim().is_empty() {
+        return Err(Error::ConfigInvalid {
+            field: "database",
+            reason: "empty".to_string(),
+        });
+    }
+
+    let coll = client
+        .database(db_name)
+        .collection::<Document>(SQL_SCHEMAS_COLLECTION);
+
+    let cursor = coll.find(doc! {}).await?;
+    let docs: Vec<Document> = cursor.try_collect().await?;
+
+    if docs.is_empty() {
+        return Err(Error::SchemaNotFound {
+            msg: format!("collection `{SQL_SCHEMAS_COLLECTION}` in database `{db_name}` is empty",),
+        });
+    }
+
+    let mut by_collection: BTreeMap<String, JsonSchema> = BTreeMap::new();
+    for doc in docs {
+        let (name, schema) = parse_schema_document(doc)?;
+        by_collection.insert(name, schema);
+    }
+
+    let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+    by_db.insert(db_name.to_string(), by_collection);
+    Ok(by_db)
+}
+
+/// Read a YAML/JSON schema file from disk and produce the same
+/// `BTreeMap<db, BTreeMap<coll, Schema>>` shape `load_from_file` builds
+/// internally — keyed under [`FILE_MODE_DB_PLACEHOLDER`].
+fn collect_file_docs(
+    path: &std::path::Path,
+) -> Result<BTreeMap<String, BTreeMap<String, JsonSchema>>> {
+    if !path.exists() {
+        return Err(Error::SchemaFileNotFound {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+
+    let format = match ext.as_deref() {
+        Some("yaml") | Some("yml") => SchemaFileFormat::Yaml,
+        Some("json") => SchemaFileFormat::Json,
+        Some(other) => {
+            return Err(Error::ConfigInvalid {
+                field: "schema_file",
+                reason: format!("unsupported extension '{other}'; expected .yaml/.yml/.json",),
+            });
+        }
+        None => {
+            return Err(Error::ConfigInvalid {
+                field: "schema_file",
+                reason: format!(
+                    "missing file extension on `{}`; expected .yaml/.yml/.json",
+                    path.display(),
+                ),
+            });
+        }
+    };
+
+    let raw = std::fs::read_to_string(path).map_err(|e| Error::SchemaInvalid {
+        msg: format!("failed to read `{}`: {e}", path.display()),
+    })?;
+
+    let envelope = parse_file_to_document(format, &raw, path)?;
+    let collections = extract_collections_from_envelope(&envelope, path)?;
+
+    if collections.is_empty() {
+        return Err(Error::SchemaNotFound {
+            msg: format!(
+                "schema file `{}` has no entries under schema.jsonSchema.properties",
+                path.display(),
+            ),
+        });
+    }
+
+    let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+    by_db.insert(FILE_MODE_DB_PLACEHOLDER.to_string(), collections);
+    Ok(by_db)
 }
 
 /// Loads the schema from `__sql_schemas` in the configured database.
@@ -488,8 +729,16 @@ impl SchemaRefreshHandle {
     /// Returns when the task has fully exited. If the task panicked, the
     /// `JoinError` is logged and discarded; we do not propagate panics from
     /// the background task into the shutdown caller.
+    ///
+    /// Uses `notify_one()` rather than `notify_waiters()` so the permit
+    /// persists when the spawned task hasn't yet registered its first
+    /// `notified()` future. `notify_waiters()` only wakes pre-existing
+    /// waiters and is dropped on the floor if the task is still in the
+    /// "spawned but not yet polled" state — which is exactly what happens
+    /// when callers shut a client down immediately after `test_connection()`
+    /// on a `current_thread` runtime.
     pub async fn shutdown(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         if let Err(e) = self.join.await {
             tracing::warn!(
                 target: "mongosql_driver::schema",

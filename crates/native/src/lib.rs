@@ -13,13 +13,14 @@
 extern crate napi_derive;
 
 mod client;
-mod config;
-// `error`, `execute`, `schema`, and `translate` are `pub` so the in-tree
-// integration test targets under `tests/` can reach them via
+// `config`, `error`, `execute`, `schema`, and `translate` are `pub` so the
+// in-tree integration test targets under `tests/` can reach them via
 // `use cubejs_mongosql_driver_native::*`. They are NOT part of the napi-rs
 // surface (`MongoSqlClient` in `client.rs` is); Node consumers see them only
-// through that wrapper. Other modules stay private until a real Rust
-// consumer needs them.
+// through that wrapper. `config::ClientConfig` is exposed by napi-rs as an
+// object on its own, but the module path stays accessible to Rust callers.
+// Other modules stay private until a real Rust consumer needs them.
+pub mod config;
 pub mod error;
 pub mod execute;
 pub mod schema;
