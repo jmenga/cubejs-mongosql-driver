@@ -71,9 +71,6 @@
     "@cubejs-backend/base-driver": "^1.6.0",
     "@cubejs-backend/schema-compiler": "^1.6.0"
   },
-  "dependencies": {
-    "@node-rs/helper": "^1.6.0"
-  },
   "optionalDependencies": {
     "cubejs-mongosql-driver-linux-x64-gnu": "0.1.0-pre.0",
     "cubejs-mongosql-driver-linux-arm64-gnu": "0.1.0-pre.0",

@@ -7,10 +7,6 @@ settings:
 importers:
 
   .:
-    dependencies:
-      '@node-rs/helper':
-        specifier: ^1.6.0
-        version: 1.6.0
     devDependencies:
       '@cubejs-backend/base-driver':
         specifier: ^1.6.26
@@ -1079,14 +1075,8 @@ packages:
     engines: {node: '>= 10'}
     hasBin: true
 
-  '@napi-rs/triples@1.2.0':
-    resolution: {integrity: sha512-HAPjR3bnCsdXBsATpDIP5WCrw0JcACwhhrwIAQhiR46n+jm+a2F8kBsfseAuWtSyQ+H3Yebt2k43B5dy+04yMA==}
-
   '@nodable/entities@2.1.0':
     resolution: {integrity: sha512-nyT7T3nbMyBI/lvr6L5TyWbFJAI9FTgVRakNoBqCD+PmID8DzFrrNdLLtHMwMszOtqZa8PAOV24ZqDnQrhQINA==}
-
-  '@node-rs/helper@1.6.0':
-    resolution: {integrity: sha512-2OTh/tokcLA1qom1zuCJm2gQzaZljCCbtX1YCrwRVd/toz7KxaDRFeLTAPwhs8m9hWgzrBn5rShRm6IaZofCPw==}
 
   '@oclif/color@0.1.2':
     resolution: {integrity: sha512-M9o+DOrb8l603qvgz1FogJBUGLqcMFL1aFg2ZEL0FbXJofiNTLOWIeB4faeZTLwE6dt0xH9GpCVpzksMMzGbmA==}
@@ -5131,13 +5121,7 @@ snapshots:
 
   '@napi-rs/cli@2.18.4': {}
 
-  '@napi-rs/triples@1.2.0': {}
-
   '@nodable/entities@2.1.0': {}
-
-  '@node-rs/helper@1.6.0':
-    dependencies:
-      '@napi-rs/triples': 1.2.0
 
   '@oclif/color@0.1.2':
     dependencies:
