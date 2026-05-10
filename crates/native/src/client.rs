@@ -43,6 +43,11 @@ impl MongoSqlClient {
 
     /// Translate `sql` and execute the resulting MQL pipeline. Returns rows
     /// as a JSON array. See FR-4.
+    ///
+    /// As of T07 the translation half (`crate::translate::translate`) is
+    /// available, but wiring it through here is deferred to T09 so that the
+    /// query path lands together with the executor (T08) — partial wiring
+    /// would change error semantics under tests with no compensating value.
     #[napi]
     pub async fn query(&self, _sql: String) -> NapiResult<serde_json::Value> {
         Err(unimplemented("MongoSqlClient::query").into())
