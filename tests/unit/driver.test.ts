@@ -301,6 +301,34 @@ describe('MongoSqlDriver — query() row flattening', () => {
     const rows = await d.query<{ id: string; email: string }>('SELECT * FROM users');
     expect(rows).toEqual([{ id: 'u1', email: 'a@b' }]);
   });
+
+  // Critic v2 — Issue 4: query() must NOT silently ignore non-empty `values`.
+  // Mongosql v1.8.5 doesn't accept SQL parameters via the wire; ignoring
+  // them would produce a query that doesn't match the intended filter (a
+  // correctness bug, not a feature gap). Refuse explicitly.
+  it('refuses non-empty values argument with MONGOSQL_CONFIG_INVALID (Issue 4)', async () => {
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const err = (await d
+      .query('SELECT * FROM users WHERE id = ?', [1])
+      .catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_CONFIG_INVALID');
+    expect(err.message).toMatch(/parameteri[sz]ed/i);
+    // Native client never created — refusal is at the dispatch gate.
+    expect(createdClients).toBe(0);
+  });
+
+  it('accepts query() with no values argument (Issue 4)', async () => {
+    installMockNative({ query: vi.fn().mockResolvedValue([]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await expect(d.query('SELECT * FROM users')).resolves.toEqual([]);
+  });
+
+  it('accepts query() with explicit empty-array values (Issue 4)', async () => {
+    installMockNative({ query: vi.fn().mockResolvedValue([]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await expect(d.query('SELECT * FROM users', [])).resolves.toEqual([]);
+  });
 });
 
 describe('MongoSqlDriver — testConnection / lifecycle', () => {

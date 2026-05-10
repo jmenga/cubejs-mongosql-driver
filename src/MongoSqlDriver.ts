@@ -101,7 +101,20 @@ export class MongoSqlDriver extends BaseDriver {
     await client.testConnection();
   }
 
-  public override async query<R = unknown>(sql: string, _values?: unknown[], _options?: QueryOptions): Promise<R[]> {
+  public override async query<R = unknown>(sql: string, values?: unknown[], _options?: QueryOptions): Promise<R[]> {
+    // Critic v2 — Issue 4: refuse non-empty `values` explicitly. Cube
+    // passes a values array on some pre-aggregation paths; mongosql v1.8.5
+    // does not accept SQL parameters via the wire (no `?` / `$N`
+    // placeholder substitution at the translator layer), so silently
+    // ignoring `values` would produce queries that don't match the
+    // intended filter — a correctness bug, not a feature gap.
+    if (values !== undefined && values.length > 0) {
+      throw configInvalid(
+        'parameterized queries are not yet supported; mongosql v1.8.5 does not accept ' +
+          'SQL parameters via the wire — substitute literals server-side or in the ' +
+          "dialect (CubeJS's `BaseQuery.paramAllocator` builds the literal-substituted form).",
+      );
+    }
     if (projectionHasNameCollision(sql)) {
       throw translateFailed(
         'JOIN projection contains two or more qualified columns with the same name ' +
@@ -322,11 +335,11 @@ type EnvLike = NodeJS.ProcessEnv;
 
 function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike): MongoSqlConfig {
   const uri = override?.uri ?? env.CUBEJS_DB_URI;
-  if (!uri) throw configInvalid('uri (set CUBEJS_DB_URI or pass `uri` to the constructor)');
+  if (!uri) throw configInvalidMissing('uri (set CUBEJS_DB_URI or pass `uri` to the constructor)');
 
   const database = override?.database ?? env.CUBEJS_DB_NAME;
   if (!database) {
-    throw configInvalid('database (set CUBEJS_DB_NAME or pass `database` to the constructor)');
+    throw configInvalidMissing('database (set CUBEJS_DB_NAME or pass `database` to the constructor)');
   }
 
   const schemaSource = override?.schemaSource ?? schemaSourceFromEnv(env);
@@ -368,8 +381,12 @@ function boolEnv(v: string | undefined): boolean | undefined {
   return v.toLowerCase() === 'true' || v === '1';
 }
 
+function configInvalidMissing(detail: string): MongoSqlError {
+  return configInvalid(`missing required config: ${detail}`);
+}
+
 function configInvalid(detail: string): MongoSqlError {
-  const err = new Error(`MONGOSQL_CONFIG_INVALID: missing required config: ${detail}`) as MongoSqlError;
+  const err = new Error(`MONGOSQL_CONFIG_INVALID: ${detail}`) as MongoSqlError;
   err.code = 'MONGOSQL_CONFIG_INVALID';
   err.name = 'MongoSqlError';
   return err;
