@@ -14,13 +14,16 @@ extern crate napi_derive;
 
 mod client;
 mod config;
-mod error;
-mod execute;
-// `schema` is `pub` so the in-tree integration test target
-// (`tests/schema_collection.rs`) can `use cubejs_mongosql_driver_native::schema`.
-// Other modules stay private until a real Rust consumer needs them.
+// `error`, `execute`, `schema`, and `translate` are `pub` so the in-tree
+// integration test targets under `tests/` can reach them via
+// `use cubejs_mongosql_driver_native::*`. They are NOT part of the napi-rs
+// surface (`MongoSqlClient` in `client.rs` is); Node consumers see them only
+// through that wrapper. Other modules stay private until a real Rust
+// consumer needs them.
+pub mod error;
+pub mod execute;
 pub mod schema;
-mod translate;
+pub mod translate;
 
 pub use client::MongoSqlClient;
 
