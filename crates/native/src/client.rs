@@ -17,9 +17,12 @@ pub struct MongoSqlClient {
 #[napi]
 impl MongoSqlClient {
     /// Construct a new client. No I/O is performed.
+    /// Validation is deferred to `test_connection()` (FR-1) so the constructor
+    /// stays infallible — napi-rs 2.16's `#[napi(constructor)]` requires `Self`
+    /// directly, not `Result<Self>`.
     #[napi(constructor)]
-    pub fn new(config: ClientConfig) -> NapiResult<Self> {
-        Ok(Self { _config: config })
+    pub fn new(config: ClientConfig) -> Self {
+        Self { _config: config }
     }
 
     /// Verify cluster connectivity and load initial schema. Spawns the schema

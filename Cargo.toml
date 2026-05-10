@@ -14,8 +14,11 @@ napi-derive = "2.16"
 napi-build = "2.1"
 
 # MongoDB
-mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-3-0"] }
-bson = "2.13"
+# Default features include the tokio runtime which the napi-rs `tokio_rt`
+# feature provides; rustls-tls is required for Atlas. Avoid `compat-3-3-0` —
+# that flag is for migrating from 2.x to 3.x, not for new code.
+mongodb = { version = "3", features = ["rustls-tls"] }
+bson = "2"
 
 # MongoSQL translator — open-source MongoDB Apache-2.0 crate.
 # Confirmed by T00 spike: NOT published to crates.io (Cargo.toml in upstream
