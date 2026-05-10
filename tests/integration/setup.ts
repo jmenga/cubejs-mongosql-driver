@@ -1,50 +1,97 @@
 /**
  * Vitest globalSetup for integration tests.
- * Brings up `tests/integration/docker-compose.test.yml`, waits for healthy,
- * and verifies that `__sql_schemas` was populated.
  *
- * Tear-down is handled by returning a cleanup function.
+ * Brings up `tests/integration/docker-compose.test.yml`, waits for atlas-local
+ * to be healthy AND for `__sql_schemas` to be populated, and exports a default
+ * `TEST_MONGO_URI` for tests that don't set one.
+ *
+ * Tear-down: by default we only stop containers (`down`, no `-v`) so the next
+ * `pnpm test:integration` run can reuse the seeded volume and skip the ~30 s
+ * mongod-replicaset bootstrap. Set `INTEGRATION_TEARDOWN=destroy` to force
+ * `down -v` (used by `make e2e`).
+ *
+ * Set `INTEGRATION_TEARDOWN=keep` to leave containers running between runs
+ * (useful for iterative test development — pair with `make e2e:up`).
+ *
+ * Required env (with sensible defaults):
+ *   - TEST_MONGO_URI       default: admin/admin@localhost:27017 directConnection
+ *   - INTEGRATION_TEARDOWN default: 'stop' ('keep' | 'stop' | 'destroy')
  */
 import { execSync, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const COMPOSE_FILE = './tests/integration/docker-compose.test.yml';
+const DEFAULT_URI = 'mongodb://admin:admin@localhost:27017/?authSource=admin&directConnection=true';
 
-async function waitForHealthy(service: string, maxSeconds = 90): Promise<void> {
+async function waitForHealthy(service: string, maxSeconds = 180): Promise<void> {
   const deadline = Date.now() + maxSeconds * 1000;
   while (Date.now() < deadline) {
     try {
-      const out = execSync(
-        `docker compose -f ${COMPOSE_FILE} ps --format json ${service}`,
-        { encoding: 'utf-8' },
-      );
+      const out = execSync(`docker compose -f ${COMPOSE_FILE} ps --format json ${service}`, {
+        encoding: 'utf-8',
+      });
       const lines = out.trim().split('\n').filter(Boolean);
       for (const line of lines) {
         const entry = JSON.parse(line);
         if (entry.Health === 'healthy') return;
       }
     } catch {
-      // ignore — container may not be up yet
+      // container may not be up yet
     }
     await sleep(2000);
   }
   throw new Error(`Service ${service} did not become healthy within ${maxSeconds}s`);
 }
 
+async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
+  // mongodb-atlas-local runs init scripts asynchronously after the healthcheck
+  // first reports green — poll __sql_schemas until it's seeded.
+  const deadline = Date.now() + maxSeconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const out = execSync(
+        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments()'`,
+        { encoding: 'utf-8' },
+      ).trim();
+      const n = parseInt(out, 10);
+      if (Number.isFinite(n) && n >= 3) return;
+    } catch {
+      // mongosh may not be ready yet
+    }
+    await sleep(2000);
+  }
+  throw new Error(`__sql_schemas was not populated within ${maxSeconds}s`);
+}
+
 export default async function setup() {
+  if (!process.env.TEST_MONGO_URI) process.env.TEST_MONGO_URI = DEFAULT_URI;
+
+  const teardownMode = process.env.INTEGRATION_TEARDOWN ?? 'stop';
+
   // eslint-disable-next-line no-console
   console.log('integration setup: starting docker compose...');
-  spawn('docker', ['compose', '-f', COMPOSE_FILE, 'up', '-d'], {
-    stdio: 'inherit',
-  });
+  spawn('docker', ['compose', '-f', COMPOSE_FILE, 'up', '-d'], { stdio: 'inherit' });
 
   await waitForHealthy('atlas-local');
   // eslint-disable-next-line no-console
   console.log('integration setup: atlas-local healthy');
 
+  await waitForSqlSchemas();
+  // eslint-disable-next-line no-console
+  console.log('integration setup: __sql_schemas populated');
+
   return async () => {
+    if (teardownMode === 'keep') {
+      // eslint-disable-next-line no-console
+      console.log('integration teardown: keeping compose stack (INTEGRATION_TEARDOWN=keep)');
+      return;
+    }
     // eslint-disable-next-line no-console
-    console.log('integration teardown: stopping docker compose...');
-    execSync(`docker compose -f ${COMPOSE_FILE} down -v`, { stdio: 'inherit' });
+    console.log(`integration teardown: stopping docker compose (mode=${teardownMode})...`);
+    const cmd =
+      teardownMode === 'destroy'
+        ? `docker compose -f ${COMPOSE_FILE} down -v`
+        : `docker compose -f ${COMPOSE_FILE} down`;
+    execSync(cmd, { stdio: 'inherit' });
   };
 }

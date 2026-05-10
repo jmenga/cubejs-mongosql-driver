@@ -9,7 +9,7 @@ const COMPOSE_FILE = './tests/integration/docker-compose.test.yml';
 
 function mongoshEval(script: string): string {
   return execSync(
-    `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet --eval ${JSON.stringify(script)}`,
+    `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval ${JSON.stringify(script)}`,
     { encoding: 'utf-8' },
   ).trim();
 }
@@ -26,7 +26,9 @@ describe('docker harness', () => {
   });
 
   it('seed-schemas populated __sql_schemas', () => {
-    const out = mongoshEval('db.getSiblingDB("mongosql_test").__sql_schemas.countDocuments()');
+    // mongosh's `db` proxy chokes on dot-access for collections starting with
+    // `_`; use bracket-form via getCollection() to read the count.
+    const out = mongoshEval('db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments()');
     expect(parseInt(out, 10)).toBeGreaterThanOrEqual(3);
   });
 });
