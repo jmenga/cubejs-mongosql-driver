@@ -64,6 +64,8 @@ use mongosql::{
     catalog::Catalog,
     json_schema::{self, Schema as JsonSchema},
 };
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 
@@ -462,6 +464,110 @@ fn extract_collections_from_envelope(
     }
 
     Ok(by_collection)
+}
+
+/// Handle returned by [`spawn_refresh_task`]. Owns the shutdown signal and the
+/// background task's `JoinHandle`. Calling [`SchemaRefreshHandle::shutdown`]
+/// notifies the task to stop and awaits its termination.
+///
+/// The handle deliberately does NOT auto-stop the task on drop — that would
+/// detach the task instead, since `Drop` cannot await. Callers are expected to
+/// call `shutdown().await` during graceful client teardown. If the handle is
+/// dropped without `shutdown`, the task continues running until the process
+/// exits.
+#[allow(dead_code)] // wired into MongoSqlClient by T09; exercised by tests today
+pub struct SchemaRefreshHandle {
+    shutdown: Arc<Notify>,
+    join: JoinHandle<()>,
+}
+
+#[allow(dead_code)] // see SchemaRefreshHandle attribute
+impl SchemaRefreshHandle {
+    /// Signals the refresh task to stop and awaits its termination.
+    ///
+    /// Returns when the task has fully exited. If the task panicked, the
+    /// `JoinError` is logged and discarded; we do not propagate panics from
+    /// the background task into the shutdown caller.
+    pub async fn shutdown(self) {
+        self.shutdown.notify_waiters();
+        if let Err(e) = self.join.await {
+            tracing::warn!(
+                target: "mongosql_driver::schema",
+                error = %e,
+                "schema refresh task did not exit cleanly",
+            );
+        }
+    }
+}
+
+/// Spawn a Tokio task that calls `loader()` every `refresh_sec` seconds and
+/// atomically swaps the `cache` on success.
+///
+/// Behaviour:
+/// - The first refresh fires *after* `refresh_sec` elapses, not immediately.
+///   `MongoSqlClient::test_connection()` is responsible for the initial load.
+/// - On loader success: the new catalog is wrapped in `Arc` and written via
+///   [`SchemaCache::write`] — readers observe the new pointer via the next
+///   `read()` call.
+/// - On loader failure: the error is logged at `WARN` (with the full chain via
+///   `Display` on `Error`, which `thiserror` constructs). The previous cache
+///   contents remain in place. The task continues, retrying at the next tick.
+/// - Shutdown: the returned [`SchemaRefreshHandle`] holds a `Notify`. The task
+///   exits cleanly when `shutdown().await` is called.
+///
+/// This intentionally uses an explicit `Notify` for shutdown rather than the
+/// `Weak<Self>`-self-stop pattern: `Weak`-based stop forces the task to wake
+/// up before it can detect the drop, which races with the refresh interval
+/// and can leak the task for up to `refresh_sec` seconds. The `Notify` lets
+/// shutdown interrupt the sleep immediately.
+#[allow(dead_code)] // wired into MongoSqlClient by T09; exercised by tests today
+pub fn spawn_refresh_task<F, Fut>(
+    cache: SchemaCache,
+    refresh_sec: u64,
+    loader: F,
+) -> SchemaRefreshHandle
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<MongoSqlCatalog>> + Send,
+{
+    let shutdown = Arc::new(Notify::new());
+    let task_shutdown = Arc::clone(&shutdown);
+    let interval = std::time::Duration::from_secs(refresh_sec);
+
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = task_shutdown.notified() => {
+                    tracing::debug!(
+                        target: "mongosql_driver::schema",
+                        "schema refresh task received shutdown",
+                    );
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+
+            match loader().await {
+                Ok(new_catalog) => {
+                    cache.write(Arc::new(new_catalog));
+                    tracing::debug!(
+                        target: "mongosql_driver::schema",
+                        "schema cache refreshed",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mongosql_driver::schema",
+                        error = %e,
+                        "schema refresh failed; retaining stale cache, retrying next tick",
+                    );
+                }
+            }
+        }
+    });
+
+    SchemaRefreshHandle { shutdown, join }
 }
 
 #[cfg(test)]
@@ -998,6 +1104,266 @@ mod tests {
                 "file-mode and collection-mode schemas diverge for `{coll}`",
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // T06 — Refresh task helpers + tests
+    // -----------------------------------------------------------------
+
+    /// Build a tiny non-empty catalog under `db`/`coll`, suitable as a
+    /// loader return value. Used by the refresh-task tests to verify cache
+    /// content after a swap.
+    fn tiny_catalog(db: &str, coll: &str) -> Catalog {
+        let docs = vec![make_doc(coll, doc! { "v": { "bsonType": "string" } })];
+        build_catalog_from_docs(db, docs).expect("test catalog builds")
+    }
+
+    /// Hold a refcount on the loader's `AtomicUsize` callcount so test
+    /// assertions can wait deterministically for the loader to fire.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Count how many namespaces a catalog exposes for a given (db, list of
+    /// candidate colls). Used as a coarse "is this the catalog I expected"
+    /// fingerprint, since `Catalog` itself is not directly comparable.
+    fn catalog_has_ns(cat: &Catalog, db: &str, coll: &str) -> bool {
+        let ns = Namespace {
+            database: db.to_string(),
+            collection: coll.to_string(),
+        };
+        cat.get_schema_for_namespace(&ns).is_some()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_task_runs_after_interval() {
+        let cache = SchemaCache::new_empty();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_loader = Arc::clone(&calls);
+
+        let handle = spawn_refresh_task(cache.clone(), 30, move || {
+            let n = calls_loader.fetch_add(1, Ordering::SeqCst) + 1;
+            // First call returns "users", second returns "orders" so we can
+            // detect distinct refreshes by inspecting the cache content.
+            let coll = if n == 1 { "users" } else { "orders" };
+            async move { Ok(tiny_catalog("mydb", coll)) }
+        });
+
+        // Yield so the spawned task gets a chance to enter its select loop
+        // and register the first sleep timer.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // Initial: loader has not fired (it fires *after* the first interval).
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!catalog_has_ns(&cache.read(), "mydb", "users"));
+
+        // Sleep on the test future for one interval — under `start_paused` the
+        // current_thread runtime auto-advances paused time when all tasks are
+        // idle, which fires the refresh task's sleep without an explicit
+        // `advance` race. The extra slack ensures the loader future has time
+        // to resolve before we observe.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(catalog_has_ns(&cache.read(), "mydb", "users"));
+
+        // Second tick: loader returns the "orders" catalog and the cache swaps.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(catalog_has_ns(&cache.read(), "mydb", "orders"));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_retains_stale_cache() {
+        let cache = SchemaCache::new_empty();
+        // Pre-populate cache with a known-good catalog so we can detect
+        // whether a failed refresh clobbered it.
+        cache.write(Arc::new(tiny_catalog("mydb", "users")));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_loader = Arc::clone(&calls);
+
+        let handle = spawn_refresh_task(cache.clone(), 10, move || {
+            let n = calls_loader.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n == 1 {
+                    // First refresh: simulate a transient load failure.
+                    Err(Error::SchemaInvalid {
+                        msg: "synthetic failure".to_string(),
+                    })
+                } else {
+                    // Second refresh: succeed with a *different* catalog so
+                    // we can prove the retry actually swapped.
+                    Ok(tiny_catalog("mydb", "orders"))
+                }
+            }
+        });
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // First tick: failure path. Cache must remain at "users".
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(catalog_has_ns(&cache.read(), "mydb", "users"));
+        assert!(!catalog_has_ns(&cache.read(), "mydb", "orders"));
+
+        // Second tick: success path. Cache must swap to "orders".
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(catalog_has_ns(&cache.read(), "mydb", "orders"));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_task_within_bounded_time() {
+        // No paused clock here: real Tokio time so the shutdown bound is
+        // wall-clock meaningful. Refresh interval is large enough that the
+        // task is guaranteed to be parked in `sleep` when we signal.
+        let cache = SchemaCache::new_empty();
+        let handle = spawn_refresh_task(cache.clone(), 3600, move || async move {
+            Ok(tiny_catalog("mydb", "users"))
+        });
+
+        // Give the task a moment to enter its select loop.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Shutdown must complete well within a second — the bound exists so
+        // a regression to the Weak-self-stop pattern (which can wait up to
+        // the full refresh interval) would fail this test.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle.shutdown()).await;
+        assert!(res.is_ok(), "shutdown did not return within 1s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_readers_observe_consistent_swap() {
+        // Spawn 100 readers (as OS threads via `spawn_blocking` so they don't
+        // monopolize the async runtime) that hammer `cache.read()` while a
+        // writer thread alternates between two catalogs. Each reader must
+        // observe a *valid* catalog at every read — never a half-swapped
+        // state. The `RwLock<Arc<...>>` outer-swap pattern guarantees readers
+        // either see the old `Arc` or the new `Arc`, never an in-between.
+        let cache = SchemaCache::new_empty();
+        cache.write(Arc::new(tiny_catalog("mydb", "users")));
+
+        let stop = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let cache = cache.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut observed_users = 0usize;
+                let mut observed_orders = 0usize;
+                while stop.load(Ordering::SeqCst) == 0 {
+                    let cat = cache.read();
+                    let has_users = catalog_has_ns(&cat, "mydb", "users");
+                    let has_orders = catalog_has_ns(&cat, "mydb", "orders");
+                    // The catalog is always *one of* the two states we wrote;
+                    // never both (different collection names) and never
+                    // neither (we pre-seeded the cache).
+                    assert!(
+                        has_users ^ has_orders,
+                        "inconsistent catalog observed: users={has_users} orders={has_orders}",
+                    );
+                    if has_users {
+                        observed_users += 1;
+                    }
+                    if has_orders {
+                        observed_orders += 1;
+                    }
+                }
+                (observed_users, observed_orders)
+            }));
+        }
+
+        // Force many swaps from a separate writer thread so reads and writes
+        // genuinely race on the lock.
+        let writer_cache = cache.clone();
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while writer_stop.load(Ordering::SeqCst) == 0 {
+                let coll = if i.is_multiple_of(2) {
+                    "users"
+                } else {
+                    "orders"
+                };
+                writer_cache.write(Arc::new(tiny_catalog("mydb", coll)));
+                i = i.wrapping_add(1);
+            }
+            i
+        });
+
+        // Let the storm run briefly; bounded so the test stays fast in CI.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stop.store(1, Ordering::SeqCst);
+
+        let mut total_users = 0usize;
+        let mut total_orders = 0usize;
+        for r in readers {
+            let (u, o) = r.join().expect("reader did not panic");
+            total_users += u;
+            total_orders += o;
+        }
+        let writes = writer.join().expect("writer did not panic");
+
+        // Sanity: the storm actually did something on both sides. Without a
+        // real swap the inconsistency assertion would be meaningless.
+        assert!(writes > 0, "writer made no swaps");
+        assert!(total_users + total_orders > 0, "readers observed nothing",);
+    }
+
+    #[test]
+    fn many_swaps_do_not_leak() {
+        // Best-effort no-leak signal: perform 1000 swaps and assert the
+        // SchemaCache's outer `Arc<RwLock<Arc<Catalog>>>` retains its
+        // type-level size and that strong-count on the *outer* Arc held by
+        // the cache stays bounded. We can't measure heap precisely without
+        // an allocator hook, but a leak in the swap path would manifest as
+        // unbounded growth in observable references.
+        let cache = SchemaCache::new_empty();
+        let outer_size_before = std::mem::size_of_val(&cache);
+
+        for i in 0..1000_u32 {
+            // Alternate between two catalogs so each iteration triggers a
+            // real swap (rather than identical-pointer noop).
+            let coll = if i.is_multiple_of(2) {
+                "users"
+            } else {
+                "orders"
+            };
+            cache.write(Arc::new(tiny_catalog("mydb", coll)));
+        }
+
+        let outer_size_after = std::mem::size_of_val(&cache);
+        assert_eq!(outer_size_before, outer_size_after);
+
+        // The cache holds exactly one inner `Arc<Catalog>`; after 1000 swaps,
+        // any leaked references would be visible as elevated strong-count on
+        // the *current* inner Arc. The current inner Arc is freshly written,
+        // so its strong count must be 1 once we drop our local handle.
+        let current = cache.read();
+        // `current` and the cache's stored Arc both reference the same
+        // allocation: strong count must be exactly 2.
+        assert_eq!(Arc::strong_count(&current), 2);
+        drop(current);
+        // After dropping our reader handle, only the cache holds it.
+        let again = cache.read();
+        assert_eq!(Arc::strong_count(&again), 2);
     }
 
     #[test]

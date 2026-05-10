@@ -38,3 +38,8 @@ agg-ast = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables `tokio::time::pause`/`advance` for deterministic refresh
+# task tests in `schema.rs::tests`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
