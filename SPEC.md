@@ -66,9 +66,12 @@ The driver MUST:
 
 The driver MUST:
 
-- Translate every SQL query through `mongosql::translate(sql, schema)` using the cached schema.
-- Send the resulting MQL pipeline to MongoDB via `db.<collection>.aggregate(pipeline)` semantics through the official `mongodb` Rust crate.
-- Stream results using cursors (no full-result-set buffering for large queries).
+- Translate every SQL query through `mongosql::translate_sql(default_db, sql, &Catalog, SqlOptions)` using the cached `Catalog`.
+- Inspect the returned `Translation.target_collection: Option<String>`:
+  - `Some(name)` → run as `db.<name>.aggregate(pipeline)`
+  - `None` → run as a database-level aggregate (`db.aggregate(pipeline)`) — for queries that span or operate independently of any single collection
+- Send the resulting MQL pipeline (`Translation.pipeline: bson::Bson`) to MongoDB through the official `mongodb` Rust crate.
+- Drain the cursor up to `CUBEJS_MONGOSQL_MAX_ROWS`; throw `MONGOSQL_RESULT_TOO_LARGE` if the cap is exceeded.
 - Marshal BSON values to JSON-compatible primitives the Node side can consume.
 - Surface translation errors and execution errors with clear, actionable messages — wrapped in Cube's expected error shapes where applicable.
 
@@ -112,15 +115,17 @@ All configuration via standard Cube env vars where they exist; new `CUBEJS_MONGO
 | `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no | `300` | Refresh interval in seconds |
 | `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN` | no | `false` | If `true`, don't fail testConnection on initial schema-load failure |
 | `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | no | `60000` | Per-query timeout |
+| `CUBEJS_MONGOSQL_MAX_ROWS` | no | `100000` | Max rows returned per query (driver buffers; see NFR-1). Exceeding throws `MONGOSQL_RESULT_TOO_LARGE` |
 
 ## 4. Non-functional requirements
 
 ### NFR-1 — Performance
 
 - **Schema cache reads**: O(1) — read lock acquisition + in-memory map lookup.
-- **Hot-path translation**: `mongosql::translate` measured to be sub-millisecond for typical OLAP queries; treat as effectively free.
+- **Hot-path translation**: `mongosql::translate_sql` measured to be sub-millisecond for typical OLAP queries; treat as effectively free.
 - **Schema refresh**: must not block queries. Use Tokio's interval timer + atomic-pointer cache swap.
-- **Pre-agg builds**: cursor-based streaming; bounded memory regardless of result set size.
+- **Result transport**: napi-rs has no `AsyncIterator` macro for Rust→Node, so the driver buffers query results into a `serde_json::Value::Array` before returning. To bound memory, queries are capped at `CUBEJS_MONGOSQL_MAX_ROWS` (default 100000); the driver throws `MONGOSQL_RESULT_TOO_LARGE` if exceeded. Streaming via `ThreadsafeFunction` is a post-MVP enhancement.
+- **Pre-agg builds**: same row-cap applies. For partitioned pre-aggs, partition_granularity should be chosen so each partition stays under the cap. Driver-level guidance documented in README troubleshooting.
 
 ### NFR-2 — Compatibility
 
@@ -170,6 +175,7 @@ export interface MongoSqlConfig {
   schemaRefreshSec?: number;        // defaults to 300
   schemaFailOpen?: boolean;         // defaults to false
   queryTimeoutMs?: number;          // defaults to 60000
+  maxRows?: number;                 // defaults to 100000
 }
 
 // src/MongoSqlDriver.ts
@@ -190,6 +196,25 @@ export class MongoSqlQuery extends BaseQuery {
 
 ### 5.2 Rust (`crates/native/`)
 
+The driver wraps the open-source [`mongodb/mongosql`](https://github.com/mongodb/mongosql) crate (Apache-2.0). That crate is **not published to crates.io**; it is consumed via a git source pinned to a release tag.
+
+```toml
+# Cargo.toml workspace dep — concrete tag chosen at T03 implementation
+mongosql = { git = "https://github.com/mongodb/mongosql", tag = "v1.0.0-beta-1" }
+```
+
+The `mongosql` API surface we use:
+
+| What | Symbol |
+|---|---|
+| Schema container | `mongosql::catalog::Catalog` |
+| Build catalog from schemas | `mongosql::build_catalog_from_catalog_schema(BTreeMap<db, BTreeMap<coll, json_schema::Schema>>) -> Catalog` |
+| Translate SQL → MQL | `mongosql::translate_sql(current_db: &str, sql: &str, catalog: &Catalog, options: SqlOptions) -> Result<Translation, mongosql::Error>` |
+| Translation result | `Translation { target_db: String, target_collection: Option<String>, pipeline: bson::Bson, result_set_schema: ... }` |
+| Discover referenced namespaces (optional) | `mongosql::get_namespaces(current_db: &str, sql: &str) -> Result<HashSet<Namespace>, _>` |
+
+Our napi-rs surface:
+
 ```rust
 // crates/native/src/lib.rs
 #[napi]
@@ -204,6 +229,7 @@ impl MongoSqlClient {
     pub async fn test_connection(&self) -> napi::Result<()>;
 
     /// Returns rows as JSON array (BSON values → JSON values).
+    /// Buffered up to ClientConfig.max_rows; exceeds throw RESULT_TOO_LARGE.
     #[napi]
     pub async fn query(&self, sql: String) -> napi::Result<serde_json::Value>;
 
@@ -223,6 +249,7 @@ pub struct ClientConfig {
     pub schema_refresh_sec: u32,
     pub schema_fail_open: bool,
     pub query_timeout_ms: u32,
+    pub max_rows: u32,
 }
 ```
 
@@ -268,6 +295,7 @@ All driver errors thrown to Cube MUST be `Error` instances with `name` and `mess
 | `MONGOSQL_TRANSLATE_FAILED` | `mongosql::translate` rejected SQL | Check column names, types vs schema |
 | `MONGOSQL_EXECUTE_FAILED` | Aggregation pipeline failed at MongoDB | Check Mongo logs; reproduce with `mongosql-cli` |
 | `MONGOSQL_TIMEOUT` | Query exceeded `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | Add pre-agg, optimize query, increase timeout |
+| `MONGOSQL_RESULT_TOO_LARGE` | Cursor returned more rows than `CUBEJS_MONGOSQL_MAX_ROWS` | Add pre-agg, narrow filter, raise cap |
 
 ## 7. Out of scope (deferred)
 

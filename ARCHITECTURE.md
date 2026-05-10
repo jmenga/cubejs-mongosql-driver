@@ -98,8 +98,9 @@ pub enum SchemaSource {
 ┌─ test_connection() ───────────────────────────────────────────────┐
 │   Run mongo `ping` admin command                                  │
 │   Load schema (Collection or File path)                           │
-│     - Collection: query __sql_schemas; build mongosql::Schema     │
-│     - File: read+parse YAML/JSON; build mongosql::Schema          │
+│     - Collection: query __sql_schemas; build mongosql::Catalog    │
+│       via build_catalog_from_catalog_schema(...)                  │
+│     - File: read+parse YAML/JSON; build same Catalog              │
 │   Acquire cache write lock; replace cache contents                │
 │   Spawn refresh task (Tokio interval, schema_refresh_sec)         │
 │   Return Ok(())                                                   │
@@ -113,17 +114,22 @@ pub enum SchemaSource {
 
 ┌─ query(sql) (per-query, hot path) ────────────────────────────────┐
 │   Acquire cache read lock (cheap)                                 │
-│   mongosql::translate(sql, &cached_schema) → MQL pipeline         │
+│   mongosql::translate_sql(default_db, sql, &Catalog, opts)        │
+│       → Translation { target_db, target_collection, pipeline }    │
 │   Drop read lock (translation is in-memory)                       │
-│   Execute MQL via mongodb crate (cursor)                          │
-│   Drain cursor; marshal BSON → JSON                               │
-│   Return rows                                                     │
+│   Execute MQL via mongodb crate                                   │
+│     - Some(coll): db.collection(coll).aggregate(pipeline)         │
+│     - None: db.aggregate(pipeline) (database-level)               │
+│   Drain cursor up to max_rows; marshal BSON → JSON                │
+│   Return rows (or RESULT_TOO_LARGE if cap exceeded)               │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
+**Eager-vs-lazy schema loading.** The current design eagerly loads all `__sql_schemas` documents at startup and caches them. The `mongosql` crate also exposes `get_namespaces(default_db, sql) -> HashSet<Namespace>` which would let us load only the schemas referenced by each query (lazy mode). Eager is sufficient for our scale (~20–50 collections per partner database). If a tenant catalog ever exceeds ~1000 collections, switch the loader to lazy: in `query()`, call `get_namespaces`, fetch any uncached schemas with TTL caching, then translate.
+
 ### 3.3 `__sql_schemas` document shape
 
-Each document represents one *namespace* (database). The `mongosql` crate consumes these as a `mongosql::SchemaCatalog`. Reference shape:
+Each document represents one *collection*'s schema, keyed by `_id` (the collection name) within a database. The `schema.rs` loader collects all such documents from a database, builds a `BTreeMap<String, json_schema::Schema>` (collection → schema), and constructs a `mongosql::catalog::Catalog` via `build_catalog_from_catalog_schema(BTreeMap<db_name, BTreeMap<coll_name, json_schema::Schema>>)`. Reference shape:
 
 ```json
 {
@@ -140,7 +146,7 @@ Each document represents one *namespace* (database). The `mongosql` crate consum
 }
 ```
 
-The mapping from this shape to `mongosql::Schema` is owned by the `schema.rs` module.
+The mapping from this shape to `mongosql::catalog::Catalog` is owned by the `schema.rs` module.
 
 ### 3.4 File schema format
 
@@ -182,21 +188,33 @@ TS MongoSqlDriver.query(sql)
   ▼ napi-rs (await Promise interop)
 Rust MongoSqlClient::query(sql)
   │
-  ├─ schema = self.cache.read().clone_arc()      // O(1) read lock
+  ├─ catalog = self.cache.read().clone()         // O(1) read lock; Arc<Catalog>
   │
-  ├─ pipeline = mongosql::translate(             // pure CPU
-  │     sql,
-  │     &schema,
-  │     &self.config.database,
-  │   )?
+  ├─ Translation { target_db, target_collection, pipeline, .. }
+  │    = mongosql::translate_sql(                // pure CPU
+  │        &self.config.database,                // current_db
+  │        &sql,
+  │        &catalog,
+  │        SqlOptions::default(),
+  │      )?
   │
-  ├─ db = self.mongo_client.database(&self.config.database)
-  ├─ coll = pipeline.first_collection()           // mongosql tells us
-  ├─ cursor = db.collection(&coll)
-  │              .aggregate(pipeline.stages, AggregateOptions {
-  │                cursor: { batchSize: 1000 },
-  │                max_time: Some(self.config.query_timeout_ms),
-  │              }).await?
+  ├─ db = self.mongo_client.database(&target_db)
+  ├─ // pipeline is bson::Bson — convert to Vec<Document> for mongodb crate
+  │   let stages: Vec<bson::Document> = bson_array_to_documents(pipeline)?;
+  │
+  ├─ cursor = match target_collection {
+  │     Some(name) => db.collection::<bson::Document>(&name)
+  │                     .aggregate(stages).await?,
+  │     None       => db.aggregate(stages).await?,    // database-level
+  │   };
+  │
+  ├─ // Drain with row cap; max_time applied to AggregateOptions
+  │   while let Some(doc) = cursor.try_next().await? {
+  │     if rows.len() >= self.config.max_rows {
+  │       return Err(Error::ResultTooLarge);
+  │     }
+  │     rows.push(bson_to_json(doc)?);
+  │   }
   │
   ├─ rows = Vec<serde_json::Value>::with_capacity(1024)
   ├─ while let Some(doc) = cursor.try_next().await? {
@@ -222,7 +240,8 @@ Rust MongoSqlClient::query(sql)
 | `DateTime` | `string` (ISO 8601) | Cube parses time dimensions from strings |
 | `Binary` | `{ "$binary": "<base64>", "$type": "<hex>" }` | EJSON form |
 | `Regex` | `{ "$regex": "...", "$options": "..." }` | EJSON form |
-| `Symbol`, `Code`, `Timestamp`, etc. | EJSON form | Rare in OLAP |
+| `Symbol`, `Code`, `Timestamp` | EJSON form | Rare in OLAP |
+| `MinKey`, `MaxKey`, `Undefined` | EJSON form (`$minKey: 1`, etc.) | Legacy; surface losslessly even if Cube ignores |
 
 Implementation: thin custom serializer in `execute.rs` calling `serde_json::Value::*` constructors directly — avoids the lossy generic BSON-to-JSON path.
 
@@ -234,6 +253,7 @@ Implementation: thin custom serializer in `execute.rs` calling `serde_json::Valu
 | `mongodb::error::Error` (connect) | `ConnectFailed` | `MONGOSQL_CONNECT_FAILED` |
 | `mongodb::error::Error` (other) | `ExecuteFailed` | `MONGOSQL_EXECUTE_FAILED` |
 | `mongosql::Error::*` | `TranslateFailed { msg }` | `MONGOSQL_TRANSLATE_FAILED` |
+| Cursor returned > `max_rows` | `ResultTooLarge` | `MONGOSQL_RESULT_TOO_LARGE` |
 | Schema parse / load | `SchemaInvalid` / `SchemaNotFound` | `MONGOSQL_SCHEMA_*` |
 | Tokio timeout | `Timeout` | `MONGOSQL_TIMEOUT` |
 

@@ -17,11 +17,14 @@ napi-build = "2.1"
 mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-3-0"] }
 bson = "2.13"
 
-# MongoSQL translator (open-source MongoDB Apache-2.0 crate).
-# NOTE: pin a known-good version; verify availability on crates.io vs git source
-# during T03 spike. The crate may be published under `mongosql` directly or only
-# vendored via the git repo — TBD at first build.
-# mongosql = { version = "...", default-features = false }
+# MongoSQL translator — open-source MongoDB Apache-2.0 crate.
+# Confirmed by T00 spike: NOT published to crates.io (Cargo.toml in upstream
+# declares version "0.0.0"). Consume via git source pinned to a release tag.
+# The exact tag is selected at T03 implementation time from the upstream
+# Releases page: https://github.com/mongodb/mongosql/releases
+# Example pin (revisit at T03):
+#   mongosql = { git = "https://github.com/mongodb/mongosql", tag = "v1.0.0-beta-1" }
+# mongosql = { ... }   # T03
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
