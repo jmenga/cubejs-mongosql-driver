@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# Cube image extended with cubejs-mongosql-driver.
+# Cube image extended with mongosql-cubejs-driver.
 #
 # Strategy:
 #   * Stage 1 (`builder`): native-Linux Rust toolchain compiles the
@@ -19,11 +19,14 @@
 #   which checks (in order):
 #     1. The closed `DriverDependencies` map — `mongosql` is NOT listed.
 #     2. `@cubejs-backend/${type}-driver` — we are not under that scope.
-#     3. `${type}-cubejs-driver` — our package is `cubejs-mongosql-driver`.
-#   None match. We bypass the lookup entirely with a custom `cube.js`
-#   `driverFactory` that explicitly `require()`s our package — see
-#   `cube/cube.js`. This is the same approach Cube documents for any
-#   community/third-party driver not yet in the closed map.
+#     3. `${type}-cubejs-driver` — our package is `mongosql-cubejs-driver`,
+#        which now matches this convention. T19b rename eliminated the
+#        previous dual-install workaround (canonical + alias).
+#   We still wire `driverFactory` + `dialectFactory` in `cube.js` because
+#   `OptsHandler.getDriverConcurrency` (v1.6.44 OptsHandler.ts:288) calls
+#   `lookupDriverClass(dbType)` unconditionally; with the matching name,
+#   that lookup succeeds and the explicit factories ensure Cube picks up
+#   our typed exports.
 
 ARG CUBE_VERSION=v1.6.44
 ARG TARGETARCH
@@ -118,47 +121,28 @@ WORKDIR /cube/conf
 # which are excluded by `package.json#files`. We add them manually
 # below.
 # Path relative to the repo-root build context.
-COPY examples/docker/pkg/cubejs-mongosql-driver-*.tgz /tmp/
+COPY examples/docker/pkg/mongosql-cubejs-driver-*.tgz /tmp/
 
 # Install the tarball into /cube/conf/node_modules. `npm install --no-save`
-# avoids editing any package.json.
+# avoids editing any package.json. Single install — the package name
+# (`mongosql-cubejs-driver`) matches Cube's resolver convention
+# `${type}-cubejs-driver`, so no alias install is needed.
 RUN cd /cube/conf \
     && npm init -y >/dev/null \
-    && npm install --no-save /tmp/cubejs-mongosql-driver-*.tgz
-
-# Create an alias install at `mongosql-cubejs-driver` so Cube's
-# `packageExists('${dbType}-cubejs-driver')` resolution path
-# (`@cubejs-backend/server-core`'s DriverResolvers.ts) finds *something*.
-# Required because `OptsHandler.getDriverConcurrency` (v1.6.44 OptsHandler.ts:288)
-# calls `lookupDriverClass(dbType)` UNCONDITIONALLY — even when the user
-# sets `driverFactory`/`dialectFactory` in cube.js. The alias is a copy
-# (not a symlink, because `require.resolve` of a relative `index.js`
-# inside a symlinked dir + the napi loader's `..` path arithmetic
-# resolves to the real path, not the alias path, so the loader still
-# finds the .node binary). The actual driver/dialect instances Cube
-# uses come from cube.js's factories, not this alias.
-RUN cp -r /cube/conf/node_modules/cubejs-mongosql-driver \
-         /cube/conf/node_modules/mongosql-cubejs-driver
+    && npm install --no-save /tmp/mongosql-cubejs-driver-*.tgz
 
 # Splice in the napi loader + native binary that the tarball misses.
 # Path the loader expects at runtime:
-#   /cube/conf/node_modules/cubejs-mongosql-driver/index.js
-#   /cube/conf/node_modules/cubejs-mongosql-driver/index.d.ts
-#   /cube/conf/node_modules/cubejs-mongosql-driver/cubejs-mongosql-driver-native.<triple>.node
+#   /cube/conf/node_modules/mongosql-cubejs-driver/index.js
+#   /cube/conf/node_modules/mongosql-cubejs-driver/index.d.ts
+#   /cube/conf/node_modules/mongosql-cubejs-driver/cubejs-mongosql-driver-native.<triple>.node
 #
-# `dist/src/native.js` does `require('../../index.js')` first then
-# `require('../index.js')` — copying to the package root satisfies the
-# second branch (consumed via `dist/index.js` → `dist/src/native.js`).
-COPY --from=builder /build/index.js     /cube/conf/node_modules/cubejs-mongosql-driver/index.js
-COPY --from=builder /build/index.d.ts   /cube/conf/node_modules/cubejs-mongosql-driver/index.d.ts
-COPY --from=builder /build/cubejs-mongosql-driver-native.*.node \
-                   /cube/conf/node_modules/cubejs-mongosql-driver/
-
-# Mirror the same files into the alias install so its native loader
-# can find the .node binary. Cube only needs the constructor surface
-# (`MongoSqlDriver` from dist/MongoSqlDriver.js) for the concurrency
-# probe, but `lookupDriverClass` does `require()` the package's
-# `main`, which transitively loads the native binary.
+# Note the `.node` filename keeps the `cubejs-mongosql-driver-native.*`
+# basename — that's the napi.name (preserved deliberately during the
+# T19b rename), not the npm package name. `dist/src/native.js` does
+# `require('../../index.js')` first then `require('../index.js')` —
+# copying to the package root satisfies the second branch (consumed
+# via `dist/index.js` → `dist/src/native.js`).
 COPY --from=builder /build/index.js     /cube/conf/node_modules/mongosql-cubejs-driver/index.js
 COPY --from=builder /build/index.d.ts   /cube/conf/node_modules/mongosql-cubejs-driver/index.d.ts
 COPY --from=builder /build/cubejs-mongosql-driver-native.*.node \

@@ -23,7 +23,7 @@ GitHub's repo metadata (https://api.github.com/repos/mongodb/mongosql) confirms 
 "license": {"key":"apache-2.0","name":"Apache License 2.0","spdx_id":"Apache-2.0"}
 ```
 
-No SSPL, no copyleft. Apache-2.0 is permissive and compatible with the cubejs-mongosql-driver project's MIT license (or whatever the project ends up adopting).
+No SSPL, no copyleft. Apache-2.0 is permissive and compatible with the mongosql-cubejs-driver project's MIT license (or whatever the project ends up adopting).
 
 ---
 

@@ -14,7 +14,7 @@
 │      Cube engine                                                    │
 │           │ SQL                                                     │
 │           ▼                                                         │
-│      cubejs-mongosql-driver (this package)                          │
+│      mongosql-cubejs-driver (this package)                          │
 │        ├─ MongoSqlDriver  (extends BaseDriver)                      │
 │        └─ MongoSqlQuery   (extends BaseQuery — dialect)             │
 │                  │                                                  │

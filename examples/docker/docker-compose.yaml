@@ -1,4 +1,4 @@
-# Docker Compose for cubejs-mongosql-driver E2E (IMPLEMENTATION_PLAN T19).
+# Docker Compose for mongosql-cubejs-driver E2E (IMPLEMENTATION_PLAN T19).
 #
 # Brings up:
 #   - atlas-local — MongoDB Atlas dev image (matches tests/integration
@@ -54,7 +54,7 @@ services:
       dockerfile: examples/docker/Dockerfile
       args:
         CUBE_VERSION: v1.6.44
-    image: cubejs-mongosql-driver-e2e:latest
+    image: mongosql-cubejs-driver-e2e:latest
     container_name: cubejs-mongosql-e2e-cube
     depends_on:
       atlas-local:
@@ -63,8 +63,11 @@ services:
       - '4000:4000'
     environment:
       # Cube tags this data source as 'mongosql' for caching/orchestration
-      # paths that key off the string. The driver-class lookup is bypassed
-      # by the `driverFactory` + `dialectFactory` overrides in cube.js.
+      # paths that key off the string. With the T19b rename, the package
+      # name `mongosql-cubejs-driver` matches Cube's `${type}-cubejs-driver`
+      # convention so the resolver finds it automatically. cube.js still
+      # sets `driverFactory` + `dialectFactory` to wire the dialect class
+      # explicitly — see comments in cube/cube.js.
       CUBEJS_DB_TYPE: mongosql
       # Cube container talks to atlas-local over the docker network.
       # `directConnection=true` + `authSource=admin` matches the

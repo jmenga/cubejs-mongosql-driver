@@ -1,5 +1,5 @@
 {
-  "name": "cubejs-mongosql-driver-linux-arm64-musl",
+  "name": "mongosql-cubejs-driver-linux-arm64-musl",
   "version": "0.1.0-pre.0",
   "os": [
     "linux"
@@ -18,7 +18,7 @@
   "libc": [
     "musl"
   ],
-  "description": "Linux arm64 (musl) prebuilt binary for cubejs-mongosql-driver",
+  "description": "Linux arm64 (musl) prebuilt binary for mongosql-cubejs-driver",
   "repository": {
     "type": "git",
     "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"

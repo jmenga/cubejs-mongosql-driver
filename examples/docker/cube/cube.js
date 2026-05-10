@@ -1,35 +1,28 @@
 /**
- * Cube configuration for the cubejs-mongosql-driver E2E example.
+ * Cube configuration for the mongosql-cubejs-driver E2E example.
  *
- * Driver-name resolution caveat (verified against
+ * Driver-name resolution (verified against
  * `@cubejs-backend/server-core@v1.6.44`'s
  * `src/core/DriverResolvers.ts::driverDependencies`):
  *
  *   The order of lookups is:
  *     1. closed `DriverDependencies` map — `mongosql` is NOT listed.
  *     2. `@cubejs-backend/${type}-driver` — we are not under that scope.
- *     3. `${type}-cubejs-driver` — our package is `cubejs-mongosql-driver`.
+ *     3. `${type}-cubejs-driver` — our package is `mongosql-cubejs-driver`,
+ *        which matches this convention (T19b rename eliminated the prior
+ *        dual-install workaround).
  *
- *   None match, so `CUBEJS_DB_TYPE=mongosql` would `throw new Error(
- *   'Unsupported db type: mongosql')`. We sidestep the lookup with both
- *   `driverFactory` AND `dialectFactory` overrides — Cube's default
- *   `dialectFactory` (in CubejsServerCore.ts) ALSO calls
- *   `lookupDriverClass(ctx.dbType).dialectClass()`, which would hit the
- *   same lookup path and throw. Overriding both is required for any
- *   driver whose package name doesn't match the conventions.
- *
- * Alternatives we considered and rejected:
- *   - Renaming the published package to `mongosql-cubejs-driver`. Breaks
- *     the napi-rs `optionalDependencies` block (T18) and the README
- *     install snippet (T20). Filed as a follow-up if zero-config install
- *     ever becomes a hard requirement.
- *   - Setting `CUBEJS_DRIVER_PATH=/path/to/...`. There is NO such env
- *     var in cube v1.6.44 — `DriverResolvers.ts` does not read it. The
- *     T19 task brief mentions this as a fallback, but reading the source
- *     shows it's unimplemented. `driverFactory` + `dialectFactory` is
- *     the only working mechanism.
+ *   With `CUBEJS_DB_TYPE=mongosql`, lookup (3) resolves to our package
+ *   automatically. We still set `driverFactory` + `dialectFactory`
+ *   explicitly because Cube's default `dialectFactory` calls
+ *   `lookupDriverClass(ctx.dbType).dialectClass()` and our driver uses
+ *   a separately-exported `MongoSqlQuery` class — wiring the dialect
+ *   directly gives Cube the full type info without depending on a
+ *   `dialectClass` static method on the driver. (Driver authors can
+ *   alternatively expose `MongoSqlDriver.dialectClass = () =>
+ *   MongoSqlQuery` and skip the dialectFactory override.)
  */
-const { MongoSqlDriver, MongoSqlQuery } = require('cubejs-mongosql-driver');
+const { MongoSqlDriver, MongoSqlQuery } = require('mongosql-cubejs-driver');
 
 module.exports = {
   driverFactory: () => new MongoSqlDriver({}),

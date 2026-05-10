@@ -1,5 +1,5 @@
 /**
- * Public exports for cubejs-mongosql-driver.
+ * Public exports for mongosql-cubejs-driver.
  * See SPEC.md §5.1.
  */
 export { MongoSqlDriver } from './MongoSqlDriver.js';

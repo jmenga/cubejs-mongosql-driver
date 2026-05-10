@@ -29,16 +29,12 @@
  *     the input scale per critic v2 issue 3 — STRING-form decimal,
  *     never a JS float. Total = 150+200.50+99.99+320+75.25 = 845.74.
  *
- * Known limitation surfaced during T19 (filed as a follow-up below):
- *   * mongosql v1.8.5's algebrizer rejects qualified column refs of
- *     the form `<table_alias>.<col>` even when the alias matches the
- *     FROM clause's collection (Error 3008 "Field `orders` ...").
- *     Cube's BaseQuery emits this form for every dimension, so any
- *     query with a `dimensions: [...]` term fails translation. The
- *     driver works correctly via direct SQL (verified in
- *     `tests/integration/basic-queries.test.ts`); the dialect needs a
- *     follow-up to suppress the table-alias prefix in single-cube
- *     queries. Tracked as a T13/T14 follow-up after T19.
+ * T19a follow-up (RESOLVED): mongosql v1.8.5's algebrizer rejected
+ * qualified `<alias>.<col>` refs in single-cube projections (Error 3008).
+ * MongoSqlQuery now overrides `autoPrefixWithCubeName` to drop the alias
+ * prefix when `this.join.joins.length === 0`, so `dimensions: [...]`
+ * queries on single-cube models now work. Covered below by the
+ * "dimension query" test, which would have failed pre-fix.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -77,11 +73,7 @@ async function loadQuery(body: object, attempt = 1): Promise<CubeLoadResponse> {
   // is ready. Mirror that here so the test isn't flaky on cold cache.
   if (res.ok) {
     const json = (await res.json()) as CubeLoadResponse | { error: string };
-    if (
-      'error' in json &&
-      typeof json.error === 'string' &&
-      /continue wait/i.test(json.error)
-    ) {
+    if ('error' in json && typeof json.error === 'string' && /continue wait/i.test(json.error)) {
       if (attempt > 30) {
         throw new Error(`Cube returned "Continue wait" 30 times — aborting`);
       }
@@ -95,7 +87,7 @@ async function loadQuery(body: object, attempt = 1): Promise<CubeLoadResponse> {
   throw new Error(`Cube load failed: HTTP ${res.status} — ${text}`);
 }
 
-describe('Cube E2E — cubejs-mongosql-driver via cubejs/cube image', () => {
+describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
   beforeAll(async () => {
     // /readyz is checked in setup.ts; an additional /meta call here
     // confirms the schema/cube are visible to the API gateway, not just
@@ -195,20 +187,36 @@ describe('Cube E2E — cubejs-mongosql-driver via cubejs/cube image', () => {
     const orders = meta.cubes.find((c) => c.name === 'orders');
     expect(orders).toBeDefined();
     // The model declares `count` + `totalAmount` measures.
-    const measureNames = (orders?.measures as Array<{ name: string }>).map(
-      (m) => m.name,
-    );
+    const measureNames = (orders?.measures as Array<{ name: string }>).map((m) => m.name);
     expect(measureNames).toContain('orders.count');
     expect(measureNames).toContain('orders.totalAmount');
-    // Dimensions are declared but currently unusable via /load due to
-    // the `<alias>.<col>` qualified-ref limitation in mongosql v1.8.5
-    // (see file header). The dimensions ARE visible in /meta which
-    // confirms the cube compiled.
-    const dimNames = (orders?.dimensions as Array<{ name: string }>).map(
-      (d) => d.name,
-    );
+    // T19a fix: dimensions are now usable via /load (the qualified-ref
+    // override in MongoSqlQuery.autoPrefixWithCubeName suppresses the
+    // alias prefix on single-cube projections).
+    const dimNames = (orders?.dimensions as Array<{ name: string }>).map((d) => d.name);
     expect(dimNames).toContain('orders.accountId');
     expect(dimNames).toContain('orders.status');
     expect(dimNames).toContain('orders.createdAt');
+  });
+
+  it('dimension query — count grouped by status (T19a regression test)', async () => {
+    // Pre-T19a fix: this query failed with mongosql Error 3008 because
+    // BaseQuery emitted `\`orders\`.status` in the SELECT projection.
+    // Post-fix: the dialect drops the alias prefix on single-cube
+    // projections and the query returns one row per distinct status.
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.status'],
+      },
+    });
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    // Seed has 3 paid + 1 pending + 1 refunded = 3 distinct statuses.
+    expect(body.data.length).toBe(3);
+    const byStatus = Object.fromEntries(body.data.map((r) => [r['orders.status'], Number(r['orders.count'])]));
+    expect(byStatus.paid).toBe(3);
+    expect(byStatus.pending).toBe(1);
+    expect(byStatus.refunded).toBe(1);
   });
 });

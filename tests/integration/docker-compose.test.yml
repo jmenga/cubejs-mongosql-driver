@@ -1,7 +1,7 @@
 services:
   atlas-local:
     image: mongodb/mongodb-atlas-local:8.0
-    container_name: cubejs-mongosql-driver-atlas
+    container_name: mongosql-cubejs-driver-atlas
     ports:
       - '27017:27017'
     environment:

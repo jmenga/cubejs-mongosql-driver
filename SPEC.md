@@ -1,4 +1,4 @@
-# `cubejs-mongosql-driver` — Specification
+# `mongosql-cubejs-driver` — Specification
 
 **Status:** Draft v1
 **Last reviewed:** 2026-05-09

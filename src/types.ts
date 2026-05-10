@@ -1,11 +1,9 @@
 /**
- * Public types for cubejs-mongosql-driver.
+ * Public types for mongosql-cubejs-driver.
  * See SPEC.md §5.1 for the contract.
  */
 
-export type SchemaSource =
-  | { kind: 'collection' }
-  | { kind: 'file'; path: string };
+export type SchemaSource = { kind: 'collection' } | { kind: 'file'; path: string };
 
 export interface MongoSqlConfig {
   /** MongoDB connection URI (mongodb:// or mongodb+srv://). */

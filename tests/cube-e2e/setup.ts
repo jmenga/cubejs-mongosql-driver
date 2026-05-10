@@ -4,7 +4,7 @@
  *
  * Steps (idempotent):
  *   1. Run `examples/docker/build-driver.sh` to produce dist/ and
- *      stage `examples/docker/pkg/cubejs-mongosql-driver-*.tgz`. The
+ *      stage `examples/docker/pkg/mongosql-cubejs-driver-*.tgz`. The
  *      tarball is what the Dockerfile's `npm install` step consumes.
  *      The Rust .node binary is rebuilt INSIDE the docker image — we
  *      don't host-build it, because cross-compiling darwin → linux
@@ -43,10 +43,10 @@ async function waitForHealthy(service: string, maxSeconds: number): Promise<void
   const deadline = Date.now() + maxSeconds * 1000;
   while (Date.now() < deadline) {
     try {
-      const out = execSync(
-        `docker compose -f ${COMPOSE_FILE} ps --format json ${service}`,
-        { encoding: 'utf-8', cwd: REPO_ROOT },
-      );
+      const out = execSync(`docker compose -f ${COMPOSE_FILE} ps --format json ${service}`, {
+        encoding: 'utf-8',
+        cwd: REPO_ROOT,
+      });
       const lines = out.trim().split('\n').filter(Boolean);
       for (const line of lines) {
         const entry = JSON.parse(line);

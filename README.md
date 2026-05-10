@@ -1,4 +1,4 @@
-# cubejs-mongosql-driver
+# mongosql-cubejs-driver
 
 [![ci](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yaml/badge.svg)](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yaml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -65,10 +65,16 @@ The Rust shim caches schema in memory, refreshes it every 5 minutes in the backg
 ## Install
 
 ```
-npm install cubejs-mongosql-driver
+npm install mongosql-cubejs-driver
 # or
-pnpm add cubejs-mongosql-driver
+pnpm add mongosql-cubejs-driver
 ```
+
+The package name follows Cube's `${type}-cubejs-driver` resolver convention,
+so `CUBEJS_DB_TYPE=mongosql` resolves automatically — no `driverFactory`
+override is required for the lookup to succeed (you may still want one if
+you need to wire the dialect class explicitly; see
+[`examples/docker/cube/cube.js`](./examples/docker/cube/cube.js)).
 
 The package ships a small JavaScript loader plus per-platform prebuilt native
 binaries published as separate npm packages. The root package declares each
@@ -80,12 +86,12 @@ Supported platforms (per SPEC NFR-2):
 
 | Platform                | Sub-package                               |
 | ----------------------- | ----------------------------------------- |
-| Linux x64 (glibc)       | `cubejs-mongosql-driver-linux-x64-gnu`    |
-| Linux arm64 (glibc)     | `cubejs-mongosql-driver-linux-arm64-gnu`  |
-| Linux x64 (musl)        | `cubejs-mongosql-driver-linux-x64-musl`   |
-| Linux arm64 (musl)      | `cubejs-mongosql-driver-linux-arm64-musl` |
-| macOS x64 (Intel)       | `cubejs-mongosql-driver-darwin-x64`       |
-| macOS arm64 (Apple Si.) | `cubejs-mongosql-driver-darwin-arm64`     |
+| Linux x64 (glibc)       | `mongosql-cubejs-driver-linux-x64-gnu`    |
+| Linux arm64 (glibc)     | `mongosql-cubejs-driver-linux-arm64-gnu`  |
+| Linux x64 (musl)        | `mongosql-cubejs-driver-linux-x64-musl`   |
+| Linux arm64 (musl)      | `mongosql-cubejs-driver-linux-arm64-musl` |
+| macOS x64 (Intel)       | `mongosql-cubejs-driver-darwin-x64`       |
+| macOS arm64 (Apple Si.) | `mongosql-cubejs-driver-darwin-arm64`     |
 
 Windows (`win32`) is not supported in v0.1.0. If `npm install` cannot find a
 matching binary it will fail with a clear "no native binary for your

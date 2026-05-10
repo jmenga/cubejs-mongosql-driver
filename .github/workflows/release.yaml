@@ -28,7 +28,7 @@ permissions:
 
 env:
   DEBUG: napi:*
-  APP_NAME: cubejs-mongosql-driver
+  APP_NAME: mongosql-cubejs-driver
   NATIVE_NAME: cubejs-mongosql-driver-native
   MACOSX_DEPLOYMENT_TARGET: '10.13'
 
