@@ -1,0 +1,29 @@
+[package]
+name = "cubejs-mongosql-driver-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { workspace = true }
+napi-derive = { workspace = true }
+mongodb = { workspace = true }
+bson = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# mongosql = { workspace = true }   # T03 spike — pin once API is verified
+
+[build-dependencies]
+napi-build = { workspace = true }

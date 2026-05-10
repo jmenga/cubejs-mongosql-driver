@@ -1,0 +1,36 @@
+# Node
+node_modules
+*.log
+.pnpm-store
+coverage
+*.tsbuildinfo
+
+# Rust
+target
+Cargo.lock
+**/*.rs.bk
+
+# napi-rs
+*.node
+!npm/**/*.node
+
+# Build output
+dist
+build
+
+# Environment
+.env*
+!.env*.example
+.npmrc
+
+# Editor
+.vscode
+.idea
+
+# OS
+.DS_Store
+
+# Testing
+.nyc_output
+playwright-report
+test-results

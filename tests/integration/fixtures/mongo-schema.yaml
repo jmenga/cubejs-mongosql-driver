@@ -1,0 +1,33 @@
+# File-mode schema fixture — mirrors what `__sql_schemas` would expose
+# after the Atlas SQL Interface sampler runs. Used by `tests/integration/schema-modes.test.ts`
+# (T15) to assert Collection-mode and File-mode produce identical query results.
+
+schema:
+  version: 1
+  jsonSchema:
+    bsonType: object
+    properties:
+      users:
+        bsonType: object
+        properties:
+          _id:        { bsonType: objectId }
+          email:      { bsonType: string }
+          name:       { bsonType: string }
+          account_id: { bsonType: string }
+          created_at: { bsonType: date }
+      accounts:
+        bsonType: object
+        properties:
+          _id:        { bsonType: string }
+          name:       { bsonType: string }
+          tier:       { bsonType: string }
+          created_at: { bsonType: date }
+      orders:
+        bsonType: object
+        properties:
+          _id:        { bsonType: objectId }
+          account_id: { bsonType: string }
+          amount:     { bsonType: decimal }
+          status:     { bsonType: string }
+          created_at: { bsonType: date }
+          updated_at: { bsonType: date }

@@ -1,0 +1,89 @@
+{
+  "name": "cubejs-mongosql-driver",
+  "version": "0.1.0-pre.0",
+  "description": "Cube.js native data source driver for MongoDB via the MongoSQL translator (Rust + napi-rs). Replacement for the EOL'd BI Connector path.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "npm",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "napi": {
+    "name": "cubejs-mongosql-driver-native",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "pnpm build:rust && pnpm build:ts",
+    "build:rust": "napi build --platform --release crates/native",
+    "build:rust:debug": "napi build --platform crates/native",
+    "build:ts": "tsc -p tsconfig.build.json",
+    "test": "pnpm test:unit && pnpm test:rust",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:rust": "cargo test --workspace",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "make e2e",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "pnpm lint:ts && pnpm lint:rust",
+    "lint:ts": "eslint . && prettier --check \"**/*.{ts,js,json,md,yaml,yml}\"",
+    "lint:rust": "cargo fmt --check && cargo clippy -- -D warnings",
+    "lint:fix": "eslint . --fix && prettier --write \"**/*.{ts,js,json,md,yaml,yml}\" && cargo fmt",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist node_modules target npm/*/cubejs-mongosql-driver-native.*.node"
+  },
+  "keywords": [
+    "cubejs",
+    "cube",
+    "cubejs-driver",
+    "mongodb",
+    "mongosql",
+    "atlas",
+    "olap",
+    "analytics"
+  ],
+  "author": "Justin Menga",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
+  },
+  "peerDependencies": {
+    "@cubejs-backend/base-driver": "^1.6.0",
+    "@cubejs-backend/schema-compiler": "^1.6.0"
+  },
+  "dependencies": {
+    "@node-rs/helper": "^1.6.0"
+  },
+  "devDependencies": {
+    "@cubejs-backend/base-driver": "^1.6.26",
+    "@cubejs-backend/schema-compiler": "^1.6.26",
+    "@napi-rs/cli": "^2.18.4",
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-prettier": "^5.5.4",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

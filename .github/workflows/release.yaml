@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: pnpm build:rust --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: pnpm build:rust --target aarch64-unknown-linux-gnu --use-cross
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: pnpm build:rust --target x86_64-unknown-linux-musl --use-cross
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: pnpm build:rust --target aarch64-unknown-linux-musl --use-cross
+          - host: macos-14
+            target: x86_64-apple-darwin
+            build: pnpm build:rust --target x86_64-apple-darwin
+          - host: macos-14
+            target: aarch64-apple-darwin
+            build: pnpm build:rust --target aarch64-apple-darwin
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.settings.target }}
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ matrix.settings.build }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: crates/native/*.node
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:ts
+      - name: Move binaries to npm/<platform>/
+        run: |
+          mkdir -p npm
+          for dir in artifacts/bindings-*; do
+            target="${dir#artifacts/bindings-}"
+            mkdir -p "npm/$target"
+            mv "$dir"/*.node "npm/$target/" 2>/dev/null || true
+          done
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

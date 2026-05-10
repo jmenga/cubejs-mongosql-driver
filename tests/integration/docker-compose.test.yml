@@ -1,0 +1,27 @@
+services:
+  atlas-local:
+    image: mongodb/mongodb-atlas-local:8.0
+    container_name: cubejs-mongosql-driver-atlas
+    ports:
+      - '27017:27017'
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: admin
+      MONGODB_INITDB_ROOT_PASSWORD: admin
+    volumes:
+      - atlas-data:/data/db
+      - ./fixtures/seed-data.js:/docker-entrypoint-initdb.d/01-seed-data.js:ro
+      - ./fixtures/seed-schemas.js:/docker-entrypoint-initdb.d/02-seed-schemas.js:ro
+    networks:
+      - test
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  atlas-data:
+
+networks:
+  test:
+    driver: bridge

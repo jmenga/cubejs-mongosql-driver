@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/native"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-pre.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/jmenga/cubejs-mongosql-driver"
+
+[workspace.dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi8", "tokio_rt", "serde-json"] }
+napi-derive = "2.16"
+napi-build = "2.1"
+
+# MongoDB
+mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-3-0"] }
+bson = "2.13"
+
+# MongoSQL translator (open-source MongoDB Apache-2.0 crate).
+# NOTE: pin a known-good version; verify availability on crates.io vs git source
+# during T03 spike. The crate may be published under `mongosql` directly or only
+# vendored via the git repo — TBD at first build.
+# mongosql = { version = "...", default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
