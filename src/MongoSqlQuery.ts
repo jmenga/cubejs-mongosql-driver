@@ -5,37 +5,65 @@
  * https://www.mongodb.com/docs/sql-interface/language-reference/
  *
  * T12a scope: STATIC SYNTAX — identifier quoting, type names, timestamp
- * casts, timezone passthrough, NULL/param tokens. T12b will cover date
- * arithmetic, intervals, seriesSql, dateBin, dateTimeFormat granularities.
+ * casts, timezone passthrough, NULL/param tokens.
+ * T12b scope: DATE ARITHMETIC, INTERVALS, time-series generation,
+ * date-truncation, dateBin, unixTimestampSql.
+ *
+ * MongoSQL date-function audit (verified against mongosql v1.8.5 source —
+ * `mongosql/src/ast/definitions.rs` `FunctionName::try_from` and
+ * `algebrize_date_function`, plus `ast/rewrites/test.rs`):
+ *
+ * | Function       | Signature                                              | Notes                                                              |
+ * |----------------|--------------------------------------------------------|--------------------------------------------------------------------|
+ * | DATEADD        | DATEADD(<date_part>, <numeric>, <date>)                | TIMESTAMPADD is an alias.                                          |
+ * | DATEDIFF       | DATEDIFF(<date_part>, <start>, <end>[, <start_of_week>]) | Returns LONG. TIMESTAMPDIFF is an alias.                         |
+ * | DATETRUNC      | DATETRUNC(<date_part>, <date>[, <start_of_week>])      | TIMESTAMPTRUNC is an alias.                                        |
+ * | EXTRACT        | EXTRACT(<date_part> FROM <date>)                       | Supports YEAR/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND/MILLISECOND/...    |
+ * | YEAR/MONTH/... | YEAR(d), MONTH(d), ... — rewritten to EXTRACT          | All datepart helpers map to EXTRACT.                               |
+ * | CURRENT_TIMESTAMP | CURRENT_TIMESTAMP[(<precision>)]                    | SQL-92 keyword. Replaces NOW().                                    |
+ *
+ * <date_part> for DATEADD / DATEDIFF / DATETRUNC must be one of:
+ *   YEAR | QUARTER | MONTH | WEEK | DAY | HOUR | MINUTE | SECOND | MILLISECOND
+ * (mongosql `DatePart` enum; `IsoWeek`/`DayOfYear` are EXTRACT-only and
+ * panic for date-functions per `algebrize_date_function`.)
+ *
+ * NOT available in MongoSQL (called out so future maintainers don't try):
+ *   - `INTERVAL '1 day'` literals — REJECTED by parser.
+ *   - `EXTRACT(EPOCH FROM ...)` — EPOCH is not a `DatePart`.
+ *   - `AT TIME ZONE` / `CONVERT_TZ` — no SQL-level timezone function.
+ *   - `VALUES (...)` table constructors — no parser support.
+ *   - `WITH RECURSIVE` / `generate_series` — no recursive CTEs.
+ * For each gap, see the override below for the closest viable substitute.
  *
  * BaseQuery method-list audit (against
  * `node_modules/@cubejs-backend/schema-compiler/dist/src/adapter/BaseQuery.js`,
  * cross-checked against `MysqlQuery.js` and `PostgresQuery.js`):
  *
- * | BaseQuery method                          | T12a action       | Why                                                                 |
+ * | BaseQuery method                          | T12a/b action     | Why                                                                 |
  * |-------------------------------------------|-------------------|---------------------------------------------------------------------|
- * | escapeColumnName(name)                    | OVERRIDE          | Default emits double-quoted ident; MongoSQL uses backticks.         |
- * | quoteIdentifier(name)                     | ADD (alias)       | Not on BaseQuery, but task spec + driver doc-comment expect it.     |
- * | timeStampCast(value)                      | OVERRIDE          | Base emits `value::timestamptz` (Postgres). Mongosql has no `::`.   |
- * | dateTimeCast(value)                       | OVERRIDE          | Base emits `value::timestamp` (Postgres) — invalid in MongoSQL.     |
+ * | escapeColumnName(name)                    | OVERRIDE (T12a)   | Default emits double-quoted ident; MongoSQL uses backticks.         |
+ * | quoteIdentifier(name)                     | ADD (alias) (T12a)| Not on BaseQuery, but task spec + driver doc-comment expect it.     |
+ * | timeStampCast(value)                      | OVERRIDE (T12a)   | Base emits `value::timestamptz` (Postgres). Mongosql has no `::`.   |
+ * | dateTimeCast(value)                       | OVERRIDE (T12a)   | Base emits `value::timestamp` (Postgres) — invalid in MongoSQL.     |
  * | timeStampParam(td)                        | INHERIT           | Default delegates to timeStampCast — fine once we override that.    |
  * | timestampFormat()                         | INHERIT           | ISO-8601 default matches mongosql's accepted CAST literal form.     |
- * | castToString(sql)                         | OVERRIDE          | Base emits `CAST(.. as TEXT)`; MongoSQL spells it `STRING`.         |
- * | convertTz(field)                          | OVERRIDE (passthr)| MongoSQL has no AT TIME ZONE / CONVERT_TZ; data is UTC. TODO T12b.  |
+ * | castToString(sql)                         | OVERRIDE (T12a)   | Base emits `CAST(.. as TEXT)`; MongoSQL spells it `STRING`.         |
+ * | convertTz(field)                          | OVERRIDE (T12a)   | MongoSQL has no AT TIME ZONE / CONVERT_TZ. UTC-only passthrough.    |
  * | inDbTimeZone(date)                        | INHERIT           | Pure JS — converts JS-side; no SQL emitted.                         |
- * | nowTimestampSql()                         | OVERRIDE          | Base emits `NOW()`; MongoSQL spells it `CURRENT_TIMESTAMP`.         |
- * | unixTimestampSql()                        | LEAVE (T12b)      | Base default uses EXTRACT/EPOCH — not in MongoSQL; defer with intvl.|
+ * | nowTimestampSql()                         | OVERRIDE (T12a)   | Base emits `NOW()`; MongoSQL spells it `CURRENT_TIMESTAMP`.         |
+ * | unixTimestampSql()                        | OVERRIDE (T12b)   | Base uses EXTRACT(EPOCH ...) — not in MongoSQL. Use DATEDIFF.       |
  * | concatStringsSql(strings)                 | INHERIT           | Default uses `||` template; MongoSQL accepts `||` for concat.       |
- * | sqlTemplates()                            | OVERRIDE (patch)  | Patch quotes/identifiers + types.* to MongoSQL spellings.           |
- * | timeGroupedColumn(g, dim)                 | LEAVE (T12b)      | Date-truncation; T12b — needs MongoSQL date funcs.                  |
- * | dateBin(interval, source, origin)         | LEAVE (T12b)      | Custom granularity; T12b.                                           |
- * | subtractInterval / addInterval            | LEAVE (T12b)      | Interval arithmetic — T12b.                                         |
- * | seriesSql(td)                             | LEAVE (T12b)      | Time-series UNION ALL — T12b.                                       |
+ * | sqlTemplates()                            | OVERRIDE (T12a)   | Patch quotes/identifiers + types.* to MongoSQL spellings.           |
+ * | timeGroupedColumn(g, dim)                 | OVERRIDE (T12b)   | Use DATETRUNC. Week pinned to 'sunday' for determinism.             |
+ * | dateBin(interval, source, origin)         | OVERRIDE (T12b)   | DATEADD(unit, FLOOR(DATEDIFF/N)*N, origin) — no INTERVAL literals.  |
+ * | subtractInterval / addInterval            | OVERRIDE (T12b)   | DATEADD with positive/negative numeric. Compound = chained calls.   |
+ * | intervalString(interval)                  | OVERRIDE (T12b)   | Quote-and-pass; no INTERVAL keyword. Used only in error/diag paths. |
+ * | seriesSql(td)                             | OVERRIDE (T12b)   | UNION ALL of literal rows (MysqlQuery pattern, CAST not TIMESTAMP). |
  * | newParamAllocator(p)                      | INHERIT           | Default `?` placeholder works for MongoSQL.                         |
  * | escapeColumnName-driven preAggTableName   | INHERIT           | Inherited tableName logic produces backtick-safe identifiers.       |
  *
  * Anything not in this table is BaseQuery default behaviour and is either
- * (a) provably valid MongoSQL or (b) on the T12b list.
+ * (a) provably valid MongoSQL or (b) routed through the overrides above.
  */
 
 import { BaseQuery } from '@cubejs-backend/schema-compiler';
@@ -44,6 +72,79 @@ import { BaseQuery } from '@cubejs-backend/schema-compiler';
 // keeps the subclass shape compatible without leaking `any` into our public API.
 type BaseQueryCompilers = ConstructorParameters<typeof BaseQuery>[0];
 type BaseQueryOptions = ConstructorParameters<typeof BaseQuery>[1];
+
+/**
+ * Inlined re-implementation of `@cubejs-backend/shared`'s `parseSqlInterval`.
+ * The shared package isn't a direct dep (only transitive via schema-compiler),
+ * and the function is a 10-line string-split — inlining avoids pulling in
+ * the entire shared package and keeps the dialect's resolver-friendly.
+ *
+ * Source pattern (matches shared@1.6.44 `dist/src/time.js::parseSqlInterval`):
+ *   "1 year 6 months" -> { year: 1, month: 6 }
+ *   Negative values are supported.
+ */
+function parseSqlInterval(intervalStr: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  const parts = intervalStr.trim().split(/\s+/);
+  for (let i = 0; i < parts.length; i += 2) {
+    const value = parseInt(parts[i], 10);
+    const unit = (parts[i + 1] ?? '').toLowerCase();
+    if (!unit || Number.isNaN(value)) {
+      throw new Error(`Cannot parse interval segment "${parts[i]} ${parts[i + 1] ?? ''}" in "${intervalStr}"`);
+    }
+    const singular = unit.endsWith('s') ? unit.slice(0, -1) : unit;
+    out[singular] = value;
+  }
+  return out;
+}
+
+/**
+ * Map from Cube's lowercase granularity names to MongoSQL's documented
+ * `DatePart` tokens (uppercase). Matches PostgresQuery's `GRANULARITY_TO_INTERVAL`
+ * spirit but uses MongoSQL's spellings.
+ */
+const GRANULARITY_TO_DATE_PART: Readonly<Record<string, string>> = Object.freeze({
+  second: 'SECOND',
+  minute: 'MINUTE',
+  hour: 'HOUR',
+  day: 'DAY',
+  week: 'WEEK',
+  month: 'MONTH',
+  quarter: 'QUARTER',
+  year: 'YEAR',
+});
+
+/**
+ * Map from `parseSqlInterval` keys (singular, lowercase) to MongoSQL DATEADD
+ * date-part tokens. Includes `millisecond` because mongosql DATEADD supports
+ * MILLISECOND (per `DatePart` enum).
+ */
+const INTERVAL_UNIT_TO_DATE_PART: Readonly<Record<string, string>> = Object.freeze({
+  millisecond: 'MILLISECOND',
+  second: 'SECOND',
+  minute: 'MINUTE',
+  hour: 'HOUR',
+  day: 'DAY',
+  week: 'WEEK',
+  month: 'MONTH',
+  quarter: 'QUARTER',
+  year: 'YEAR',
+});
+
+/** A single component of a parsed Cube interval, mapped to MongoSQL units. */
+interface IntervalComponent {
+  value: number;
+  unit: string; // MongoSQL DatePart token, uppercase.
+}
+
+/**
+ * BaseTimeDimension shape we depend on inside `seriesSql`. Cube's TS
+ * declaration types `timeSeries()` as `string[][]` (loose), so we accept
+ * the same and cast the inner row to a 2-tuple for safer destructuring.
+ */
+interface SeriesTimeDimension {
+  timeSeries(): string[][];
+}
 
 /**
  * Cube SQL-dialect adapter that emits MongoSQL-compatible SQL.
@@ -104,48 +205,205 @@ export class MongoSqlQuery extends BaseQuery {
    * Generic typed cast helper. MongoSQL accepts the standard CAST grammar;
    * the *type name* must be one of MongoSQL's documented type tokens
    * (BOOL, INT, LONG, DOUBLE, DECIMAL, STRING, TIMESTAMP, ARRAY, DOCUMENT).
-   *
-   * Not currently a BaseQuery hook (BaseQuery emits CAST via the
-   * `expressions.cast` template), but exposed for explicit use in T12b
-   * date-arithmetic code paths and tests.
    */
   public castSqlType(value: string, type: string): string {
     return `CAST(${value} AS ${type})`;
   }
 
   /**
-   * Timezone conversion — TODO(T12b): MongoSQL has no `AT TIME ZONE` or
-   * `CONVERT_TZ` function. The Atlas SQL Language Reference documents
-   * timezone via the `$dateAdd`/`$dateTrunc` aggregation expressions but no
-   * standalone SQL function. Strategy: data is stored in UTC (BSON DateTime),
-   * and `inDbTimeZone()` (inherited) shifts JS-side timestamp parameters.
-   * For SQL-emitted field references we currently passthrough — this is
-   * correct for UTC data and matches the "no conversion" semantics until a
-   * proper hook is identified.
+   * Timezone conversion — MongoSQL has no `AT TIME ZONE` or `CONVERT_TZ`
+   * function (verified against the v1.8.5 grammar). Data is stored in UTC
+   * (BSON DateTime), and `inDbTimeZone()` (inherited) shifts JS-side
+   * timestamp parameters. For SQL-emitted field references we passthrough —
+   * correct for UTC data and matching "no conversion" semantics.
    *
-   * If MongoSQL adds a timezone function later, swap this for the documented
-   * form. The dialect test below documents the current behaviour so a future
-   * change shows up as a test diff, not a silent regression.
+   * Revisit if MongoSQL adds a timezone-aware function form, or if T14
+   * integration shows non-UTC dimensions break.
    */
   public override convertTz(field: string): string {
-    // TODO(T12b): emit MongoSQL timezone-aware form once one is identified.
     return field;
   }
 
   /**
    * NOW() equivalent. MongoSQL's documented form for the current time is
    * `CURRENT_TIMESTAMP` (SQL-92 keyword), not MySQL/Postgres `NOW()`.
-   * Reference: https://www.mongodb.com/docs/sql-interface/language-reference/functions/
    */
   public override nowTimestampSql(): string {
     return 'CURRENT_TIMESTAMP';
   }
 
   /**
+   * Seconds since the Unix epoch. BaseQuery default uses
+   * `EXTRACT(EPOCH FROM NOW())`, but MongoSQL's `EXTRACT` does NOT support
+   * the `EPOCH` date-part (only YEAR/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND/
+   * MILLISECOND/DAYOFYEAR/DAYOFWEEK/ISOWEEK/ISOWEEKDAY — see
+   * `algebrize_extract` in mongosql/src/algebrizer/definitions.rs).
+   *
+   * Use `DATEDIFF(SECOND, '1970-01-01T00:00:00Z', CURRENT_TIMESTAMP)`
+   * instead. Returns LONG (mongosql `$dateDiff`).
+   */
+  public override unixTimestampSql(): string {
+    return `DATEDIFF(SECOND, ${this.timeStampCast("'1970-01-01T00:00:00Z'")}, ${this.nowTimestampSql()})`;
+  }
+
+  /**
+   * Parse a Cube/Postgres-style interval string ("1 day", "2 weeks",
+   * "1 year 6 months") into an ordered list of MongoSQL DATEADD components.
+   *
+   * Cube emits compound intervals for partition ranges and granularity
+   * offsets. MongoSQL's DATEADD takes a single `<date_part>`, so we apply
+   * each component as a chained DATEADD call (see `addInterval` /
+   * `subtractInterval`). Order is preserved from `parseSqlInterval` so the
+   * outermost DATEADD is the *last* component (matches semantics: applying
+   * `(YEAR, 1)` then `(MONTH, 6)` is equivalent to "1 year 6 months").
+   *
+   * Public for unit-testing the bridge in isolation; not on BaseQuery.
+   */
+  public intervalUnitsForMongo(interval: string): IntervalComponent[] {
+    const parsed = parseSqlInterval(interval) as Record<string, number>;
+    const components: IntervalComponent[] = [];
+    for (const [unit, value] of Object.entries(parsed)) {
+      const datePart = INTERVAL_UNIT_TO_DATE_PART[unit];
+      if (!datePart) {
+        throw new Error(`MongoSQL DATEADD does not support interval unit "${unit}" (from "${interval}")`);
+      }
+      components.push({ value, unit: datePart });
+    }
+    if (components.length === 0) {
+      throw new Error(`Cannot parse interval "${interval}" — produced no components`);
+    }
+    return components;
+  }
+
+  /**
+   * Add a Cube interval to a date expression. Compound intervals
+   * ("1 year 6 months") are emitted as chained DATEADD calls.
+   *
+   * MongoSQL has no `INTERVAL '...'` literal. The base implementation emits
+   * `${date} + interval '...'` which the parser rejects.
+   */
+  public override addInterval(date: string, interval: string): string {
+    return this.applyIntervalChain(date, this.intervalUnitsForMongo(interval), 1);
+  }
+
+  /**
+   * Subtract a Cube interval from a date expression. Implemented as DATEADD
+   * with negated values (so `subtractInterval('d', '1 month')` becomes
+   * `DATEADD(MONTH, -1, d)`). Compound intervals chain the same way as
+   * `addInterval`.
+   */
+  public override subtractInterval(date: string, interval: string): string {
+    return this.applyIntervalChain(date, this.intervalUnitsForMongo(interval), -1);
+  }
+
+  private applyIntervalChain(date: string, components: IntervalComponent[], sign: 1 | -1): string {
+    return components.reduce((acc, { value, unit }) => `DATEADD(${unit}, ${sign * value}, ${acc})`, date);
+  }
+
+  /**
+   * Printable interval string. MongoSQL has no INTERVAL literal so this is
+   * not safe to splice into emitted SQL — kept for diagnostic / error
+   * messages and for any BaseQuery code path we haven't audited yet (a
+   * future grep for `'1 day'` in SQL output would surface a regression).
+   */
+  public override intervalString(interval: string): string {
+    return `'${interval}'`;
+  }
+
+  /**
+   * Truncate a timestamp to a granularity boundary. MongoSQL's documented
+   * form is `DATETRUNC(<unit>, <date>[, <start_of_week>])`. For week we pin
+   * `'sunday'` explicitly: mongosql's `ScalarFunctionsRewritePass` defaults
+   * a missing third arg to `'sunday'` (per ast/rewrites/test.rs::
+   * `timestamp_trunc`), but Cube's tests should not depend on that
+   * implicit default — a future mongosql release could change it.
+   */
+  public override timeGroupedColumn(granularity: string, dimension: string): string {
+    const datePart = GRANULARITY_TO_DATE_PART[granularity];
+    if (!datePart) {
+      throw new Error(`MongoSQL dialect does not support granularity "${granularity}"`);
+    }
+    if (granularity === 'week') {
+      return `DATETRUNC(${datePart}, ${dimension}, 'sunday')`;
+    }
+    return `DATETRUNC(${datePart}, ${dimension})`;
+  }
+
+  /**
+   * Bucket `source` into intervals starting from `origin`. Cube uses this
+   * for custom (non-natural) granularities like "5 minutes" or "10 days".
+   *
+   * MongoSQL has no INTERVAL literal, so PostgresQuery's
+   * `'origin'::ts + INTERVAL N * FLOOR(EXTRACT(EPOCH ...))` form doesn't
+   * port. Instead we use the DATEADD/DATEDIFF identity:
+   *
+   *   floor((source - origin) / interval) * interval + origin
+   *
+   * which becomes:
+   *
+   *   DATEADD(unit, FLOOR(DATEDIFF(unit, origin, source) / N) * N, origin)
+   *
+   * Year and quarter intervals are normalised to MONTH (1 year = 12 months,
+   * 1 quarter = 3 months) so arithmetic doesn't depend on leap-day-aware
+   * second math. Every other unit (week / day / hour / minute / second /
+   * millisecond) is used as-is — DATEDIFF/DATEADD operate in the unit's
+   * native granularity which is the most precise viable choice.
+   *
+   * NOTE: only single-component intervals are supported here (matches
+   * Cube's custom-granularity inputs which are always one unit). Compound
+   * dateBin intervals would need a different strategy.
+   */
+  public override dateBin(interval: string, source: string, origin: string): string {
+    const components = this.intervalUnitsForMongo(interval);
+    if (components.length !== 1) {
+      throw new Error(`MongoSQL dateBin requires a single-unit interval; got "${interval}"`);
+    }
+    const [{ value, unit }] = components;
+    // Normalise year/quarter to MONTH so the unit aligns with calendar
+    // boundaries; everything else uses its native unit for max precision.
+    const usedUnit = unit === 'YEAR' || unit === 'QUARTER' ? 'MONTH' : unit;
+    const stride = unit === 'YEAR' ? value * 12 : unit === 'QUARTER' ? value * 3 : value;
+    const originExpr = this.dateTimeCast(`'${origin}'`);
+    return `DATEADD(${usedUnit}, FLOOR(DATEDIFF(${usedUnit}, ${originExpr}, ${source}) / ${stride}) * ${stride}, ${originExpr})`;
+  }
+
+  /**
+   * Generate the date-series SQL Cube uses for time-bucketed pre-aggregations.
+   * MongoSQL has no `VALUES (...)`, no recursive CTE, and no `generate_series`,
+   * so we emit a UNION ALL of literal-row SELECTs (MysqlQuery's strategy)
+   * and CAST in the outer projection. Identical row count to MysqlQuery's
+   * version; the difference is `CAST(... AS TIMESTAMP)` instead of
+   * MySQL-specific `TIMESTAMP(...)`.
+   *
+   * NOTE: emits N rows for an N-row series. For very large partition ranges
+   * Cube can pre-compute the row set in JS — there's no in-DB way to grow
+   * the series without recursive CTEs, which v1.8.5 doesn't support.
+   */
+  public override seriesSql(timeDimension: SeriesTimeDimension): string {
+    const rows = timeDimension.timeSeries();
+    const union = rows
+      .map((row) => {
+        const [from, to] = row;
+        return `SELECT '${from}' f, '${to}' t`;
+      })
+      .join(' UNION ALL ');
+    const dateFrom = this.escapeColumnName('date_from');
+    const dateTo = this.escapeColumnName('date_to');
+    return `SELECT CAST(dates.f AS TIMESTAMP) AS ${dateFrom}, CAST(dates.t AS TIMESTAMP) AS ${dateTo} FROM (${union}) ${this.asSyntaxTable} dates`;
+  }
+
+  /**
    * Patch the SQL templates that drive the rest of BaseQuery's builders.
    * Mirrors MysqlQuery.sqlTemplates()'s pattern of `super` + targeted
-   * overrides. Only static-syntax fields are touched here; T12b will
-   * augment this with date-function templates and time-series statements.
+   * overrides.
+   *
+   * T12b additions: remove the `expressions.interval` template (BaseQuery's
+   * default emits `INTERVAL '<x>'` — invalid MongoSQL) so any caller that
+   * tries to render an interval literal surfaces an error rather than
+   * silently emitting unparseable SQL. The arithmetic-emitting paths
+   * (subtractInterval/addInterval/dateBin) don't go through this template.
+   * Also drop `statements.generated_time_series_*` for the same reason —
+   * those are recursive-CTE forms that mongosql doesn't accept.
    */
   public override sqlTemplates(): ReturnType<BaseQuery['sqlTemplates']> {
     const templates = super.sqlTemplates();
@@ -172,6 +430,18 @@ export class MongoSqlQuery extends BaseQuery {
     templates.types.time = 'TIMESTAMP';
     delete templates.types.interval;
     delete templates.types.binary;
+
+    // Drop INTERVAL-literal and recursive-CTE forms — mongosql v1.8.5
+    // rejects both. Anything that would have used these now routes through
+    // our typed overrides (addInterval/subtractInterval/seriesSql) or
+    // surfaces a clear missing-template error.
+    if (templates.expressions) {
+      delete templates.expressions.interval;
+    }
+    if (templates.statements) {
+      delete templates.statements.generated_time_series_select;
+      delete templates.statements.generated_time_series_with_cte_range_source;
+    }
 
     return templates;
   }
