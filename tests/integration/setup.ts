@@ -68,25 +68,20 @@ export default async function setup() {
 
   const teardownMode = process.env.INTEGRATION_TEARDOWN ?? 'stop';
 
-  // eslint-disable-next-line no-console
   console.log('integration setup: starting docker compose...');
   spawn('docker', ['compose', '-f', COMPOSE_FILE, 'up', '-d'], { stdio: 'inherit' });
 
   await waitForHealthy('atlas-local');
-  // eslint-disable-next-line no-console
   console.log('integration setup: atlas-local healthy');
 
   await waitForSqlSchemas();
-  // eslint-disable-next-line no-console
   console.log('integration setup: __sql_schemas populated');
 
   return async () => {
     if (teardownMode === 'keep') {
-      // eslint-disable-next-line no-console
       console.log('integration teardown: keeping compose stack (INTEGRATION_TEARDOWN=keep)');
       return;
     }
-    // eslint-disable-next-line no-console
     console.log(`integration teardown: stopping docker compose (mode=${teardownMode})...`);
     const cmd =
       teardownMode === 'destroy'

@@ -228,9 +228,7 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     // 670.50` — note the preserved trailing zero. `Number(r.total)`
     // would yield `670.5`, losing the cents-scale digit. This test
     // asserts the string form matches byte-for-byte.
-    const rows = await driver.query<{ total: string }>(
-      "SELECT SUM(amount) AS total FROM orders WHERE status = 'paid'",
-    );
+    const rows = await driver.query<{ total: string }>("SELECT SUM(amount) AS total FROM orders WHERE status = 'paid'");
     expect(rows).toHaveLength(1);
     expect(typeof rows[0].total).toBe('string');
     expect(rows[0].total).toBe('670.50');

@@ -90,10 +90,7 @@ describe('MongoSqlQuery pre-aggregation dialect (T13)', () => {
       const sql = emitEveryRefreshKey(q, 10);
       // Valid MongoSQL: FLOOR is a documented scalar function; DATEDIFF is
       // documented; CURRENT_TIMESTAMP is the SQL-92 keyword mongosql accepts.
-      expect(sql).toBe(
-        // eslint-disable-next-line max-len
-        "FLOOR((DATEDIFF(SECOND, CAST('1970-01-01T00:00:00Z' AS TIMESTAMP), CURRENT_TIMESTAMP)) / 10)",
-      );
+      expect(sql).toBe("FLOOR((DATEDIFF(SECOND, CAST('1970-01-01T00:00:00Z' AS TIMESTAMP), CURRENT_TIMESTAMP)) / 10)");
       expect(sql).not.toMatch(/EXTRACT\s*\(\s*EPOCH/i);
       expect(sql).not.toMatch(/\bNOW\s*\(/i);
       expect(sql).not.toMatch(/\bINTERVAL\b/i);

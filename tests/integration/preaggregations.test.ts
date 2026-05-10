@@ -69,7 +69,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // mongosql, so we evaluate the FLOOR expression as a derived column on
       // a one-row source.
       const rows = await driver.query<Record<string, unknown>>(
-        // eslint-disable-next-line max-len
         "SELECT FLOOR((DATEDIFF(SECOND, CAST('1970-01-01T00:00:00Z' AS TIMESTAMP), CURRENT_TIMESTAMP)) / 10) AS refresh_key FROM accounts LIMIT 1",
       );
       expect(rows).toHaveLength(1);
@@ -132,13 +131,11 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // The seed has 5 orders: 04-01, 04-02, 04-03, 04-04, 04-05. Half-open
       // window [04-01, 04-06) covers all 5; [04-02, 04-03) covers exactly 1.
       const rowsAll = await driver.query<{ created_at: string }>(
-        // eslint-disable-next-line max-len
         `SELECT \`created_at\` FROM \`orders\` WHERE \`created_at\` >= CAST(${SEED_DATE_LO} AS TIMESTAMP) AND \`created_at\` < CAST(${SEED_DATE_HI} AS TIMESTAMP) ORDER BY \`created_at\` ASC`,
       );
       expect(rowsAll).toHaveLength(5);
 
       const rowsOne = await driver.query<{ created_at: string }>(
-        // eslint-disable-next-line max-len
         `SELECT \`created_at\` FROM \`orders\` WHERE \`created_at\` >= CAST(${SEED_PARTITION_DAY_2} AS TIMESTAMP) AND \`created_at\` < CAST(${SEED_PARTITION_DAY_3} AS TIMESTAMP) ORDER BY \`created_at\` ASC`,
       );
       expect(rowsOne).toHaveLength(1);
@@ -151,7 +148,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // 7-day extension past 2026-03-30 = 2026-04-06 (exclusive), which
       // covers the full seed window (2026-04-01 .. 2026-04-05T14:00:00Z).
       const rows = await driver.query<{ created_at: string }>(
-        // eslint-disable-next-line max-len
         "SELECT `created_at` FROM `orders` WHERE `created_at` < DATEADD(DAY, 7, CAST('2026-03-30T00:00:00Z' AS TIMESTAMP)) ORDER BY `created_at` ASC",
       );
       expect(rows).toHaveLength(5);
@@ -162,7 +158,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // 2026-02-26 + 1 month = 2026-03-26; + 7 day = 2026-04-02. Strictly less
       // than 04-02T00:00:00Z matches only the 04-01 seed row.
       const rows = await driver.query<{ created_at: string }>(
-        // eslint-disable-next-line max-len
         "SELECT `created_at` FROM `orders` WHERE `created_at` < DATEADD(DAY, 7, DATEADD(MONTH, 1, CAST('2026-02-26T00:00:00Z' AS TIMESTAMP))) ORDER BY `created_at` ASC",
       );
       expect(rows).toHaveLength(1);
@@ -180,27 +175,30 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
     // We don't pin exact bucket counts (mongosql's WEEK boundary depends on
     // the sunday-start; April 2026 spans two ISO-style weeks) — only that
     // every shape executes and yields rows summing to 5.
-    it.each(['HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'])(
-      'DATETRUNC(%s, created_at) groups the seed without parser/translate error',
-      async (granularity) => {
-        const weekArg = granularity === 'WEEK' ? ", 'sunday'" : '';
-        const sql = `SELECT DATETRUNC(${granularity}, \`created_at\`${weekArg}) AS bucket, COUNT(*) AS c FROM \`orders\` GROUP BY bucket ORDER BY bucket ASC`;
-        const rows = await driver.query<{ bucket: string; c: number }>(sql);
-        // Total row count across buckets equals the seed (5 orders).
-        const total = rows.reduce((acc, r) => acc + Number(r.c), 0);
-        expect(total).toBe(5);
-        // Each bucket is a non-empty timestamp string.
-        for (const r of rows) {
-          expect(typeof r.bucket).toBe('string');
-          expect(r.bucket).toMatch(/^20\d{2}-\d{2}-\d{2}T/);
-          expect(Number(r.c)).toBeGreaterThan(0);
-        }
-      },
-    );
+    it.each([
+      'HOUR',
+      'DAY',
+      'WEEK',
+      'MONTH',
+      'QUARTER',
+      'YEAR',
+    ])('DATETRUNC(%s, created_at) groups the seed without parser/translate error', async (granularity) => {
+      const weekArg = granularity === 'WEEK' ? ", 'sunday'" : '';
+      const sql = `SELECT DATETRUNC(${granularity}, \`created_at\`${weekArg}) AS bucket, COUNT(*) AS c FROM \`orders\` GROUP BY bucket ORDER BY bucket ASC`;
+      const rows = await driver.query<{ bucket: string; c: number }>(sql);
+      // Total row count across buckets equals the seed (5 orders).
+      const total = rows.reduce((acc, r) => acc + Number(r.c), 0);
+      expect(total).toBe(5);
+      // Each bucket is a non-empty timestamp string.
+      for (const r of rows) {
+        expect(typeof r.bucket).toBe('string');
+        expect(r.bucket).toMatch(/^20\d{2}-\d{2}-\d{2}T/);
+        expect(Number(r.c)).toBeGreaterThan(0);
+      }
+    });
 
     it('DATETRUNC(DAY, ...) produces one bucket per seed day', async () => {
       const rows = await driver.query<{ bucket: string; c: number }>(
-        // eslint-disable-next-line max-len
         'SELECT DATETRUNC(DAY, `created_at`) AS bucket, COUNT(*) AS c FROM `orders` GROUP BY bucket ORDER BY bucket ASC',
       );
       expect(rows).toHaveLength(5);
@@ -212,7 +210,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
 
     it("DATETRUNC(WEEK, ..., 'sunday') executes deterministically", async () => {
       const rows = await driver.query<{ bucket: string; c: number }>(
-        // eslint-disable-next-line max-len
         "SELECT DATETRUNC(WEEK, `created_at`, 'sunday') AS bucket, COUNT(*) AS c FROM `orders` GROUP BY bucket ORDER BY bucket ASC",
       );
       // April 1–5 2026 spans two sunday-starting weeks (W1 = 2026-03-29 sun;
@@ -234,7 +231,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // future relative to the test run so the predicate is true today but
       // would flip false in a year — we only assert truthiness here.
       const rows = await driver.query<{ within_window: boolean | number | string }>(
-        // eslint-disable-next-line max-len
         "SELECT (CURRENT_TIMESTAMP < DATEADD(DAY, 7, CAST('2030-01-01T00:00:00Z' AS TIMESTAMP))) AS within_window FROM `accounts` LIMIT 1",
       );
       expect(rows).toHaveLength(1);
@@ -246,7 +242,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
 
     it('CURRENT_TIMESTAMP < CAST(? AS TIMESTAMP) (no window) evaluates as a boolean', async () => {
       const rows = await driver.query<{ within: boolean | number | string }>(
-        // eslint-disable-next-line max-len
         "SELECT (CURRENT_TIMESTAMP < CAST('2030-01-01T00:00:00Z' AS TIMESTAMP)) AS within FROM `accounts` LIMIT 1",
       );
       expect(rows).toHaveLength(1);
@@ -285,7 +280,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // a string column from a derived UNION ALL — the exact path Cube uses
       // when expanding a partition list.
       const rows = await driver.query<{ from_ts: string; to_ts: string }>(
-        // eslint-disable-next-line max-len
         'SELECT CAST(`date_from` AS TIMESTAMP) AS `from_ts`, CAST(`date_to` AS TIMESTAMP) AS `to_ts` FROM (' +
           "SELECT '2026-04-01T00:00:00.000' AS `date_from`, '2026-04-02T00:00:00.000' AS `date_to` UNION ALL " +
           "SELECT '2026-04-02T00:00:00.000' AS `date_from`, '2026-04-03T00:00:00.000' AS `date_to`" +
@@ -322,7 +316,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // We pick the [2026-04-01, 2026-04-03) day-2-bucket and assert the
       // updated_at in that window matches the day-2 seeded row.
       const partitionRefresh = await driver.query<{ m: string }>(
-        // eslint-disable-next-line max-len
         "SELECT MAX(`updated_at`) AS `m` FROM `orders` WHERE `created_at` >= CAST('2026-04-01T00:00:00Z' AS TIMESTAMP) AND `created_at` < CAST('2026-04-03T00:00:00Z' AS TIMESTAMP)",
       );
       expect(partitionRefresh).toHaveLength(1);
@@ -333,7 +326,6 @@ describe('MongoSqlDriver — pre-aggregation orchestration (E2E, T16)', () => {
       // hi + 1 day. In year 2026 we're past the seed window, so it should
       // be FALSE. Assert it's a boolean-shaped value either way.
       const winRows = await driver.query<{ active: boolean | number | string }>(
-        // eslint-disable-next-line max-len
         `SELECT (CURRENT_TIMESTAMP < DATEADD(DAY, 1, CAST('${hi.slice(0, 19)}Z' AS TIMESTAMP))) AS active FROM \`accounts\` LIMIT 1`,
       );
       expect(winRows).toHaveLength(1);

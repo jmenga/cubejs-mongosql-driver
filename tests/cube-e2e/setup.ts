@@ -95,7 +95,6 @@ async function waitForCubeReady(maxSeconds = 120): Promise<void> {
 export default async function setup(): Promise<() => Promise<void>> {
   const teardownMode = process.env.CUBE_E2E_TEARDOWN ?? 'stop';
 
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: building driver tarball (build-driver.sh)...');
   const buildResult = spawnSync('bash', [BUILD_SCRIPT], {
     stdio: 'inherit',
@@ -105,33 +104,26 @@ export default async function setup(): Promise<() => Promise<void>> {
     throw new Error(`build-driver.sh exited ${buildResult.status}`);
   }
 
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: docker compose build (Rust + Node, ~3-5 min cold)...');
   compose('build');
 
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: docker compose up -d');
   compose('up', '-d');
 
   await waitForHealthy('atlas-local', 180);
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: atlas-local healthy');
 
   await waitForSqlSchemas();
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: __sql_schemas populated');
 
   await waitForCubeReady(180);
-  // eslint-disable-next-line no-console
   console.log('cube-e2e setup: cube /readyz green');
 
   return async () => {
     if (teardownMode === 'keep') {
-      // eslint-disable-next-line no-console
       console.log('cube-e2e teardown: keeping compose stack (CUBE_E2E_TEARDOWN=keep)');
       return;
     }
-    // eslint-disable-next-line no-console
     console.log(`cube-e2e teardown: stopping (mode=${teardownMode})...`);
     try {
       if (teardownMode === 'destroy') {
@@ -141,7 +133,6 @@ export default async function setup(): Promise<() => Promise<void>> {
       }
     } catch (err) {
       // Don't throw from teardown — masks the underlying test failure.
-      // eslint-disable-next-line no-console
       console.error('cube-e2e teardown error (ignored):', err);
     }
   };

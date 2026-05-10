@@ -69,11 +69,6 @@
 
 import { BaseQuery } from '@cubejs-backend/schema-compiler';
 
-// BaseQuery is loosely typed (constructor params are `any`); matching that here
-// keeps the subclass shape compatible without leaking `any` into our public API.
-type BaseQueryCompilers = ConstructorParameters<typeof BaseQuery>[0];
-type BaseQueryOptions = ConstructorParameters<typeof BaseQuery>[1];
-
 /**
  * Inlined re-implementation of `@cubejs-backend/shared`'s `parseSqlInterval`.
  * The shared package isn't a direct dep (only transitive via schema-compiler),
@@ -154,10 +149,6 @@ interface SeriesTimeDimension {
  * every measure/dimension/timeDimension SQL fragment.
  */
 export class MongoSqlQuery extends BaseQuery {
-  public constructor(compilers: BaseQueryCompilers, options: BaseQueryOptions) {
-    super(compilers, options);
-  }
-
   /**
    * Identifier quoting — MongoSQL uses backticks.
    * Reference: https://www.mongodb.com/docs/sql-interface/language-reference/identifiers/

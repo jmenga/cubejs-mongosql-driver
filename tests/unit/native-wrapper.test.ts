@@ -36,7 +36,6 @@ let lastClient: FakeClient | undefined;
 
 function installMockNative(overrides: Partial<FakeClient> = {}): void {
   _setNativeModuleForTests({
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     MongoSqlClient: function (config: unknown): FakeClient {
       const client: FakeClient = {
         config,
@@ -48,7 +47,6 @@ function installMockNative(overrides: Partial<FakeClient> = {}): void {
       };
       lastClient = client;
       return client;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any,
   });
 }
@@ -84,20 +82,14 @@ describe('MongoSqlClient — constructor', () => {
 
   it('does not throw on construction', () => {
     installMockNative();
-    expect(
-      () => new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' }),
-    ).not.toThrow();
+    expect(() => new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' })).not.toThrow();
   });
 });
 
 describe('MongoSqlClient — error normalization', () => {
   it('parses MONGOSQL_* code prefix and throws with `code` field', async () => {
     installMockNative({
-      query: vi
-        .fn()
-        .mockRejectedValue(
-          new Error('MONGOSQL_CONFIG_INVALID: field `uri`: must not be empty'),
-        ),
+      query: vi.fn().mockRejectedValue(new Error('MONGOSQL_CONFIG_INVALID: field `uri`: must not be empty')),
     });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     const err = (await c.query('SELECT 1').catch((e: unknown) => e)) as MongoSqlError;
@@ -109,9 +101,7 @@ describe('MongoSqlClient — error normalization', () => {
 
   it('preserves multi-line messages after the code prefix', async () => {
     installMockNative({
-      query: vi
-        .fn()
-        .mockRejectedValue(new Error('MONGOSQL_TRANSLATE_FAILED: line one\nline two')),
+      query: vi.fn().mockRejectedValue(new Error('MONGOSQL_TRANSLATE_FAILED: line one\nline two')),
     });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     const err = (await c.query('SELECT 1').catch((e: unknown) => e)) as MongoSqlError;
@@ -155,9 +145,7 @@ describe('MongoSqlClient — testConnection', () => {
 
   it('normalises error codes from the connection probe', async () => {
     installMockNative({
-      testConnection: vi
-        .fn()
-        .mockRejectedValue(new Error('MONGOSQL_CONNECT_FAILED: ping timed out after 10s')),
+      testConnection: vi.fn().mockRejectedValue(new Error('MONGOSQL_CONNECT_FAILED: ping timed out after 10s')),
     });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     const err = (await c.testConnection().catch((e: unknown) => e)) as MongoSqlError;
@@ -215,9 +203,7 @@ describe('MongoSqlClient — tablesSchema', () => {
 
   it('normalises code-prefixed errors from the native side', async () => {
     installMockNative({
-      tablesSchema: vi
-        .fn()
-        .mockRejectedValue(new Error('MONGOSQL_SCHEMA_NOT_FOUND: __sql_schemas empty')),
+      tablesSchema: vi.fn().mockRejectedValue(new Error('MONGOSQL_SCHEMA_NOT_FOUND: __sql_schemas empty')),
     });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'mydb' });
     const err = (await c.tablesSchema().catch((e: unknown) => e)) as MongoSqlError;

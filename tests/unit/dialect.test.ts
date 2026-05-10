@@ -144,7 +144,6 @@ describe('MongoSqlQuery dialect (T12a — static syntax)', () => {
     // We import lazily inside `it` so the schema-compiler bootstrap (which
     // touches the heavy NativeInstance / YamlCompiler stack) only runs when
     // these tests are selected — keeps the rest of the suite at sub-100 ms.
-    /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires, global-require */
     interface CompilerLike {
       compiler: { compile: () => Promise<void> };
     }
@@ -162,8 +161,6 @@ describe('MongoSqlQuery dialect (T12a — static syntax)', () => {
       const [sql] = q.buildSqlAndParams() as [string, unknown[]];
       return sql;
     }
-    /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires, global-require */
-
     it('single-cube SELECT emits unqualified column refs (mongosql Error 3008 fix)', async () => {
       const sql = await buildSql({
         cubes: `cube('orders', {
@@ -296,7 +293,6 @@ describe('MongoSqlQuery dialect (T12a — static syntax)', () => {
         `WHERE ${q.escapeColumnName('created_at')} >= ` +
         `${q.timeStampCast("'2026-04-01T00:00:00Z'")}`;
       expect(fragment).toBe(
-        // eslint-disable-next-line max-len
         "SELECT `user_id`, CAST(`amount` AS STRING) FROM `orders` WHERE `created_at` >= CAST('2026-04-01T00:00:00Z' AS TIMESTAMP)",
       );
     });

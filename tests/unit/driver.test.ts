@@ -24,7 +24,6 @@ let createdClients = 0;
 
 function installMockNative(overrides: Partial<FakeClient> = {}): void {
   _setNativeModuleForTests({
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     MongoSqlClient: function (config: unknown): FakeClient {
       const client: FakeClient = {
         config,
@@ -37,7 +36,6 @@ function installMockNative(overrides: Partial<FakeClient> = {}): void {
       lastClient = client;
       createdClients += 1;
       return client;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any,
   });
 }
@@ -309,9 +307,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
   it('refuses non-empty values argument with MONGOSQL_CONFIG_INVALID (Issue 4)', async () => {
     installMockNative();
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
-    const err = (await d
-      .query('SELECT * FROM users WHERE id = ?', [1])
-      .catch((e: unknown) => e)) as MongoSqlError;
+    const err = (await d.query('SELECT * FROM users WHERE id = ?', [1]).catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_CONFIG_INVALID');
     expect(err.message).toMatch(/parameteri[sz]ed/i);
     // Native client never created — refusal is at the dispatch gate.

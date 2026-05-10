@@ -83,10 +83,7 @@ export class MongoSqlClient {
   async query<R = Record<string, unknown>>(sql: string): Promise<R[]> {
     const result = await wrapErrors(() => this.inner.query(sql));
     if (!Array.isArray(result)) {
-      throw createError(
-        'MONGOSQL_EXECUTE_FAILED',
-        `expected query result to be an array, got ${typeof result}`,
-      );
+      throw createError('MONGOSQL_EXECUTE_FAILED', `expected query result to be an array, got ${typeof result}`);
     }
     return result as R[];
   }
