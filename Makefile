@@ -11,7 +11,7 @@ help:
 	@echo "  e2e:up        bring up compose only"
 	@echo "  e2e:down      tear down compose"
 	@echo "  e2e:reset     down -v + up (fresh fixtures)"
-	@echo "  lint          eslint + prettier check + cargo fmt check + clippy"
+	@echo "  lint          biome ci + cargo fmt check + clippy"
 	@echo "  lint:fix      auto-fix"
 	@echo "  typecheck     tsc --noEmit"
 	@echo "  clean         remove build outputs"

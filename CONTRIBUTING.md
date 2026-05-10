@@ -45,7 +45,7 @@ Rules:
 Run the *Validation* commands listed in the task. All must exit 0:
 
 ```
-pnpm lint            # eslint + prettier --check + rustfmt --check + clippy
+pnpm lint            # biome ci + rustfmt --check + clippy
 pnpm typecheck       # tsc --noEmit
 pnpm test            # vitest (unit)
 cargo test           # rust unit
@@ -132,7 +132,7 @@ Don't write E2E tests for things unit tests can cover.
 ### TypeScript
 
 - Strict mode on; no `any` (use `unknown` and narrow)
-- ESLint + Prettier auto-fix on commit
+- Biome auto-fix on commit (`pnpm lint:fix`)
 - Public APIs documented with JSDoc
 - Async functions return `Promise<T>` explicitly; no implicit returns
 
