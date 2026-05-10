@@ -37,6 +37,12 @@ function installMockNative(overrides: Partial<FakeClient> = {}): void {
       createdClients += 1;
       return client;
     } as any,
+    AbortHandle: function (): { abort: () => void; aborted: () => boolean } {
+      // Minimal stub — driver tests don't inspect the handle, only that
+      // it gets passed through. Tests in native-wrapper.test.ts cover the
+      // bridge wiring in detail.
+      return { abort: vi.fn(), aborted: vi.fn().mockReturnValue(false) };
+    } as any,
   });
 }
 
@@ -324,6 +330,57 @@ describe('MongoSqlDriver — query() row flattening', () => {
     installMockNative({ query: vi.fn().mockResolvedValue([]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     await expect(d.query('SELECT * FROM users', [])).resolves.toEqual([]);
+  });
+});
+
+describe('MongoSqlDriver — query() cancellation (Cube release-during-pre-agg flow)', () => {
+  it('forwards options.signal through the wrapper which bridges it to a native AbortHandle', async () => {
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const ctrl = new AbortController();
+    await d.query('SELECT * FROM users', [], { signal: ctrl.signal });
+    const args = lastClient!.query.mock.calls[0];
+    // The driver hands the AbortSignal to the wrapper, which constructs a
+    // native AbortHandle and passes that. Our mock impersonates the
+    // native module directly — args[1] is the FakeAbortHandle, not the
+    // raw AbortSignal.
+    expect(args[1]).toBeDefined();
+    expect(args[1]).not.toBeNull();
+  });
+
+  it('passes null to the native side when options.signal is missing (fast path)', async () => {
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query('SELECT * FROM users');
+    const args = lastClient!.query.mock.calls[0];
+    // No signal → wrapper's runCancellable fast-paths with `null` so the
+    // napi-rs `Option<&AbortHandle>` slot is explicit.
+    expect(args[1]).toBeNull();
+  });
+
+  it('ignores non-AbortSignal values in options.signal (defensive)', async () => {
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query('SELECT * FROM users', [], { signal: 'not a signal' as unknown as AbortSignal });
+    const args = lastClient!.query.mock.calls[0];
+    // extractAbortSignal rejects non-AbortSignal values → wrapper sees
+    // undefined → fast-paths to null.
+    expect(args[1]).toBeNull();
+  });
+
+  it('release() cancels in-flight queries by triggering the underlying client.close()', async () => {
+    // Cube's `release()` is the SIGTERM-during-pre-agg entry point. The
+    // driver layer just calls client.close(); the native side fans the
+    // close-token out to in-flight queries. This test confirms the call
+    // shape — cancellation behaviour itself is covered by the Rust
+    // integration tests (close_cancels_in_flight_queries).
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.testConnection();
+    const queryPromise = d.query('SELECT 1');
+    await d.release();
+    expect(lastClient!.close).toHaveBeenCalledTimes(1);
+    await queryPromise;
   });
 });
 

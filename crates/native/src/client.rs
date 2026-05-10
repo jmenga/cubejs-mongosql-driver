@@ -42,6 +42,7 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 
+use crate::cancel::{AbortHandle, CancelToken};
 use crate::config::ClientConfig;
 use crate::error::{Error, Result};
 use crate::execute;
@@ -54,6 +55,13 @@ use crate::translate;
 /// Bounded so a misconfigured URI fails fast rather than hanging through the
 /// full mongodb crate server-selection timeout (default 30s).
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`MongoSqlClient::close`] waits for in-flight queries to drain
+/// after their cancellation tokens fire. Picked to be short enough that a
+/// SIGTERM-during-pre-agg shutdown stays under typical container kill-grace
+/// windows (Kubernetes default is 30s) while long enough that any TCP
+/// teardown plus the executor's last `try_next` round trip can settle.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Public napi-rs entry point. Cube's TypeScript driver instantiates this once
 /// per Cube driver instance.
@@ -85,6 +93,17 @@ pub struct MongoSqlClient {
     /// caller count. Always-on (single relaxed atomic increment) so tests
     /// can observe it without a `#[cfg(test)]` field.
     refresh_spawn_count: AtomicUsize,
+    /// Parent cancellation token. `close()` cancels it, which fans out to
+    /// every per-call child token created in `query()` /
+    /// `test_connection()` / `tables_schema()`. SIGTERM-during-pre-agg fix:
+    /// without this, `release()` would return immediately while the cursor
+    /// kept draining until `max_time`.
+    close_token: Arc<CancelToken>,
+    /// Number of in-flight cancellable operations. Incremented at entry,
+    /// decremented in a guard at exit. `close()` waits for this to hit 0
+    /// (with [`CLOSE_DRAIN_TIMEOUT`] as a budget) so it doesn't race a
+    /// query past the mongo client's drop.
+    in_flight: Arc<AtomicUsize>,
 }
 
 #[napi]
@@ -106,6 +125,8 @@ impl MongoSqlClient {
             refresh_handle: Mutex::new(None),
             init_once: OnceCell::new(),
             refresh_spawn_count: AtomicUsize::new(0),
+            close_token: CancelToken::new(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -127,9 +148,18 @@ impl MongoSqlClient {
     /// 5. Swap into the cache; build the column map.
     /// 6. Spawn the refresh task.
     ///
-    /// Each step's failure preserves the SPEC §6 error code.
+    /// Each step's failure preserves the SPEC §6 error code. Optional
+    /// `signal` cancels the in-flight ping/load if the caller (or a
+    /// concurrent `close()`) fires it; on cancellation we surface
+    /// [`Error::Cancelled`] with site `"test_connection"`.
     #[napi]
-    pub async fn test_connection(&self) -> napi::Result<()> {
+    pub async fn test_connection(&self, signal: Option<&AbortHandle>) -> napi::Result<()> {
+        let token = self.guarded_token(signal);
+        let _guard = InFlightGuard::enter(&self.in_flight);
+        with_cancellation(&token, "test_connection", self.do_test_connection()).await
+    }
+
+    async fn do_test_connection(&self) -> napi::Result<()> {
         self.config.validate().map_err(napi::Error::from)?;
         let client = self.ensure_client().await.map_err(napi::Error::from)?;
 
@@ -185,8 +215,20 @@ impl MongoSqlClient {
     /// `Translation::target_db` is rewritten to `config.database` before the
     /// executor runs the aggregate, so the wire-level command targets the
     /// real database the user configured.
+    ///
+    /// If `signal` is provided, abort propagates to the in-flight cursor:
+    /// the racing `tokio::select!` short-circuits with [`Error::Cancelled`].
+    /// `close()` also cancels via the parent [`Self::close_token`].
+    /// `biased` polling on the cancel branch ensures cancellation has
+    /// priority if the abort fires before/while the executor schedules.
     #[napi]
-    pub async fn query(&self, sql: String) -> napi::Result<Value> {
+    pub async fn query(&self, sql: String, signal: Option<&AbortHandle>) -> napi::Result<Value> {
+        let token = self.guarded_token(signal);
+        let _guard = InFlightGuard::enter(&self.in_flight);
+        with_cancellation(&token, "query", self.do_query(sql)).await
+    }
+
+    async fn do_query(&self, sql: String) -> napi::Result<Value> {
         let client = self.ensure_client().await.map_err(napi::Error::from)?;
         let catalog = self.schema_cache.read();
         let default_db = self.default_db_for_translate();
@@ -219,8 +261,19 @@ impl MongoSqlClient {
     /// db). For file-mode catalogs the internal placeholder key is rewritten
     /// to the configured database name so consumers see a single coherent
     /// database label.
+    ///
+    /// Optional `signal` cancels the lock acquisition / map clone if a
+    /// large `__sql_schemas` is being copied. In practice the body is
+    /// memory-only, but the guard keeps the API symmetrical with `query()`
+    /// and lets `close()` short-circuit pending callers.
     #[napi]
-    pub async fn tables_schema(&self) -> napi::Result<Value> {
+    pub async fn tables_schema(&self, signal: Option<&AbortHandle>) -> napi::Result<Value> {
+        let token = self.guarded_token(signal);
+        let _guard = InFlightGuard::enter(&self.in_flight);
+        with_cancellation(&token, "tables_schema", self.do_tables_schema()).await
+    }
+
+    async fn do_tables_schema(&self) -> napi::Result<Value> {
         let columns = self.table_columns.lock().await.clone();
         let target_db = self.config.database.clone();
 
@@ -258,12 +311,108 @@ impl MongoSqlClient {
     /// than an error. The mongodb client itself has no explicit close on
     /// v3.x — its connection pool drops when the last `Arc<Client>` goes out
     /// of scope.
+    ///
+    /// **SIGTERM-during-pre-agg fix.** Before this method existed, `close()`
+    /// only stopped the schema-refresh task; in-flight queries kept draining
+    /// their cursors until the server-side `maxTimeMS` fired (default 60s,
+    /// tunable via `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`). That leaks
+    /// connections and wastes Mongo work when the caller has already
+    /// signalled "stop everything". We now:
+    ///
+    /// 1. Cancel the parent token, which fans out to every per-call child
+    ///    token (created in `query()` / `test_connection()` /
+    ///    `tables_schema()`). Each in-flight async fn breaks out of its
+    ///    `tokio::select!` with `Error::Cancelled`.
+    /// 2. Wait up to [`CLOSE_DRAIN_TIMEOUT`] for the in-flight counter to
+    ///    reach zero — the upper bound on caller-visible delay.
+    /// 3. Stop the schema refresh task.
+    ///
+    /// The 5s drain budget is conservative; in practice in-flight cursors
+    /// abandon their `try_next()` within microseconds of the cancel and
+    /// the counter hits zero in O(milliseconds). We keep the bounded wait
+    /// as defence-in-depth for slow TCP closes.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        // Step 1: cancel parent — propagates to every child token via the
+        // watcher tasks set up in CancelToken::child.
+        self.close_token.cancel();
+
+        // Step 2: drain. Poll the counter rather than spinning a notify
+        // because the cancellation already woke the workers; we just need
+        // them to drop their guards. If a worker is genuinely stuck (e.g.
+        // a TLS shutdown blocked on a dead socket) we time out rather than
+        // hold the caller hostage.
+        let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, self.wait_drained()).await;
+
+        // Step 3: refresh task. Doing this last lets it observe the parent
+        // cancellation through any future select! integration; today it
+        // only checks its own Notify shutdown channel, so order is moot —
+        // but the contract stays: by the time `close()` returns, no
+        // background work touches `self`.
         if let Some(handle) = self.refresh_handle.lock().await.take() {
             handle.shutdown().await;
         }
         Ok(())
+    }
+
+    async fn wait_drained(&self) {
+        // Cooperative: yield_now in a loop is fine because workers fire
+        // their guard's Drop synchronously. Tight, bounded, no busy-wait
+        // waste because tokio yields cooperatively.
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Build the cancel token a public method should `select!` on. Always
+    /// a child of [`Self::close_token`] so `close()` cancels every
+    /// in-flight operation. If the caller passed an `AbortHandle`, its
+    /// underlying token is also wired so JS-side aborts cancel too.
+    ///
+    /// **Pre-aborted fast path.** If either parent is already cancelled at
+    /// the moment of construction we return an already-cancelled token
+    /// directly. This matters when the work future resolves so fast that
+    /// the bridge task hasn't been polled yet — without the fast path a
+    /// `biased` select! would still see "neither ready" on first poll
+    /// (the bridge sets the flag asynchronously), let the work win, and
+    /// silently lose the cancellation. Behaviour confirmed by
+    /// `tables_schema_with_pre_aborted_signal_returns_cancelled`.
+    fn guarded_token(&self, signal: Option<&AbortHandle>) -> Arc<CancelToken> {
+        // Always link to the close token so `close()` short-circuits this
+        // operation. If the caller also passed an AbortHandle, link it via
+        // a second child so either source fires the cancellation.
+        let from_close = CancelToken::child(&self.close_token);
+        let signal_token = signal.map(|h| h.token());
+
+        let already_cancelled = from_close.is_cancelled()
+            || signal_token
+                .as_ref()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false);
+        if already_cancelled {
+            let pre = CancelToken::new();
+            pre.cancel();
+            return pre;
+        }
+
+        match signal_token {
+            None => from_close,
+            Some(from_signal) => {
+                // Bridge: when EITHER token fires, the returned token fires.
+                let combined = CancelToken::new();
+                let combined_ref = Arc::clone(&combined);
+                let parent_a = Arc::clone(&from_close);
+                let parent_b = Arc::clone(&from_signal);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = parent_a.cancelled() => {},
+                        _ = parent_b.cancelled() => {},
+                    }
+                    combined_ref.cancel();
+                });
+                combined
+            }
+        }
     }
 
     /// Lazily build the `mongodb::Client` for `config.uri`. Returns an
@@ -347,6 +496,41 @@ impl MongoSqlClient {
                 Ok(catalog)
             }
         })
+    }
+}
+
+/// Race the given future against the supplied cancellation token. Cancel
+/// branch is `biased` so an already-fired token short-circuits immediately
+/// without polling the work future at all.
+async fn with_cancellation<T>(
+    token: &Arc<CancelToken>,
+    site: &'static str,
+    fut: impl std::future::Future<Output = napi::Result<T>>,
+) -> napi::Result<T> {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(napi::Error::from(Error::Cancelled { site })),
+        res = fut => res,
+    }
+}
+
+/// RAII counter guard. Increment in-flight on `enter()`, decrement on
+/// `Drop`. `close()` polls the counter to drain in-flight ops before
+/// dropping the mongo client.
+struct InFlightGuard<'a> {
+    counter: &'a Arc<AtomicUsize>,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(counter: &'a Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl<'a> Drop for InFlightGuard<'a> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -447,7 +631,7 @@ mod tests {
         cfg.uri = "not-a-valid-uri".to_string();
         let c = MongoSqlClient::new(cfg);
         let err = c
-            .query("SELECT 1".to_string())
+            .query("SELECT 1".to_string(), None)
             .await
             .expect_err("query must fail without a valid URI");
         let msg = err.reason.clone();
@@ -465,7 +649,7 @@ mod tests {
         cfg.database = String::new();
         let c = MongoSqlClient::new(cfg);
         let err = c
-            .test_connection()
+            .test_connection(None)
             .await
             .expect_err("test_connection should reject empty db");
         assert!(err.reason.starts_with("MONGOSQL_CONFIG_INVALID"));
@@ -477,11 +661,144 @@ mod tests {
         // `{<db>: {}}` shape must still parse — Cube's introspection code
         // tolerates an empty schema, just not a missing one.
         let c = MongoSqlClient::new(fixture_config());
-        let v = c.tables_schema().await.expect("tables_schema");
+        let v = c.tables_schema(None).await.expect("tables_schema");
         let obj = v.as_object().expect("top level is an object");
         assert!(obj.contains_key("mydb"), "must expose configured db key");
         let inner = obj.get("mydb").and_then(|v| v.as_object()).expect("db obj");
         assert!(inner.is_empty(), "no tables loaded yet");
+    }
+
+    #[tokio::test]
+    async fn query_with_pre_aborted_signal_returns_cancelled() {
+        // Pre-fire the abort handle: the biased select! must short-circuit
+        // with MONGOSQL_CANCELLED before ensure_client/translate/execute
+        // even start. We use a deliberately bogus URI so that, if the
+        // cancel branch did NOT win, the failure mode would be a different
+        // (mongo) error code — making the assertion meaningful.
+        let mut cfg = fixture_config();
+        cfg.uri = "mongodb://nowhere.invalid:27017/x".to_string();
+        let c = MongoSqlClient::new(cfg);
+        let h = AbortHandle::new();
+        h.abort();
+        let err = c
+            .query("SELECT 1".to_string(), Some(&h))
+            .await
+            .expect_err("pre-aborted signal should reject");
+        assert!(
+            err.reason.starts_with("MONGOSQL_CANCELLED"),
+            "expected MONGOSQL_CANCELLED, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_with_pre_aborted_signal_returns_cancelled() {
+        let mut cfg = fixture_config();
+        cfg.uri = "mongodb://nowhere.invalid:27017/x".to_string();
+        let c = MongoSqlClient::new(cfg);
+        let h = AbortHandle::new();
+        h.abort();
+        let err = c
+            .test_connection(Some(&h))
+            .await
+            .expect_err("pre-aborted signal should reject test_connection");
+        assert!(err.reason.starts_with("MONGOSQL_CANCELLED"));
+    }
+
+    #[tokio::test]
+    async fn tables_schema_with_pre_aborted_signal_returns_cancelled() {
+        let c = MongoSqlClient::new(fixture_config());
+        let h = AbortHandle::new();
+        h.abort();
+        let err = c
+            .tables_schema(Some(&h))
+            .await
+            .expect_err("pre-aborted signal should reject tables_schema");
+        assert!(err.reason.starts_with("MONGOSQL_CANCELLED"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mid_query_abort_propagates_cancellation() {
+        // Race: spawn a query() that will hang on the bogus URI's mongo
+        // connect (server selection is bounded by the crate's default but
+        // is many seconds — plenty of time for our abort to win). Fire
+        // the abort after a short delay; the racing select! must finish
+        // with MONGOSQL_CANCELLED, not the mongo connect error.
+        use std::sync::Arc;
+        let mut cfg = fixture_config();
+        cfg.uri = "mongodb://10.255.255.1:27017/?serverSelectionTimeoutMS=15000".to_string();
+        let client = Arc::new(MongoSqlClient::new(cfg));
+        let h = Arc::new(AbortHandle::new());
+
+        let client2 = Arc::clone(&client);
+        let h2 = Arc::clone(&h);
+        let q = tokio::spawn(async move {
+            // Note: we cast through &h2 each call because AbortHandle is
+            // !Clone by design — JS-callable napi class.
+            client2
+                .query("SELECT 1".to_string(), Some(h2.as_ref()))
+                .await
+        });
+
+        // Give the worker enough time to enter the select! and start
+        // ensure_client. yield_now once gets us past the spawn boundary;
+        // a short sleep ensures the mongo connect future is parked on
+        // its own timer.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        h.abort();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), q)
+            .await
+            .expect("cancellation must complete within 2s, not run to URI's selection timeout")
+            .expect("worker did not panic")
+            .expect_err("aborted query must reject");
+        assert!(
+            err.reason.starts_with("MONGOSQL_CANCELLED"),
+            "expected MONGOSQL_CANCELLED, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_cancels_in_flight_queries() {
+        // Same pattern as mid-query abort, but via close() rather than an
+        // explicit signal. Verifies the parent close_token fans out to the
+        // per-call child.
+        use std::sync::Arc;
+        let mut cfg = fixture_config();
+        cfg.uri = "mongodb://10.255.255.1:27017/?serverSelectionTimeoutMS=15000".to_string();
+        let client = Arc::new(MongoSqlClient::new(cfg));
+
+        let client2 = Arc::clone(&client);
+        let q = tokio::spawn(async move { client2.query("SELECT 1".to_string(), None).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.close().await.expect("close");
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), q)
+            .await
+            .expect("close() must cancel in-flight query within 2s")
+            .expect("worker did not panic")
+            .expect_err("query in-flight at close() must reject");
+        assert!(
+            err.reason.starts_with("MONGOSQL_CANCELLED"),
+            "expected MONGOSQL_CANCELLED after close(), got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn close_drains_quickly_when_no_in_flight() {
+        // Fast path: close() with zero in-flight ops shouldn't sleep up to
+        // CLOSE_DRAIN_TIMEOUT — wait_drained sees counter=0 immediately.
+        let c = MongoSqlClient::new(fixture_config());
+        let start = std::time::Instant::now();
+        c.close().await.expect("close");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "close with no in-flight should be fast, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

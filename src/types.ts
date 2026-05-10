@@ -36,6 +36,7 @@ export const ERROR_CODES = [
   'MONGOSQL_EXECUTE_FAILED',
   'MONGOSQL_TIMEOUT',
   'MONGOSQL_RESULT_TOO_LARGE',
+  'MONGOSQL_CANCELLED',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

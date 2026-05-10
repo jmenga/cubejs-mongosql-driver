@@ -78,7 +78,7 @@ fn file_mode_config() -> ClientConfig {
 async fn test_connection_succeeds_against_atlas_local() {
     let client = MongoSqlClient::new(collection_mode_config());
     client
-        .test_connection()
+        .test_connection(None)
         .await
         .expect("test_connection should succeed against the seeded fixture");
     client.close().await.expect("close after test_connection");
@@ -88,10 +88,10 @@ async fn test_connection_succeeds_against_atlas_local() {
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn query_count_returns_at_least_one_row() {
     let client = MongoSqlClient::new(collection_mode_config());
-    client.test_connection().await.expect("test_connection");
+    client.test_connection(None).await.expect("test_connection");
 
     let v = client
-        .query("SELECT COUNT(*) FROM users".to_string())
+        .query("SELECT COUNT(*) FROM users".to_string(), None)
         .await
         .expect("count query");
 
@@ -107,9 +107,9 @@ async fn query_count_returns_at_least_one_row() {
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn tables_schema_returns_seeded_namespaces() {
     let client = MongoSqlClient::new(collection_mode_config());
-    client.test_connection().await.expect("test_connection");
+    client.test_connection(None).await.expect("test_connection");
 
-    let v = client.tables_schema().await.expect("tables_schema");
+    let v = client.tables_schema(None).await.expect("tables_schema");
     let top = v.as_object().expect("top object");
     let db = top
         .get(TEST_DB)
@@ -140,7 +140,7 @@ async fn tables_schema_returns_seeded_namespaces() {
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn close_stops_refresh_task() {
     let client = MongoSqlClient::new(collection_mode_config());
-    client.test_connection().await.expect("test_connection");
+    client.test_connection(None).await.expect("test_connection");
     // First close shuts down the refresh task; second close is idempotent.
     client.close().await.expect("first close");
     client.close().await.expect("second close — idempotent");
@@ -152,10 +152,10 @@ async fn file_mode_query_against_real_cluster() {
     // File-mode catalog keys under the placeholder; client.query() must rewrite
     // target_db to config.database so the executor reaches `mongosql_test`.
     let client = MongoSqlClient::new(file_mode_config());
-    client.test_connection().await.expect("test_connection");
+    client.test_connection(None).await.expect("test_connection");
 
     let v = client
-        .query("SELECT account_id FROM orders".to_string())
+        .query("SELECT account_id FROM orders".to_string(), None)
         .await
         .expect("file-mode query");
     match v {
@@ -178,7 +178,8 @@ async fn concurrent_test_connection_spawns_refresh_task_exactly_once() {
     let mut handles = Vec::with_capacity(8);
     for _ in 0..8_u32 {
         let c = Arc::clone(&client);
-        handles.push(tokio::spawn(async move { c.test_connection().await }));
+        handles.push(tokio::spawn(async move { c.test_connection(None).await }));
+        // (`None`: no abort signal — concurrency check focuses on init_once.)
     }
     for h in handles {
         h.await
@@ -192,7 +193,10 @@ async fn concurrent_test_connection_spawns_refresh_task_exactly_once() {
     );
 
     // Idempotent: a subsequent test_connection after success must NOT spawn.
-    client.test_connection().await.expect("post-init reconnect");
+    client
+        .test_connection(None)
+        .await
+        .expect("post-init reconnect");
     assert_eq!(client.refresh_spawn_count(), 1, "no extra spawn on retry");
 
     client.close().await.expect("close");
@@ -204,10 +208,10 @@ async fn query_respects_max_rows_cap() {
     let mut cfg = collection_mode_config();
     cfg.max_rows = Some(1);
     let client = MongoSqlClient::new(cfg);
-    client.test_connection().await.expect("test_connection");
+    client.test_connection(None).await.expect("test_connection");
 
     let err = client
-        .query("SELECT * FROM orders".to_string())
+        .query("SELECT * FROM orders".to_string(), None)
         .await
         .expect_err("max_rows=1 must trip ResultTooLarge");
     assert!(

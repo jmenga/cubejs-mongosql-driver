@@ -32,7 +32,13 @@ interface FakeClient {
   close: ReturnType<typeof vi.fn>;
 }
 
+interface FakeAbortHandle {
+  abort: ReturnType<typeof vi.fn>;
+  aborted: ReturnType<typeof vi.fn>;
+}
+
 let lastClient: FakeClient | undefined;
+let lastAbortHandle: FakeAbortHandle | undefined;
 
 function installMockNative(overrides: Partial<FakeClient> = {}): void {
   _setNativeModuleForTests({
@@ -48,12 +54,21 @@ function installMockNative(overrides: Partial<FakeClient> = {}): void {
       lastClient = client;
       return client;
     } as any,
+    AbortHandle: function (): FakeAbortHandle {
+      const h: FakeAbortHandle = {
+        abort: vi.fn(),
+        aborted: vi.fn().mockReturnValue(false),
+      };
+      lastAbortHandle = h;
+      return h;
+    } as any,
   });
 }
 
 beforeEach(() => {
   _resetNativeModuleForTests();
   lastClient = undefined;
+  lastAbortHandle = undefined;
 });
 
 describe('MongoSqlClient — constructor', () => {
@@ -185,7 +200,110 @@ describe('MongoSqlClient — query', () => {
     installMockNative();
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     await c.query('SELECT 1 FROM users');
-    expect(lastClient!.query).toHaveBeenCalledWith('SELECT 1 FROM users');
+    // Second arg is the optional AbortHandle slot; without a signal we
+    // pass `null` to match the napi-rs `Option<&AbortHandle>` shape.
+    expect(lastClient!.query).toHaveBeenCalledWith('SELECT 1 FROM users', null);
+  });
+});
+
+describe('MongoSqlClient — cancellation (AbortSignal bridge)', () => {
+  it('passes a native AbortHandle when a non-aborted signal is supplied', async () => {
+    installMockNative();
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    await c.query('SELECT 1', ctrl.signal);
+    // The query() second arg is the bridged AbortHandle, not null.
+    expect(lastClient!.query).toHaveBeenCalledTimes(1);
+    const args = lastClient!.query.mock.calls[0];
+    expect(args[0]).toBe('SELECT 1');
+    expect(args[1]).toBeDefined();
+    expect(args[1]).not.toBeNull();
+    // It is the FakeAbortHandle the mock factory installed.
+    expect(args[1]).toBe(lastAbortHandle);
+  });
+
+  it('forwards `abort()` to the native handle when the signal fires mid-call', async () => {
+    // The native side returns a slow promise; we abort the controller and
+    // expect the bridge to call handle.abort() before/while the promise
+    // is still pending. The native impl would observe this via the
+    // CancelToken; the mock just records the call.
+    let resolveQuery: ((v: unknown) => void) | undefined;
+    const slow = new Promise((resolve) => {
+      resolveQuery = resolve;
+    });
+    installMockNative({ query: vi.fn().mockReturnValue(slow) });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    const p = c.query('SELECT slow', ctrl.signal);
+    // Ensure the call has crossed the bridge before we abort.
+    await Promise.resolve();
+    ctrl.abort();
+    expect(lastAbortHandle).toBeDefined();
+    expect(lastAbortHandle!.abort).toHaveBeenCalledTimes(1);
+    // Tidy: resolve the slow promise so the test doesn't hang.
+    resolveQuery!([]);
+    await p;
+  });
+
+  it('rejects with MONGOSQL_CANCELLED if signal is already aborted (no native call)', async () => {
+    installMockNative();
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const err = (await c.query('SELECT 1', ctrl.signal).catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_CANCELLED');
+    expect(err.name).toBe('MongoSqlError');
+    // Native side never called — pre-abort is the dispatch gate.
+    expect(lastClient!.query).not.toHaveBeenCalled();
+    expect(lastAbortHandle).toBeUndefined();
+  });
+
+  it('removes the abort listener on success (no listener leak)', async () => {
+    installMockNative();
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    const removeSpy = vi.spyOn(ctrl.signal, 'removeEventListener');
+    await c.query('SELECT 1', ctrl.signal);
+    expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+
+  it('removes the abort listener even when the native call rejects', async () => {
+    installMockNative({
+      query: vi.fn().mockRejectedValue(new Error('MONGOSQL_EXECUTE_FAILED: boom')),
+    });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    const removeSpy = vi.spyOn(ctrl.signal, 'removeEventListener');
+    await c.query('SELECT 1', ctrl.signal).catch(() => {});
+    expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+
+  it('normalises code-prefixed errors back to MongoSqlError when cancellation races a real error', async () => {
+    installMockNative({
+      query: vi.fn().mockRejectedValue(new Error('MONGOSQL_CANCELLED: query')),
+    });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const err = (await c.query('SELECT 1').catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_CANCELLED');
+    expect(err.name).toBe('MongoSqlError');
+  });
+
+  it('passes the AbortHandle through testConnection() too', async () => {
+    installMockNative();
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    await c.testConnection(ctrl.signal);
+    const args = lastClient!.testConnection.mock.calls[0];
+    expect(args[0]).toBe(lastAbortHandle);
+  });
+
+  it('passes the AbortHandle through tablesSchema() too', async () => {
+    installMockNative();
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const ctrl = new AbortController();
+    await c.tablesSchema(ctrl.signal);
+    const args = lastClient!.tablesSchema.mock.calls[0];
+    expect(args[0]).toBe(lastAbortHandle);
   });
 });
 

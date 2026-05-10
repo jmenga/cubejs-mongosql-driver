@@ -181,9 +181,16 @@ export interface MongoSqlConfig {
 // src/MongoSqlDriver.ts
 export class MongoSqlDriver extends BaseDriver {
   constructor(config: MongoSqlConfig | undefined);
-  query<R>(sql: string, values?: unknown[]): Promise<R[]>;
+  // `options.signal: AbortSignal` is honoured if supplied (Cube core does
+  // not pass one today; we accept it for forward compatibility and for
+  // direct callers). On abort the in-flight cursor is cancelled and the
+  // call rejects with `MONGOSQL_CANCELLED`.
+  query<R>(sql: string, values?: unknown[], options?: { signal?: AbortSignal; [k: string]: unknown }): Promise<R[]>;
   testConnection(): Promise<void>;
   tablesSchema(): Promise<TablesSchema>;
+  // `release()` also cancels any in-flight queries via a parent
+  // cancellation token, then drains for up to 5s before returning. This
+  // is the SIGTERM-during-pre-agg fix.
   release(): Promise<void>;
   static dialectClass(): typeof MongoSqlQuery;
 }
@@ -226,19 +233,51 @@ impl MongoSqlClient {
     pub fn new(config: ClientConfig) -> napi::Result<Self>;
 
     #[napi]
-    pub async fn test_connection(&self) -> napi::Result<()>;
+    pub async fn test_connection(&self, signal: Option<&AbortHandle>) -> napi::Result<()>;
 
     /// Returns rows as JSON array (BSON values → JSON values).
     /// Buffered up to ClientConfig.max_rows; exceeds throw RESULT_TOO_LARGE.
+    /// Optional `signal` cancels the in-flight cursor with
+    /// `MONGOSQL_CANCELLED`. `close()` also cancels via a parent token.
     #[napi]
-    pub async fn query(&self, sql: String) -> napi::Result<serde_json::Value>;
+    pub async fn query(
+        &self,
+        sql: String,
+        signal: Option<&AbortHandle>,
+    ) -> napi::Result<serde_json::Value>;
 
     /// Returns Cube's expected table-introspection structure.
     #[napi]
-    pub async fn tables_schema(&self) -> napi::Result<serde_json::Value>;
+    pub async fn tables_schema(
+        &self,
+        signal: Option<&AbortHandle>,
+    ) -> napi::Result<serde_json::Value>;
 
+    /// Closes underlying connections, cancels in-flight queries via the
+    /// parent cancellation token, and waits up to 5s for them to drain.
     #[napi]
     pub async fn close(&self) -> napi::Result<()>;
+}
+
+/// Opaque cancellation handle. JS bridges its own `AbortSignal` to this
+/// by registering a listener that calls `handle.abort()`. The driver's
+/// TypeScript wrapper (`src/native.ts`) does the bridging automatically;
+/// direct Rust callers may use this type directly.
+#[napi]
+pub struct AbortHandle { /* ... */ }
+
+#[napi]
+impl AbortHandle {
+    #[napi(constructor)]
+    pub fn new() -> Self;
+
+    /// Mark this handle aborted. Idempotent.
+    #[napi]
+    pub fn abort(&self);
+
+    /// Synchronous probe.
+    #[napi]
+    pub fn aborted(&self) -> bool;
 }
 
 #[napi(object)]
@@ -296,6 +335,7 @@ All driver errors thrown to Cube MUST be `Error` instances with `name` and `mess
 | `MONGOSQL_EXECUTE_FAILED` | Aggregation pipeline failed at MongoDB | Check Mongo logs; reproduce with `mongosql-cli` |
 | `MONGOSQL_TIMEOUT` | Query exceeded `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | Add pre-agg, optimize query, increase timeout |
 | `MONGOSQL_RESULT_TOO_LARGE` | Cursor returned more rows than `CUBEJS_MONGOSQL_MAX_ROWS` | Add pre-agg, narrow filter, raise cap |
+| `MONGOSQL_CANCELLED` | Caller fired an `AbortSignal`, or `release()` cancelled the in-flight query | Expected on shutdown / user-cancel — no retry needed |
 
 ## 7. Out of scope (deferred)
 
@@ -314,7 +354,7 @@ All driver errors thrown to Cube MUST be `Error` instances with `name` and `mess
 - **Streaming vs buffering**: SPEC NFR-1 promises "cursor-based streaming, bounded memory" but §5.2 returns `serde_json::Value` (buffered). Either replace with napi-rs `AsyncIterator` semantics OR honestly bound max result size. Decide in T00.
 - **Type-conversion table** for BSON → JSON: see ARCHITECTURE.md §4.2; extend with `MinKey`/`MaxKey`/`Undefined` once T00 verifies the upstream BSON crate's exposed type list.
 - **MongoSQL dialect** completeness: which exact `BaseQuery` method overrides are needed? Pre-enumerated as a pre-task step in T11/T12a.
-- **Cancellation propagation**: not yet wired — Cube's `AbortSignal` ↔ Tokio `CancellationToken`. Currently relies on `max_time`. Tracked as enhancement post-MVP.
+- ~~**Cancellation propagation**: not yet wired — Cube's `AbortSignal` ↔ Tokio `CancellationToken`. Currently relies on `max_time`.~~ **Resolved 2026-05-10**: implemented via a hand-rolled `CancelToken` (`AtomicBool` + `tokio::sync::Notify`) bridged to JS via the napi-rs `AbortHandle` class — napi-rs 2.16's first-class `AbortSignal` is `AsyncTask`-only and incompatible with `#[napi] async fn`. `release()` cancels in-flight queries via a parent token with a 5s drain budget. See IMPLEMENTATION_PLAN.md *Discoveries* (2026-05-10 — cancellation).
 - **napi-rs version pin**: target latest stable `napi@2` and pin a specific minor.
 - **`mongosql` crate version**: pin to a specific release; track upstream for compatibility.
 

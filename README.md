@@ -312,6 +312,7 @@ All driver errors thrown to Cube are `Error` instances with `name = 'MongoSqlErr
 | `MONGOSQL_EXECUTE_FAILED`        | Aggregation pipeline failed at MongoDB                    | Check Mongo logs; reproduce with `mongosql-cli`                          |
 | `MONGOSQL_TIMEOUT`               | Query exceeded `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`         | Add a pre-agg, optimize the query, or raise the timeout                  |
 | `MONGOSQL_RESULT_TOO_LARGE`      | Cursor returned more rows than `CUBEJS_MONGOSQL_MAX_ROWS` | Add a pre-agg, narrow filters, partition smaller, or raise the cap       |
+| `MONGOSQL_CANCELLED`             | Caller fired an `AbortSignal`, or `release()` cancelled the in-flight query | Expected on shutdown / user-cancel — no retry needed                     |
 
 ## Troubleshooting
 
@@ -366,6 +367,15 @@ db.getCollection('__sql_schemas').find().limit(1);    // see one schema doc
 The driver refreshes its in-memory schema every `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` seconds (default 300). Newly added collections become queryable after the next refresh. To force a faster cycle in dev, drop the value to e.g. `30`. Production should keep it at 300+ to avoid unnecessary load on Atlas.
 
 For atomic guarantees: refreshes swap the cache atomically on success and keep serving the previous catalog on failure — there's no "schema briefly empty" window.
+
+### `MONGOSQL_CANCELLED` (and SIGTERM-during-pre-agg)
+
+The driver's native side honours both `AbortSignal` (when callers pass one via `query(sql, values, { signal })`) and Cube's `release()` lifecycle. On either:
+
+- The in-flight cursor is cancelled — the next `tokio::select!` poll short-circuits with `MONGOSQL_CANCELLED` rather than waiting for the server-side `maxTimeMS` to fire.
+- `release()` drains in-flight queries with a 5-second budget before returning, so a SIGTERM during a long pre-aggregation build doesn't leak connections or waste minutes of MongoDB compute. (Pre-cancellation behaviour: `release()` returned immediately while the cursor kept draining until the configured `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` — typically 60s — fired.)
+
+`MONGOSQL_CANCELLED` is the expected error code on graceful shutdown; treat it like a context-cancelled signal in caller code, not as a query-failure to retry. Cube does not pass an `AbortSignal` through to drivers in v1.6.x — the cancellation contract is exercised primarily through `release()` and through direct `MongoSqlDriver` callers.
 
 ### Connection issues
 

@@ -101,7 +101,7 @@ export class MongoSqlDriver extends BaseDriver {
     await client.testConnection();
   }
 
-  public override async query<R = unknown>(sql: string, values?: unknown[], _options?: QueryOptions): Promise<R[]> {
+  public override async query<R = unknown>(sql: string, values?: unknown[], options?: QueryOptions): Promise<R[]> {
     // Critic v2 — Issue 4: refuse non-empty `values` explicitly. Cube
     // passes a values array on some pre-aggregation paths; mongosql v1.8.5
     // does not accept SQL parameters via the wire (no `?` / `$N`
@@ -125,8 +125,14 @@ export class MongoSqlDriver extends BaseDriver {
           '(`SELECT a.col AS a_col, b.col AS b_col`).',
       );
     }
+    // Cube's QueryOptions is `{ [key: string]: any }`; consumers that want
+    // cancellation can pass a plain AbortSignal via `options.signal`.
+    // Cube core does not pass one today, but `release()` cancellation flows
+    // through the parent close-token on the native side regardless — so
+    // SIGTERM cleanup works whether or not Cube ever wires this up.
+    const signal = extractAbortSignal(options);
     const client = this.ensureClient();
-    const raw = await client.query<Record<string, unknown>>(sql);
+    const raw = await client.query<Record<string, unknown>>(sql, signal);
     return flattenRows<R>(raw);
   }
 
@@ -146,9 +152,12 @@ export class MongoSqlDriver extends BaseDriver {
   public override async downloadQueryResults(
     sql: string,
     values?: unknown[],
-    _options?: DownloadQueryResultsOptions,
+    options?: DownloadQueryResultsOptions,
   ): Promise<DownloadQueryResultsResult> {
-    const rows = await this.query<Record<string, unknown>>(sql, values);
+    // Pass through any caller-supplied AbortSignal so downloadQueryResults
+    // is cancellable on the same terms as query().
+    const signal = extractAbortSignal(options as Record<string, unknown> | undefined);
+    const rows = await this.query<Record<string, unknown>>(sql, values, { signal } as QueryOptions);
     // BaseDriver consumers expect `{ rows, types }`. We don't have type
     // metadata at row level (mongosql gives us a result-set schema from
     // translation but we don't currently surface it through napi); leaving
@@ -327,6 +336,24 @@ function projectionHasNameCollision(sql: string): boolean {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
+}
+
+/**
+ * Extract a caller-supplied AbortSignal from Cube's open `QueryOptions`
+ * shape. Cube core does not currently pass one, but the contract is
+ * `[key: string]: any`, so any caller that wires `options.signal` will
+ * have it propagate through to the native cancel token. Returns
+ * `undefined` if no signal is present or the value is not an AbortSignal.
+ */
+function extractAbortSignal(options: Record<string, unknown> | undefined): AbortSignal | undefined {
+  if (!options) return undefined;
+  const candidate = options.signal;
+  // Defensive check: AbortSignal is the standard browser/Node API.
+  // Reject plain objects so we don't crash inside the native bridge.
+  if (typeof AbortSignal !== 'undefined' && candidate instanceof AbortSignal) {
+    return candidate;
+  }
+  return undefined;
 }
 
 // ---------- Config ----------

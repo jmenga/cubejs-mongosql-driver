@@ -79,6 +79,17 @@ pub enum Error {
         /// Configured `max_rows` cap.
         limit: u32,
     },
+
+    /// Operation was cancelled via an `AbortSignal` or `close()`. Distinct
+    /// from `Timeout` (server-side `maxTimeMS` expiry) — `Cancelled` means
+    /// the *caller* asked us to stop.
+    #[error("cancelled: {site}")]
+    Cancelled {
+        /// Static label naming where the cancellation was observed
+        /// (e.g. `"query"`, `"test_connection"`, `"tables_schema"`).
+        /// Used only for diagnostics — the public `code()` is constant.
+        site: &'static str,
+    },
 }
 
 impl Error {
@@ -98,6 +109,7 @@ impl Error {
             Error::ExecuteFailed { .. } => "MONGOSQL_EXECUTE_FAILED",
             Error::Timeout => "MONGOSQL_TIMEOUT",
             Error::ResultTooLarge { .. } => "MONGOSQL_RESULT_TOO_LARGE",
+            Error::Cancelled { .. } => "MONGOSQL_CANCELLED",
         }
     }
 }
@@ -239,6 +251,7 @@ mod tests {
             },
             Error::Timeout,
             Error::ResultTooLarge { limit: 100_000 },
+            Error::Cancelled { site: "query" },
         ]
     }
 
@@ -320,6 +333,24 @@ mod tests {
         assert_eq!(
             Error::ResultTooLarge { limit: 1 }.code(),
             "MONGOSQL_RESULT_TOO_LARGE"
+        );
+    }
+
+    #[test]
+    fn cancelled_code() {
+        assert_eq!(
+            Error::Cancelled { site: "query" }.code(),
+            "MONGOSQL_CANCELLED"
+        );
+    }
+
+    #[test]
+    fn cancelled_napi_error_message_carries_code() {
+        let n: napi::Error = Error::Cancelled { site: "query" }.into();
+        assert!(
+            n.reason.starts_with("MONGOSQL_CANCELLED:"),
+            "napi error reason should start with code: {}",
+            n.reason
         );
     }
 

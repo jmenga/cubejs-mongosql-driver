@@ -10,15 +10,24 @@
 import type { MongoSqlConfig, ErrorCode, MongoSqlError } from './types.js';
 import { ERROR_CODES } from './types.js';
 
+interface NativeAbortHandle {
+  abort(): void;
+  aborted(): boolean;
+}
+
 interface NativeMongoSqlClient {
-  testConnection(): Promise<void>;
-  query(sql: string): Promise<unknown>;
-  tablesSchema(): Promise<unknown>;
+  testConnection(signal?: NativeAbortHandle | null): Promise<void>;
+  query(sql: string, signal?: NativeAbortHandle | null): Promise<unknown>;
+  tablesSchema(signal?: NativeAbortHandle | null): Promise<unknown>;
   close(): Promise<void>;
 }
 
 interface NativeModule {
   MongoSqlClient: new (config: MongoSqlConfig) => NativeMongoSqlClient;
+  // Optional in the typed surface so test mocks that only stub
+  // MongoSqlClient stay valid; runtime usage requires a non-null value
+  // when callers supply an AbortSignal — guarded inside `runCancellable`.
+  AbortHandle?: new () => NativeAbortHandle;
 }
 
 /** Column descriptor returned by `tablesSchema()`. Mirrors the Rust shape. */
@@ -59,12 +68,28 @@ export function _setNativeModuleForTests(mod: NativeModule): void {
 /**
  * Type-safe TypeScript wrapper around the napi-rs `MongoSqlClient`.
  * One-to-one method mapping; errors are normalised into `MongoSqlError`.
+ *
+ * **Cancellation contract.** Each cancellable method takes an optional
+ * `AbortSignal`. Internally we lazily allocate a native `AbortHandle` and
+ * wire `signal.addEventListener('abort', () => handle.abort())`. The
+ * native side races the work future against the handle's
+ * `CancelToken::cancelled()` future and rejects with
+ * `MONGOSQL_CANCELLED` if it fires first. Pre-aborted signals are
+ * special-cased so they reject immediately without crossing the napi
+ * boundary at all.
+ *
+ * napi-rs 2.16's first-class `AbortSignal` only integrates with
+ * `AsyncTask` (libuv async-work pattern), not `#[napi] async fn`. The
+ * Rust side therefore exposes its own opaque `AbortHandle` class
+ * (`crates/native/src/cancel.rs`) and we bridge here.
  */
 export class MongoSqlClient {
   private readonly inner: NativeMongoSqlClient;
+  private readonly nativeAbortHandleCtor: (new () => NativeAbortHandle) | undefined;
 
   constructor(config: MongoSqlConfig) {
     const native = loadNative();
+    this.nativeAbortHandleCtor = native.AbortHandle;
     this.inner = new native.MongoSqlClient({
       uri: config.uri,
       database: config.database,
@@ -76,25 +101,62 @@ export class MongoSqlClient {
     });
   }
 
-  async testConnection(): Promise<void> {
-    return wrapErrors(() => this.inner.testConnection());
+  async testConnection(signal?: AbortSignal): Promise<void> {
+    return this.runCancellable(signal, (handle) => this.inner.testConnection(handle));
   }
 
-  async query<R = Record<string, unknown>>(sql: string): Promise<R[]> {
-    const result = await wrapErrors(() => this.inner.query(sql));
+  async query<R = Record<string, unknown>>(sql: string, signal?: AbortSignal): Promise<R[]> {
+    const result = await this.runCancellable(signal, (handle) => this.inner.query(sql, handle));
     if (!Array.isArray(result)) {
       throw createError('MONGOSQL_EXECUTE_FAILED', `expected query result to be an array, got ${typeof result}`);
     }
     return result as R[];
   }
 
-  async tablesSchema(): Promise<TablesSchema> {
-    const result = await wrapErrors(() => this.inner.tablesSchema());
+  async tablesSchema(signal?: AbortSignal): Promise<TablesSchema> {
+    const result = await this.runCancellable(signal, (handle) => this.inner.tablesSchema(handle));
     return result as TablesSchema;
   }
 
   async close(): Promise<void> {
     return wrapErrors(() => this.inner.close());
+  }
+
+  /**
+   * Bridge a JS `AbortSignal` to a native `AbortHandle` for the duration
+   * of one call. If `signal` is undefined, the call runs un-cancelled
+   * (the native side still wires the parent close-token, so `close()`
+   * can still cancel it). If `signal` is already aborted, we throw
+   * `MONGOSQL_CANCELLED` synchronously without invoking the native side.
+   */
+  private async runCancellable<T>(
+    signal: AbortSignal | undefined,
+    op: (handle: NativeAbortHandle | null) => Promise<T>,
+  ): Promise<T> {
+    if (signal === undefined) {
+      return wrapErrors(() => op(null));
+    }
+    if (signal.aborted) {
+      // Pre-aborted: skip the napi round-trip entirely. Mirror the
+      // wire-format of MONGOSQL_CANCELLED that the Rust side produces
+      // so callers see one consistent error shape.
+      throw createError('MONGOSQL_CANCELLED', 'signal was aborted before call');
+    }
+    if (!this.nativeAbortHandleCtor) {
+      // Defensive: production builds always export AbortHandle; this
+      // branch only fires under test mocks that didn't stub it. Run
+      // un-cancellable rather than crashing — the caller still gets
+      // their result.
+      return wrapErrors(() => op(null));
+    }
+    const handle = new this.nativeAbortHandleCtor();
+    const onAbort = (): void => handle.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      return await wrapErrors(() => op(handle));
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
 }
 
