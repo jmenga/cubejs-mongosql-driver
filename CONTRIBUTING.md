@@ -218,7 +218,7 @@ Cube can't distinguish auth failures from query failures.
 - ❌ Catching errors to swallow them; if you catch, do something specific
 - ❌ Importing JS-side validators in TypeScript (Joi, Zod) when napi already validates
 - ❌ Writing comments that restate the code
-- ❌ Editing SPEC.md or ARCHITECTURE.md without explicit user agreement (those are contracts; the *plan* changes, the *contract* doesn't)
+- ❌ Editing SPEC.md or ARCHITECTURE.md without explicit user agreement (those are contracts; the *plan* changes, the *contract* doesn't). **Exception:** if a spike task (e.g. T00) discovers that an upstream API contradicts what SPEC asserts, file the discrepancy in *IMPLEMENTATION_PLAN.md → Discoveries* and ask the user before proceeding. Don't silently re-interpret the SPEC; don't silently ship a divergent impl.
 
 ## Spawning sub-agents
 

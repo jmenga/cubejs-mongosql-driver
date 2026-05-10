@@ -280,8 +280,13 @@ All driver errors thrown to Cube MUST be `Error` instances with `name` and `mess
 
 ## 8. Open questions
 
-- **Type-conversion table** for BSON → JSON: ObjectId as string? Decimal128 as string vs number? Need explicit table — defer to ARCHITECTURE.md §5.
-- **MongoSQL dialect** completeness: which exact `BaseQuery` method overrides are needed? Spike in Phase 3 of IMPLEMENTATION_PLAN.md.
+- **`mongosql` crate license**: must be Apache-2.0 / MIT / BSD-equivalent for npm distribution. **If SSPL or any copyleft variant: STOP and seek legal review.** Resolved by IMPLEMENTATION_PLAN.md T00.
+- **`mongosql` crate availability and public API**: not yet verified that it's usable from outside MongoDB's own JDBC driver context. Type names used in this spec (`MongoSqlCatalog`, `Translation`) are working names that may be revised after T00.
+- **napi-rs / mongodb-crate Tokio compatibility**: must be verified by hello-world, not assumed. T00.
+- **Streaming vs buffering**: SPEC NFR-1 promises "cursor-based streaming, bounded memory" but §5.2 returns `serde_json::Value` (buffered). Either replace with napi-rs `AsyncIterator` semantics OR honestly bound max result size. Decide in T00.
+- **Type-conversion table** for BSON → JSON: see ARCHITECTURE.md §4.2; extend with `MinKey`/`MaxKey`/`Undefined` once T00 verifies the upstream BSON crate's exposed type list.
+- **MongoSQL dialect** completeness: which exact `BaseQuery` method overrides are needed? Pre-enumerated as a pre-task step in T11/T12a.
+- **Cancellation propagation**: not yet wired — Cube's `AbortSignal` ↔ Tokio `CancellationToken`. Currently relies on `max_time`. Tracked as enhancement post-MVP.
 - **napi-rs version pin**: target latest stable `napi@2` and pin a specific minor.
 - **`mongosql` crate version**: pin to a specific release; track upstream for compatibility.
 
