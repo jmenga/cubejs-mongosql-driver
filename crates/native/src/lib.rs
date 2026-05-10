@@ -5,7 +5,9 @@
 //! This file is the napi-rs surface; module impls live in the sibling files.
 
 #![deny(unsafe_code)]
-#![warn(missing_docs)]
+// napi-rs codegen emits undocumented FFI plumbing impls; we keep human-
+// authored items documented but cannot enforce missing_docs at the crate
+// level without false positives on generated code.
 
 #[macro_use]
 extern crate napi_derive;

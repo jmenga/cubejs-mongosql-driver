@@ -6,6 +6,15 @@ use crate::config::ClientConfig;
 use crate::error::Error;
 use napi::Result as NapiResult;
 
+/// Placeholder error used by stubs until T04+ replace these methods with real
+/// implementations. Maps to `MONGOSQL_EXECUTE_FAILED` so the surface looks
+/// inert rather than misclassified.
+fn unimplemented(what: &str) -> Error {
+    Error::ExecuteFailed {
+        msg: format!("not implemented yet (stub): {what}"),
+    }
+}
+
 /// Public napi-rs entry point. Cube's TypeScript driver instantiates this once
 /// per Cube driver instance.
 #[napi]
@@ -29,26 +38,26 @@ impl MongoSqlClient {
     /// refresh task. See FR-1 in SPEC.md.
     #[napi]
     pub async fn test_connection(&self) -> NapiResult<()> {
-        Err(Error::Unimplemented("MongoSqlClient::test_connection").into())
+        Err(unimplemented("MongoSqlClient::test_connection").into())
     }
 
     /// Translate `sql` and execute the resulting MQL pipeline. Returns rows
     /// as a JSON array. See FR-4.
     #[napi]
     pub async fn query(&self, _sql: String) -> NapiResult<serde_json::Value> {
-        Err(Error::Unimplemented("MongoSqlClient::query").into())
+        Err(unimplemented("MongoSqlClient::query").into())
     }
 
     /// Returns Cube's expected `tablesSchema` shape from the cached catalog.
     /// See FR-1.
     #[napi]
     pub async fn tables_schema(&self) -> NapiResult<serde_json::Value> {
-        Err(Error::Unimplemented("MongoSqlClient::tables_schema").into())
+        Err(unimplemented("MongoSqlClient::tables_schema").into())
     }
 
     /// Closes underlying connections and stops background tasks.
     #[napi]
     pub async fn close(&self) -> NapiResult<()> {
-        Err(Error::Unimplemented("MongoSqlClient::close").into())
+        Err(unimplemented("MongoSqlClient::close").into())
     }
 }

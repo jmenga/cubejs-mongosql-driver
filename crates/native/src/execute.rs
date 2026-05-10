@@ -12,7 +12,9 @@ pub async fn execute(
     _translation: Translation,
     _timeout_ms: u32,
 ) -> Result<serde_json::Value> {
-    Err(Error::Unimplemented("execute"))
+    Err(Error::ExecuteFailed {
+        msg: "not implemented yet (stub): execute".to_string(),
+    })
 }
 
 /// Convert a BSON document to a JSON value per the marshaling rules in

@@ -20,5 +20,7 @@ pub struct Translation {
 /// Translate a SQL string into an MQL pipeline using the cached schema.
 #[allow(dead_code)]
 pub fn translate(_sql: &str, _schema: &MongoSqlCatalog, _default_db: &str) -> Result<Translation> {
-    Err(Error::Unimplemented("translate"))
+    Err(Error::TranslateFailed {
+        msg: "not implemented yet (stub): translate".to_string(),
+    })
 }

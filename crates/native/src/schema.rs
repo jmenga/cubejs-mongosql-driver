@@ -14,11 +14,15 @@ pub async fn load_from_collection(
     _client: &mongodb::Client,
     _db_name: &str,
 ) -> Result<MongoSqlCatalog> {
-    Err(Error::Unimplemented("load_from_collection"))
+    Err(Error::ExecuteFailed {
+        msg: "not implemented yet (stub): load_from_collection".to_string(),
+    })
 }
 
 /// Loads the schema from a YAML or JSON file.
 #[allow(dead_code)]
 pub fn load_from_file(_path: &std::path::Path) -> Result<MongoSqlCatalog> {
-    Err(Error::Unimplemented("load_from_file"))
+    Err(Error::ExecuteFailed {
+        msg: "not implemented yet (stub): load_from_file".to_string(),
+    })
 }
