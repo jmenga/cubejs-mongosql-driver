@@ -1,6 +1,6 @@
 {
   "name": "mongosql-cubejs-driver-darwin-x64",
-  "version": "0.1.0-pre.0",
+  "version": "0.1.0",
   "os": [
     "darwin"
   ],

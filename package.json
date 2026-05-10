@@ -1,6 +1,6 @@
 {
   "name": "mongosql-cubejs-driver",
-  "version": "0.1.0-pre.0",
+  "version": "0.1.0",
   "description": "Cube.js native data source driver for MongoDB via the MongoSQL translator (Rust + napi-rs). Replacement for the EOL'd BI Connector path.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -73,12 +73,12 @@
     "@cubejs-backend/schema-compiler": "^1.6.0"
   },
   "optionalDependencies": {
-    "mongosql-cubejs-driver-linux-x64-gnu": "0.1.0-pre.0",
-    "mongosql-cubejs-driver-linux-arm64-gnu": "0.1.0-pre.0",
-    "mongosql-cubejs-driver-linux-x64-musl": "0.1.0-pre.0",
-    "mongosql-cubejs-driver-linux-arm64-musl": "0.1.0-pre.0",
-    "mongosql-cubejs-driver-darwin-x64": "0.1.0-pre.0",
-    "mongosql-cubejs-driver-darwin-arm64": "0.1.0-pre.0"
+    "mongosql-cubejs-driver-linux-x64-gnu": "0.1.0",
+    "mongosql-cubejs-driver-linux-arm64-gnu": "0.1.0",
+    "mongosql-cubejs-driver-linux-x64-musl": "0.1.0",
+    "mongosql-cubejs-driver-linux-arm64-musl": "0.1.0",
+    "mongosql-cubejs-driver-darwin-x64": "0.1.0",
+    "mongosql-cubejs-driver-darwin-arm64": "0.1.0"
   },
   "devDependencies": {
     "@cubejs-backend/base-driver": "^1.6.26",
