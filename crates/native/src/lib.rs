@@ -16,7 +16,10 @@ mod client;
 mod config;
 mod error;
 mod execute;
-mod schema;
+// `schema` is `pub` so the in-tree integration test target
+// (`tests/schema_collection.rs`) can `use cubejs_mongosql_driver_native::schema`.
+// Other modules stay private until a real Rust consumer needs them.
+pub mod schema;
 mod translate;
 
 pub use client::MongoSqlClient;

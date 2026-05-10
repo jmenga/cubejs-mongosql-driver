@@ -23,11 +23,11 @@ bson = "2"
 # MongoSQL translator — open-source MongoDB Apache-2.0 crate.
 # Confirmed by T00 spike: NOT published to crates.io (Cargo.toml in upstream
 # declares version "0.0.0"). Consume via git source pinned to a release tag.
-# The exact tag is selected at T03 implementation time from the upstream
-# Releases page: https://github.com/mongodb/mongosql/releases
-# Example pin (revisit at T03):
-#   mongosql = { git = "https://github.com/mongodb/mongosql", tag = "v1.0.0-beta-1" }
-# mongosql = { ... }   # T03
+# Tag selected at T04: latest stable tag at the time of wiring.
+# Update by bumping the `tag` value here; do NOT track a branch (semver is
+# not meaningful — upstream version is "0.0.0").
+mongosql = { git = "https://github.com/mongodb/mongosql", tag = "v1.8.5" }
+agg-ast = { git = "https://github.com/mongodb/mongosql", tag = "v1.8.5", package = "agg-ast" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

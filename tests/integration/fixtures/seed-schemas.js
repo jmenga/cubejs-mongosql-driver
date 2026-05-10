@@ -54,8 +54,13 @@ const schemas = [
   },
 ];
 
+// Use bracket-property access; mongosh's `db` proxy chokes on the dot-form
+// for collection names that start with `_` (reads them as a missing property
+// and returns `undefined`).
+const schemaColl = db.getCollection('__sql_schemas');
+
 for (const schema of schemas) {
-  db.__sql_schemas.replaceOne({ _id: schema._id }, schema, { upsert: true });
+  schemaColl.replaceOne({ _id: schema._id }, schema, { upsert: true });
 }
 
-print(`seed-schemas: __sql_schemas now contains ${db.__sql_schemas.countDocuments()} documents`);
+print(`seed-schemas: __sql_schemas now contains ${schemaColl.countDocuments()} documents`);
