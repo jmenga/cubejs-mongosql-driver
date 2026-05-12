@@ -306,18 +306,49 @@ describe('MongoSqlDriver — query() row flattening', () => {
     expect(rows).toEqual([{ id: 'u1', email: 'a@b' }]);
   });
 
-  // Critic v2 — Issue 4: query() must NOT silently ignore non-empty `values`.
-  // Mongosql v1.8.5 doesn't accept SQL parameters via the wire; ignoring
-  // them would produce a query that doesn't match the intended filter (a
-  // correctness bug, not a feature gap). Refuse explicitly.
-  it('refuses non-empty values argument with MONGOSQL_CONFIG_INVALID (Issue 4)', async () => {
+  // Mongosql v1.8.5 has no wire-level parameter protocol, but Cube's
+  // pre-aggregation paths emit `WHERE col >= CAST(? AS TIMESTAMP)` with a
+  // values array. The driver inlines literal substitution before passing
+  // the SQL to mongosql — equivalent to what `BaseQuery.paramAllocator`
+  // would emit when the dialect declares no param support.
+  it('inlines ? placeholders from non-empty values into the SQL sent to mongosql', async () => {
+    const queryMock = vi.fn().mockResolvedValue([]);
+    installMockNative({ query: queryMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query('SELECT * FROM users WHERE id = ? AND created_at >= CAST(? AS TIMESTAMP)', [
+      42,
+      new Date('2026-03-01T00:00:00.000Z'),
+    ]);
+    const sentSql = queryMock.mock.calls[0][0] as string;
+    expect(sentSql).toBe(
+      "SELECT * FROM users WHERE id = 42 AND created_at >= CAST('2026-03-01T00:00:00.000Z' AS TIMESTAMP)",
+    );
+  });
+
+  it('parameter substitution skips ? characters inside string literals', async () => {
+    const queryMock = vi.fn().mockResolvedValue([]);
+    installMockNative({ query: queryMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query("SELECT * FROM users WHERE comment = 'is this a ?' AND id = ?", [7]);
+    const sentSql = queryMock.mock.calls[0][0] as string;
+    expect(sentSql).toBe("SELECT * FROM users WHERE comment = 'is this a ?' AND id = 7");
+  });
+
+  it('parameter substitution rejects placeholder/value count mismatch', async () => {
     installMockNative();
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
-    const err = (await d.query('SELECT * FROM users WHERE id = ?', [1]).catch((e: unknown) => e)) as MongoSqlError;
+    const err = (await d.query('SELECT * FROM users WHERE id = ? AND name = ?', [1]).catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_CONFIG_INVALID');
-    expect(err.message).toMatch(/parameteri[sz]ed/i);
-    // Native client never created — refusal is at the dispatch gate.
-    expect(createdClients).toBe(0);
+    expect(err.message).toMatch(/more '\?' placeholders than provided values/i);
+  });
+
+  it('quotes string values and doubles embedded single quotes', async () => {
+    const queryMock = vi.fn().mockResolvedValue([]);
+    installMockNative({ query: queryMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query("SELECT * FROM users WHERE name = ?", ["O'Brien"]);
+    const sentSql = queryMock.mock.calls[0][0] as string;
+    expect(sentSql).toBe("SELECT * FROM users WHERE name = 'O''Brien'");
   });
 
   it('accepts query() with no values argument (Issue 4)', async () => {
@@ -472,7 +503,7 @@ describe('MongoSqlDriver — unsupported BaseDriver methods', () => {
 });
 
 describe('MongoSqlDriver — downloadQueryResults', () => {
-  it('routes through query() and returns BaseDriver memory shape', async () => {
+  it('routes through query() and returns BaseDriver memory shape with sniffed types', async () => {
     installMockNative({
       query: vi.fn().mockResolvedValue([{ users: { a: 1 } }]),
     });
@@ -481,7 +512,62 @@ describe('MongoSqlDriver — downloadQueryResults', () => {
       highWaterMark: 100,
     });
     // BaseDriver expects DownloadQueryResultsResult: { rows, types }.
+    // Types are inferred from the row shape — required by Cube Store ingest
+    // (empty types throws "empty columns. introspection has failed.").
     expect(result).toMatchObject({ rows: [{ a: 1 }] });
-    expect((result as { types: unknown[] }).types).toEqual([]);
+    // Mirrors @cubejs-backend/base-driver's DbTypeValueMatcher: small
+    // integers classify as 'int', large ones as 'bigint'.
+    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
+      { name: 'a', type: 'int' },
+    ]);
+  });
+
+  it('infers decimal type from fixed-point string values (Decimal128 round-trip)', async () => {
+    installMockNative({
+      query: vi.fn().mockResolvedValue([{ orders: { total: '1234.56' } }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT total FROM orders', []);
+    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
+      { name: 'total', type: 'decimal' },
+    ]);
+  });
+
+  it('infers timestamp type from ISO-8601 string values', async () => {
+    installMockNative({
+      query: vi.fn().mockResolvedValue([{ orders: { created_at: '2026-03-01T10:00:00.000Z' } }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT created_at FROM orders', []);
+    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
+      { name: 'created_at', type: 'timestamp' },
+    ]);
+  });
+
+  it('returns empty types for empty row sets (vs throwing)', async () => {
+    installMockNative({
+      query: vi.fn().mockResolvedValue([]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT a FROM users', []);
+    expect(result).toMatchObject({ rows: [], types: [] });
+  });
+
+  it('classifies mixed int + decimal-string column as decimal (filtered SUM case)', async () => {
+    // Reproduces the byStatus pre-agg shape: a filtered SUM yields 0 (int)
+    // for rows that don't match the filter and a decimal string for rows
+    // that do. Cube Store rejects a column typed `int` if any row has a
+    // decimal-shaped value, so the column must classify as `decimal`.
+    installMockNative({
+      query: vi.fn().mockResolvedValue([
+        { orders: { paid_amount: 0 } },
+        { orders: { paid_amount: '400.00' } },
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT paid_amount FROM orders', []);
+    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
+      { name: 'paid_amount', type: 'decimal' },
+    ]);
   });
 });

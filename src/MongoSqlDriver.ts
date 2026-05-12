@@ -102,20 +102,15 @@ export class MongoSqlDriver extends BaseDriver {
   }
 
   public override async query<R = unknown>(sql: string, values?: unknown[], options?: QueryOptions): Promise<R[]> {
-    // Critic v2 — Issue 4: refuse non-empty `values` explicitly. Cube
-    // passes a values array on some pre-aggregation paths; mongosql v1.8.5
-    // does not accept SQL parameters via the wire (no `?` / `$N`
-    // placeholder substitution at the translator layer), so silently
-    // ignoring `values` would produce queries that don't match the
-    // intended filter — a correctness bug, not a feature gap.
-    if (values !== undefined && values.length > 0) {
-      throw configInvalid(
-        'parameterized queries are not yet supported; mongosql v1.8.5 does not accept ' +
-          'SQL parameters via the wire — substitute literals server-side or in the ' +
-          "dialect (CubeJS's `BaseQuery.paramAllocator` builds the literal-substituted form).",
-      );
-    }
-    if (projectionHasNameCollision(sql)) {
+    // Mongosql v1.8.5 does not accept SQL parameters via the wire (no
+    // `?` / `$N` placeholder substitution at the translator layer). Cube
+    // passes a values array on pre-aggregation build paths
+    // (partitioned/incremental rollups with `WHERE created_at >= CAST(? AS TIMESTAMP)`).
+    // We substitute the values into the SQL as quoted literals BEFORE
+    // sending to mongosql — equivalent to what CubeJS's `BaseQuery.paramAllocator`
+    // would emit when the dialect declares no param support.
+    const finalSql = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    if (projectionHasNameCollision(finalSql)) {
       throw translateFailed(
         'JOIN projection contains two or more qualified columns with the same name ' +
           '(e.g. `SELECT a.col, b.col` where the column names match). Mongosql ' +
@@ -132,7 +127,7 @@ export class MongoSqlDriver extends BaseDriver {
     // SIGTERM cleanup works whether or not Cube ever wires this up.
     const signal = extractAbortSignal(options);
     const client = this.ensureClient();
-    const raw = await client.query<Record<string, unknown>>(sql, signal);
+    const raw = await client.query<Record<string, unknown>>(finalSql, signal);
     return flattenRows<R>(raw);
   }
 
@@ -158,12 +153,13 @@ export class MongoSqlDriver extends BaseDriver {
     // is cancellable on the same terms as query().
     const signal = extractAbortSignal(options as Record<string, unknown> | undefined);
     const rows = await this.query<Record<string, unknown>>(sql, values, { signal } as QueryOptions);
-    // BaseDriver consumers expect `{ rows, types }`. We don't have type
-    // metadata at row level (mongosql gives us a result-set schema from
-    // translation but we don't currently surface it through napi); leaving
-    // `types` as an empty array is the documented fallback for memory-mode
-    // downloads — Cube infers types from row values.
-    return { rows, types: [] };
+    // Cube's pre-aggregation upload path passes `types` (a `[{name, type},
+    // ...]` list) to Cube Store to drive the LOAD ROWS column list. With
+    // `types: []` Cube Store fails ingest with "empty columns. Most probably,
+    // introspection has failed." We sniff types from row values — sufficient
+    // for the pre-agg load path (which only needs name + a column-shaped
+    // generic type tag, not full SQL-type fidelity).
+    return { rows, types: inferTypesFromRows(rows) };
   }
 
   public override capabilities(): DriverCapabilities {
@@ -333,6 +329,154 @@ function projectionHasNameCollision(sql: string): boolean {
   }
   return false;
 }
+
+/**
+ * Substitute `?` placeholders in `sql` with literal values from `values`.
+ *
+ * Mongosql v1.8.5 has no wire-level parameter protocol, so Cube's
+ * pre-aggregation paths (which emit `WHERE col >= CAST(? AS TIMESTAMP)` +
+ * `[Date, Date]`) need their placeholders inlined before translation.
+ *
+ * Skips `?` that appear inside single-quoted string literals. Doubled
+ * single-quote (`''`) is treated as a literal `'` inside the current
+ * string — matches the standard SQL escape convention.
+ *
+ * Throws `MONGOSQL_CONFIG_INVALID` on placeholder/value count mismatch.
+ */
+function substituteParameters(sql: string, values: readonly unknown[]): string {
+  let out = '';
+  let inString = false;
+  let idx = 0;
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i];
+    if (c === "'") {
+      // Doubled single-quote inside a string is an escaped quote — pass
+      // through both characters and stay in-string.
+      if (inString && sql[i + 1] === "'") {
+        out += "''";
+        i++;
+        continue;
+      }
+      inString = !inString;
+      out += c;
+    } else if (c === '?' && !inString) {
+      if (idx >= values.length) {
+        throw configInvalid(
+          `SQL has more '?' placeholders than provided values (consumed ${idx} of ${values.length})`,
+        );
+      }
+      out += formatSqlLiteral(values[idx]);
+      idx++;
+    } else {
+      out += c;
+    }
+  }
+  if (idx < values.length) {
+    throw configInvalid(
+      `parameter list has more values (${values.length}) than '?' placeholders in SQL (${idx})`,
+    );
+  }
+  return out;
+}
+
+function formatSqlLiteral(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL';
+  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
+  if (typeof v === 'bigint') return v.toString();
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return 'NULL';
+    // ISO-8601, no quoting wrapper — callers usually wrap with `CAST(... AS TIMESTAMP)`.
+    return `'${v.toISOString()}'`;
+  }
+  return `'${String(v).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Sniff column types from row values, replicating the exact behaviour of
+ * @cubejs-backend/base-driver's `DbTypeValueMatcher` inference.
+ *
+ * For each column, scan ALL rows and pick the most-restrictive type that
+ * EVERY present value satisfies. The matcher order is:
+ *   timestamp → date → int → bigint → decimal → boolean → string → text
+ *
+ * Critical case: a column with mixed `0` (int, e.g. for filtered SUMs that
+ * evaluate to zero) and `"400.00"` (decimal string) must classify as
+ * decimal — int's regex `^-?\d+$` rejects `"400.00"`, so decimal wins and
+ * Cube Store's INSERT accepts both rows.
+ */
+function inferTypesFromRows(rows: ReadonlyArray<Record<string, unknown>>): Array<{ name: string; type: string }> {
+  if (rows.length === 0) return [];
+  const colNames = new Set<string>();
+  for (const r of rows) {
+    for (const k of Object.keys(r)) colNames.add(k);
+  }
+  const out: Array<{ name: string; type: string }> = [];
+  for (const name of colNames) {
+    const presentValues = rows
+      .map((r) => r[name])
+      .filter((v): v is unknown => v !== null && v !== undefined);
+    if (presentValues.length === 0) {
+      out.push({ name, type: 'text' });
+      continue;
+    }
+    const type = TYPE_MATCHERS.find((m) => presentValues.every(m.matches))?.type ?? 'text';
+    out.push({ name, type });
+  }
+  return out;
+}
+
+const INT32_MAX = BigInt('2147483647');
+const INT32_MIN = BigInt('-2147483648');
+
+const TYPE_MATCHERS: ReadonlyArray<{ type: string; matches: (v: unknown) => boolean }> = [
+  {
+    type: 'timestamp',
+    matches: (v) =>
+      v instanceof Date || (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v)),
+  },
+  {
+    type: 'date',
+    matches: (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v),
+  },
+  {
+    type: 'int',
+    matches: (v) => {
+      if (typeof v === 'number' && Number.isInteger(v)) {
+        return Math.abs(v) <= 0x7fffffff;
+      }
+      if (typeof v === 'string' && /^-?\d+$/.test(v)) {
+        const n = BigInt(v);
+        return n <= INT32_MAX && n >= INT32_MIN;
+      }
+      return false;
+    },
+  },
+  {
+    type: 'bigint',
+    matches: (v) =>
+      (typeof v === 'number' && Number.isInteger(v)) ||
+      typeof v === 'bigint' ||
+      (typeof v === 'string' && /^-?\d+$/.test(v)),
+  },
+  {
+    type: 'decimal',
+    matches: (v) =>
+      typeof v === 'number' || (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v)),
+  },
+  {
+    type: 'boolean',
+    matches: (v) => typeof v === 'boolean' || (typeof v === 'string' && /^(true|false)$/i.test(v)),
+  },
+  {
+    type: 'string',
+    matches: (v) => typeof v === 'string' && v.length < 256,
+  },
+  {
+    type: 'text',
+    matches: () => true,
+  },
+];
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
