@@ -212,6 +212,36 @@ export class MongoSqlQuery extends BaseQuery {
   }
 
   /**
+   * GROUP BY by column alias instead of positional `1, 2, ...`.
+   * mongosql v1.8.5's algebrizer rejects positional refs in GROUP BY
+   * (and the failure mode misreports as Error 3008 "Field <col> in the
+   * SELECT clause not found"). Mirrors the ClickHouseQuery pattern.
+   */
+  public override groupByClause(): string {
+    if ((this as unknown as { ungrouped?: boolean }).ungrouped) {
+      return '';
+    }
+    const aliases = (this as unknown as { dimensionAliasNames(): string[] }).dimensionAliasNames();
+    return aliases.length ? ` GROUP BY ${aliases.join(', ')}` : '';
+  }
+
+  /**
+   * ORDER BY by column alias instead of positional `1, 2, ...`.
+   * Same constraint as `groupByClause` — mongosql requires named refs.
+   */
+  public override orderHashToString(hash: { id: string; desc: boolean } | null | undefined): string | null {
+    if (!hash || !hash.id) {
+      return null;
+    }
+    const fieldAlias = (this as unknown as { getFieldAlias(id: string): string | null }).getFieldAlias(hash.id);
+    if (fieldAlias === null) {
+      return null;
+    }
+    const direction = hash.desc ? 'DESC' : 'ASC';
+    return `${fieldAlias} ${direction}`;
+  }
+
+  /**
    * Timestamp literal cast — CRITICAL DISCOVERY (T07): MongoSQL does NOT
    * accept the SQL-92 `TIMESTAMP 'literal'` form. Use `CAST('...' AS TIMESTAMP)`.
    * Reference: https://www.mongodb.com/docs/sql-interface/language-reference/data-types/
