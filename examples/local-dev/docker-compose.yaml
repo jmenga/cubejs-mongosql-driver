@@ -22,6 +22,7 @@ services:
     volumes:
       - atlas-data:/data/db
       - ./seed-data.js:/docker-entrypoint-initdb.d/01-seed-data.js:ro
+      - ./seed-schemas.js:/docker-entrypoint-initdb.d/02-seed-schemas.js:ro
     networks:
       - localdev
     healthcheck:
@@ -48,9 +49,12 @@ services:
       CUBEJS_DB_URI: 'mongodb://admin:admin@atlas-local:27017/?authSource=admin&directConnection=true'
       CUBEJS_DB_NAME: mongosql_localdev
 
-      # File-mode schema — no __sql_schemas required.
-      CUBEJS_MONGOSQL_SCHEMA_SOURCE: file
-      CUBEJS_MONGOSQL_SCHEMA_FILE: /cube/conf/schema.yaml
+      # Collection-mode schema — reads __sql_schemas seeded by atlas-local.
+      # File mode also works (mongo-schema.yaml is bind-mounted below),
+      # but mongosql's algebrizer treats the file-mode placeholder-db
+      # differently in some single-cube projection scopes — collection
+      # mode is the path the cube-e2e regression suite covers.
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: collection
       # Snappy refresh for the dev loop — production should keep 300+.
       CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '30'
 

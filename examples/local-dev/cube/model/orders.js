@@ -1,18 +1,17 @@
 // Sample Cube model for local-dev. Queries the `orders` collection
 // declared in ../../schema.yaml and seeded by ../../seed-data.js.
 //
-// To add a new dimension: add the field to schema.yaml, save, wait
-// ~30 s for the driver to refresh, then add the entry here.
+// Identifier convention (verified by tests/unit/dialect.test.ts:184):
+// dimensions use BARE column SQL (`sql: 'account_id'`) — the
+// MongoSqlQuery dialect's autoPrefixWithCubeName override strips the
+// cube alias for single-cube queries, since mongosql v1.8.5 rejects
+// `<table_alias>.<col>` in projection scope.
 cube('orders', {
   sql_table: 'orders',
 
   measures: {
     count: { type: 'count' },
     totalAmount: { type: 'sum', sql: 'amount' },
-    paidCount: {
-      type: 'count',
-      filters: [{ sql: `${CUBE}.status = 'paid'` }],
-    },
   },
 
   dimensions: {
@@ -27,22 +26,6 @@ cube('orders', {
     createdAt: {
       sql: 'created_at',
       type: 'time',
-    },
-  },
-
-  preAggregations: {
-    // A simple monthly rollup. To exercise the partitioning + refresh
-    // path documented in README → Pre-aggregations:
-    //   1. Set CUBEJS_DB_QUERY_CACHE=false in compose to force re-build.
-    //   2. Hit /cubejs-api/v1/load with totalAmount + accountId + month.
-    //   3. Watch cube logs — you'll see DATEADD / DATETRUNC SQL emitted.
-    monthlyByAccount: {
-      measures: [count, totalAmount],
-      dimensions: [accountId],
-      timeDimension: createdAt,
-      granularity: 'month',
-      partitionGranularity: 'month',
-      refreshKey: { every: '5 minute' },
     },
   },
 });
