@@ -1,0 +1,109 @@
+# Comprehensive example for mongosql-cubejs-driver.
+#
+# Topology:
+#   - atlas-sales    (mongodb/mongodb-atlas-local:8.0) — port 27018 → shop_sales DB
+#   - atlas-catalog  (mongodb/mongodb-atlas-local:8.0) — port 27019 → shop_catalog DB
+#   - cube           (cubejs/cube + this driver)       — port 4000 → playground
+#
+# Two separate atlas-local containers physically separate the databases so
+# the driverFactory in cube/cube.js dispatches on `dataSource` to two
+# independent MongoSqlDriver instances. This is the shape that makes
+# cross-data-source rollup_join meaningful.
+#
+# Run via:
+#   ./examples/docker/build-driver.sh
+#   docker compose -f examples/docker/docker-compose.yaml build
+#   docker compose -f examples/comprehensive/docker-compose.yaml up -d
+services:
+  atlas-sales:
+    image: mongodb/mongodb-atlas-local:8.0
+    container_name: cubejs-mongosql-comp-atlas-sales
+    ports:
+      - '27018:27017'
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: admin
+      MONGODB_INITDB_ROOT_PASSWORD: admin
+    volumes:
+      - atlas-sales-data:/data/db
+      - ./seed/sales-data.js:/docker-entrypoint-initdb.d/01-data.js:ro
+      - ./seed/sales-schemas.js:/docker-entrypoint-initdb.d/02-schemas.js:ro
+    networks:
+      - comp
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  atlas-catalog:
+    image: mongodb/mongodb-atlas-local:8.0
+    container_name: cubejs-mongosql-comp-atlas-catalog
+    ports:
+      - '27019:27017'
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: admin
+      MONGODB_INITDB_ROOT_PASSWORD: admin
+    volumes:
+      - atlas-catalog-data:/data/db
+      - ./seed/catalog-data.js:/docker-entrypoint-initdb.d/01-data.js:ro
+      - ./seed/catalog-schemas.js:/docker-entrypoint-initdb.d/02-schemas.js:ro
+    networks:
+      - comp
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  cube:
+    # Reuse the image built by examples/docker/Dockerfile.
+    image: mongosql-cubejs-driver-e2e:latest
+    container_name: cubejs-mongosql-comp-cube
+    depends_on:
+      atlas-sales:
+        condition: service_healthy
+      atlas-catalog:
+        condition: service_healthy
+    ports:
+      - '4000:4000'
+    environment:
+      CUBEJS_DB_TYPE: mongosql
+      # CUBEJS_DB_URI / CUBEJS_DB_NAME are the *defaults* the driverFactory
+      # reads when a cube has no `dataSource` set. The comprehensive cube
+      # model sets dataSource explicitly on every cube, so these defaults
+      # are not actually used at runtime — they are present only because
+      # Cube's bootstrap still validates them when CUBEJS_DB_TYPE is set.
+      CUBEJS_DB_URI: 'mongodb://admin:admin@atlas-sales:27017/?authSource=admin&directConnection=true'
+      CUBEJS_DB_NAME: shop_sales
+
+      # Per-dataSource overrides — read by cube/cube.js driverFactory.
+      SALES_DB_URI: 'mongodb://admin:admin@atlas-sales:27017/?authSource=admin&directConnection=true'
+      SALES_DB_NAME: shop_sales
+      CATALOG_DB_URI: 'mongodb://admin:admin@atlas-catalog:27017/?authSource=admin&directConnection=true'
+      CATALOG_DB_NAME: shop_catalog
+
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: collection
+      CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '60'
+
+      CUBEJS_DEV_MODE: 'true'
+      CUBEJS_API_SECRET: comprehensive-not-for-prod
+      CUBEJS_LOG_LEVEL: trace
+      NODE_ENV: development
+    volumes:
+      - ./cube/cube.js:/cube/conf/cube.js:ro
+      - ./cube/model:/cube/conf/model:ro
+    networks:
+      - comp
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O- http://localhost:4000/readyz || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  atlas-sales-data:
+  atlas-catalog-data:
+
+networks:
+  comp:
+    driver: bridge
