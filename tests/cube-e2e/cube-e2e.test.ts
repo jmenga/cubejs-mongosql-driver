@@ -50,6 +50,11 @@ interface CubeLoadResponse {
   query?: unknown;
   lastRefreshTime?: string;
   dbType?: string;
+  // Top-level `usedPreAggregations` is emitted whenever Cube routes
+  // the query through a materialized rollup. Asserting it is non-empty
+  // in the partitioned-rollup tests guards against a silent fallback
+  // to direct query — see those tests for the regression rationale.
+  usedPreAggregations?: Record<string, unknown>;
   // Cube returns more fields (annotation, slowQuery, etc.); we only
   // assert what we depend on.
 }
@@ -244,6 +249,17 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(body.data.length).toBeGreaterThan(0);
     expect(body.dbType).toBe('mongosql');
 
+    // Prove the rollup was actually used. The whole point of this test
+    // is to exercise the multi-partition UNION codepath; a future
+    // regression that silently disables pre-aggregations (e.g. a
+    // schema-compile race) could let the numeric totals still pass by
+    // falling back to direct query — silently weakening the regression
+    // harness. The top-level `usedPreAggregations` field is emitted
+    // only when Cube routes through a materialized rollup.
+    expect(body.usedPreAggregations).toBeDefined();
+    expect(typeof body.usedPreAggregations).toBe('object');
+    expect(Object.keys(body.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+
     // The query has no dimension groupings, so it collapses to one
     // row per time bucket emitted by Cube's `granularity` default.
     // Sum across all returned buckets — the totals must match the seed
@@ -275,6 +291,15 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(body).toHaveProperty('data');
     expect(body.data.length).toBeGreaterThan(0);
     expect(body.dbType).toBe('mongosql');
+
+    // Same rollup-usage assertion as the previous test — the multi-
+    // partition UNION codepath only fires when the rollup is
+    // materialized, so a silently-disabled pre-aggregation would
+    // weaken the regression harness without failing the numeric
+    // assertions below.
+    expect(body.usedPreAggregations).toBeDefined();
+    expect(typeof body.usedPreAggregations).toBe('object');
+    expect(Object.keys(body.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
 
     // The seed has two categories: `subscription` (4 events, 100+200+125.25+300 = 725.25)
     // and `usage` (3 events, 50.50+75+99.99 = 225.49). Sum across buckets
