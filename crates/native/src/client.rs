@@ -249,9 +249,28 @@ impl MongoSqlClient {
             .max_rows
             .unwrap_or(crate::config::DEFAULT_MAX_ROWS);
 
-        execute::execute(client.as_ref(), translation, timeout_ms, max_rows)
+        let result = execute::execute(client.as_ref(), translation, timeout_ms, max_rows)
             .await
-            .map_err(napi::Error::from)
+            .map_err(napi::Error::from)?;
+
+        // Compose the napi-rs surface: `{ rows: Array, types: Array<{name, type}> }`.
+        // We keep `rows` and `types` as separate keys (rather than wrapping
+        // every row with its types) because Cube Store's LOAD ROWS API
+        // expects one column list per batch, not per row.
+        let mut top: Map<String, Value> = Map::new();
+        top.insert("rows".to_string(), Value::Array(result.rows));
+        let types: Vec<Value> = result
+            .types
+            .into_iter()
+            .map(|c| {
+                let mut m = Map::new();
+                m.insert("name".to_string(), Value::String(c.name));
+                m.insert("type".to_string(), Value::String(c.ty.to_string()));
+                Value::Object(m)
+            })
+            .collect();
+        top.insert("types".to_string(), Value::Array(types));
+        Ok(Value::Object(top))
     }
 
     /// Returns Cube's expected `tablesSchema` payload built from the cached

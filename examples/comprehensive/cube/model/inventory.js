@@ -46,7 +46,7 @@ cube('InventorySnapshots', {
         sql: `SELECT MAX(snapshot_date) FROM inventory_snapshots`,
       },
       build_range_start: { sql: `SELECT CAST('2026-03-01T00:00:00Z' AS TIMESTAMP)` },
-      build_range_end:   { sql: `SELECT CAST('2026-04-30T23:59:59Z' AS TIMESTAMP)` },
+      build_range_end: { sql: `SELECT CAST('2026-04-30T23:59:59Z' AS TIMESTAMP)` },
     },
   },
 });

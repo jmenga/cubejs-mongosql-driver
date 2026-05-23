@@ -34,8 +34,8 @@
   },
   "scripts": {
     "build": "pnpm build:rust && pnpm build:ts",
-    "build:rust": "napi build --platform --release --cargo-cwd crates/native --cargo-name cubejs-mongosql-driver-native -p cubejs-mongosql-driver-native",
-    "build:rust:debug": "napi build --platform --cargo-cwd crates/native --cargo-name cubejs-mongosql-driver-native -p cubejs-mongosql-driver-native",
+    "build:rust": "node scripts/build-rust.mjs --release",
+    "build:rust:debug": "node scripts/build-rust.mjs",
     "artifacts": "napi artifacts --output-dir artifacts --npm-dir npm",
     "prepublishOnly": "napi prepublish -t npm --skip-gh-release",
     "build:ts": "tsc -p tsconfig.build.json",

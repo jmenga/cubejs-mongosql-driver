@@ -31,3 +31,11 @@ schema:
           status:     { bsonType: string }
           created_at: { bsonType: date }
           updated_at: { bsonType: date }
+      revenue_events:
+        bsonType: object
+        properties:
+          _id:         { bsonType: objectId }
+          account_id:  { bsonType: string }
+          amount:      { bsonType: decimal }
+          category:    { bsonType: string }
+          occurred_at: { bsonType: date }

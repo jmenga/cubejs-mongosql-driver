@@ -46,15 +46,26 @@ async fn execute_select_where_returns_filtered_rows() {
     )
     .expect("translate");
 
-    let value = driver::execute::execute(&client, translation, 10_000, 100)
+    let result = driver::execute::execute(&client, translation, 10_000, 100)
         .await
         .expect("execute");
 
-    let rows = match value {
-        serde_json::Value::Array(rows) => rows,
-        other => panic!("expected JSON array, got {other:?}"),
-    };
+    let rows = result.rows.clone();
     assert!(!rows.is_empty(), "expected at least one paid order");
+    // The (name, type) list must follow the SELECT projection order
+    // exactly — `account_id` first, `status` second — regardless of
+    // what `Object.keys(firstRow)` would yield.
+    let names: Vec<&str> = result.types.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["account_id", "status"],
+        "types must match projection order"
+    );
+    // Both columns originate from the orders schema; account_id is
+    // typed `string` (objectId/string) and status is `string`.
+    for c in &result.types {
+        assert_eq!(c.ty, "string", "{} should be classified as string", c.name);
+    }
 
     // mongosql output is shaped as `{"<table_alias>": {<fields...>}}` per
     // its result-schema contract — it wraps each row in its source-table
@@ -89,6 +100,63 @@ async fn execute_select_where_returns_filtered_rows() {
             "row should carry account_id leaf; row={row}",
         );
     }
+}
+
+/// Critic v3 — Issue #3: drive a GROUP BY + SUM + COUNT through the
+/// executor end-to-end (real mongosql, real mongo cluster) and assert
+/// every column lands on the correct Cube generic type. Pre-fix all
+/// three would have been `text` (the `any_of` fallback bug).
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn execute_group_by_aggregate_emits_correct_types() {
+    let client = Client::with_uri_str(uri()).await.expect("connect");
+    let catalog = driver::schema::load_from_collection(&client, TEST_DB)
+        .await
+        .expect("load catalog");
+
+    let translation = driver::translate::translate(
+        "SELECT account_id, SUM(amount) AS total, COUNT(*) AS c \
+         FROM orders GROUP BY account_id",
+        &catalog,
+        TEST_DB,
+    )
+    .expect("translate");
+
+    let result = driver::execute::execute(&client, translation, 10_000, 100)
+        .await
+        .expect("execute");
+
+    // Build name → type map. Positional order is locked in translate.rs
+    // unit tests (Vec<Vec<String>> select_order is deterministic across
+    // translations); here we want to confirm that the per-column type
+    // mapping survives the wire trip.
+    let by_name: std::collections::HashMap<&str, &str> = result
+        .types
+        .iter()
+        .map(|c| (c.name.as_str(), c.ty))
+        .collect();
+    assert_eq!(
+        by_name.get("account_id"),
+        Some(&"string"),
+        "account_id should be string, full types={:?}",
+        result.types,
+    );
+    assert_eq!(
+        by_name.get("total"),
+        Some(&"decimal"),
+        "SUM(decimal) should classify as decimal, full types={:?}",
+        result.types,
+    );
+    assert_eq!(
+        by_name.get("c"),
+        Some(&"bigint"),
+        "COUNT(*) should widen Int+Long to bigint, full types={:?}",
+        result.types,
+    );
+    assert!(
+        !result.rows.is_empty(),
+        "GROUP BY over seeded orders should produce at least one row",
+    );
 }
 
 /// Row-cap enforcement: the seeded fixture has multiple `orders` rows; with

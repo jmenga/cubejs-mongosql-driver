@@ -30,4 +30,30 @@ if (db.orders.countDocuments() === 0) {
   ]);
 }
 
+// `revenue_events` is the multi-month dataset that drives the cube-e2e
+// rollup-partition test (Critic v3 — Issue #2). It must span at least
+// two distinct months so that a `partition_granularity: 'month'`
+// pre-aggregation produces 2+ partitions, which Cube Store will UNION
+// together at query time. Pre-fix, the UNION failed with
+// `type_coercion ... Timestamp vs Int64` because the driver typed the
+// aggregate columns as `text` on one partition and `bigint`/`decimal`
+// on another. This dataset is the regression harness.
+//
+// Keeping the data static (no Date.now()) is required so test
+// assertions can pin exact totals.
+if (db.revenue_events.countDocuments() === 0) {
+  db.revenue_events.insertMany([
+    // January 2026 — 3 events, total 100 + 200 + 50.50 = 350.50.
+    { _id: ObjectId(), account_id: 'acct_a', amount: NumberDecimal('100.00'), category: 'subscription', occurred_at: new Date('2026-01-05T08:00:00Z') },
+    { _id: ObjectId(), account_id: 'acct_b', amount: NumberDecimal('200.00'), category: 'subscription', occurred_at: new Date('2026-01-18T11:30:00Z') },
+    { _id: ObjectId(), account_id: 'acct_a', amount: NumberDecimal('50.50'),  category: 'usage',        occurred_at: new Date('2026-01-30T22:15:00Z') },
+    // February 2026 — 2 events, total 75 + 125.25 = 200.25.
+    { _id: ObjectId(), account_id: 'acct_a', amount: NumberDecimal('75.00'),  category: 'usage',        occurred_at: new Date('2026-02-10T14:00:00Z') },
+    { _id: ObjectId(), account_id: 'acct_b', amount: NumberDecimal('125.25'), category: 'subscription', occurred_at: new Date('2026-02-22T09:45:00Z') },
+    // March 2026 — 2 events, total 300 + 99.99 = 399.99.
+    { _id: ObjectId(), account_id: 'acct_b', amount: NumberDecimal('300.00'), category: 'subscription', occurred_at: new Date('2026-03-07T16:20:00Z') },
+    { _id: ObjectId(), account_id: 'acct_a', amount: NumberDecimal('99.99'),  category: 'usage',        occurred_at: new Date('2026-03-28T03:10:00Z') },
+  ]);
+}
+
 print('seed-data: collections seeded');

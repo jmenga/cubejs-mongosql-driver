@@ -221,7 +221,22 @@ Rust MongoSqlClient::query(sql)
   │     rows.push(bson_to_json(doc)?)
   │   }
   │
-  └─ Ok(serde_json::Value::Array(rows))
+  ├─ // Authoritative column list — name + Cube generic type — derived
+  │   // from mongosql's `Translation::{select_order, result_set_schema}`
+  │   // BEFORE the cursor drains. The pre-aggregation upload path
+  │   // (`downloadQueryResults`) consumes this list verbatim; we no
+  │   // longer sniff types from row values (that path was non-
+  │   // deterministic in multi-partition pre-aggregations because
+  │   // mongosql's `$project` stage construction iterates a HashMap-
+  │   // backed schema, producing different field orders across
+  │   // translations of the *same* SQL, and divergent column orders
+  │   // broke Cube Store UNIONs with `type_coercion` errors).
+  │   let types: Vec<ColumnType> = column_types_from_schema(
+  │       &translation.select_order,
+  │       &translation.result_set_schema,
+  │   );
+  │
+  └─ Ok({ rows, types })   // napi-rs serialises as `{rows, types}`
 ```
 
 ### 4.2 BSON → JSON marshaling rules
@@ -244,6 +259,62 @@ Rust MongoSqlClient::query(sql)
 | `MinKey`, `MaxKey`, `Undefined` | EJSON form (`$minKey: 1`, etc.) | Legacy; surface losslessly even if Cube ignores |
 
 Implementation: thin custom serializer in `execute.rs` calling `serde_json::Value::*` constructors directly — avoids the lossy generic BSON-to-JSON path.
+
+#### Per-column types from mongosql metadata
+
+Alongside the marshalled rows, the executor returns an ordered
+`Vec<{name, type}>` derived from `mongosql::Translation::{select_order,
+result_set_schema}`. `select_order` is the projection order parsed from
+the SQL SELECT clause; `result_set_schema` is the per-field
+`json_schema::Schema` declaration. The driver maps an atomic
+`bson_type` → Cube generic-type string per:
+
+| BSON type | Cube generic type |
+|---|---|
+| `String`, `ObjectId` | `string` |
+| `Int` | `int` |
+| `Long` | `bigint` |
+| `Double`, `Decimal` | `decimal` |
+| `Bool` | `boolean` |
+| `Date`, `Timestamp` | `timestamp` |
+| `Object`, `Array`, `BinData`, `Regex`, `Symbol`, code-variants, `MinKey`, `MaxKey`, `DbPointer`, `Undefined`, `Null` | `text` |
+
+**Union resolution (`any_of`).** mongosql's
+`TryFrom<Schema> for json_schema::Schema`
+(`mongosql/src/schema/definitions.rs` lines 730-743 at git-rev 4a159e5)
+emits `{ bson_type: None, any_of: Some(variants) }` for *every*
+non-atomic schema — nullable columns, GROUP BY columns, aggregate
+outputs. **It never emits `BsonType::Multiple` at runtime.** Practical
+shapes the driver sees:
+
+| SQL | Schema mongosql emits | Cube generic type |
+|---|---|---|
+| `SUM(amount)` over decimal | `any_of: [Decimal, Null]` | `decimal` |
+| `COUNT(*)` / `COUNT(col)` | `any_of: [Int, Long]` | `bigint` |
+| `account_id` from a nullable string column | `any_of: [String, Null]` | `string` |
+| `AVG(col)` over int | `any_of: [Double, Null]` | `decimal` |
+| Heterogeneous union (`SELECT CASE ... END`) | `any_of: [String, Int]` | `text` |
+
+Resolution rule (see `execute.rs::cube_type_for_schema`):
+
+1. If `bson_type` is a single atomic (no `any_of`), map directly.
+2. Otherwise, walk `any_of`, drop `Null` variants, deduplicate the
+   remaining atomic names. If exactly one distinct non-null variant
+   remains → map it. If 2+ remain and they're all numeric, **widen
+   upwards**: `Int + Long → bigint`, anything-with-`Double`-or-`Decimal`
+   → `decimal`. Any other multi-variant union → `text`.
+3. Nested `any_of` (e.g. `any_of: [{any_of: [Int, Null]}, ...]`) is
+   flattened recursively — currently theoretical (mongosql's algebra
+   layer collapses unions before the JSON-Schema conversion) but handled
+   defensively.
+4. `bson_type: None` AND `any_of: None` (Schema::Any) → `text`. Same for
+   any_of with object/array variants that can't be reduced to a single
+   atomic name.
+
+The TS-side `flattenRow` rule applies here too — for a multi-key
+envelope the name is `<namespace>__<column>` (an empty-string namespace
+yields `__<column>` to match flattenRow byte-for-byte); for a single-key
+envelope it's the bare column.
 
 ### 4.3 Errors mapped
 

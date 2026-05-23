@@ -100,6 +100,10 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(res.ok, `Cube /meta returned ${res.status}`).toBe(true);
     const meta = (await res.json()) as CubeMetaResponse;
     expect(meta.cubes.map((c) => c.name)).toContain('orders');
+    // revenue_events cube was added for the multi-partition rollup test
+    // (Critic v3 — Issue #2). Failing here means the model didn't compile
+    // — typically a missing __sql_schemas row or a Cube model syntax error.
+    expect(meta.cubes.map((c) => c.name)).toContain('revenue_events');
   }, 60_000);
 
   afterAll(() => {
@@ -197,6 +201,99 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(dimNames).toContain('orders.accountId');
     expect(dimNames).toContain('orders.status');
     expect(dimNames).toContain('orders.createdAt');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Multi-partition rollup — Critic v3 — Issue #2.
+  //
+  // The `revenue_events` cube declares a monthly-partitioned
+  // pre-aggregation over `occurred_at`. The seed data spans Jan/Feb/Mar
+  // 2026, so a query covering the full range forces Cube Store to
+  // materialize and UNION three partitions. Pre-fix, the UNION failed
+  // with `type_coercion ... Timestamp vs Int64` because the driver's
+  // `downloadQueryResults` typed every aggregate column as `text`
+  // (mongosql emits `any_of: [Decimal, Null]` / `[Int, Long]` for
+  // SUM/COUNT and the old code couldn't see past `bson_type: None`).
+  //
+  // Asserts:
+  //   - measures come back as numeric-compatible values (the JSON
+  //     wire form may stringify the decimal SUM per the BSON-marshal
+  //     contract; `Number(...)` must still produce the expected total).
+  //   - count = 7 rows total across all three months.
+  //   - totalAmount = 350.50 + 200.25 + 399.99 = 950.74.
+  // ---------------------------------------------------------------------------
+  it('partitioned rollup — query spanning 3 months UNIONs partitions correctly', async () => {
+    const body = await loadQuery({
+      query: {
+        measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+        // Time dimension with date range forces Cube to expand the
+        // partitions and UNION them. Per the seed, the data is
+        // 2026-01-05..2026-03-28; we request a slightly wider window
+        // so all three partitions definitely participate.
+        timeDimensions: [
+          {
+            dimension: 'revenue_events.occurredAt',
+            dateRange: ['2026-01-01', '2026-03-31'],
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.dbType).toBe('mongosql');
+
+    // The query has no dimension groupings, so it collapses to one
+    // row per time bucket emitted by Cube's `granularity` default.
+    // Sum across all returned buckets — the totals must match the seed
+    // exactly regardless of how Cube rolls them up.
+    const totalCount = body.data.reduce((acc, r) => acc + Number(r['revenue_events.count'] ?? 0), 0);
+    expect(totalCount).toBe(7);
+
+    const totalAmountSum = body.data.reduce((acc, r) => acc + Number(r['revenue_events.totalAmount'] ?? 0), 0);
+    expect(totalAmountSum).toBeCloseTo(950.74, 2);
+  });
+
+  it('partitioned rollup — count by category preserves numeric type across partitions', async () => {
+    // Group by `category` AND time. With monthly partitioning, the
+    // multi-month UNION exercises the exact `account_id-style + Int+Long`
+    // shape the regression test pins at the Rust level.
+    const body = await loadQuery({
+      query: {
+        measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+        dimensions: ['revenue_events.category'],
+        timeDimensions: [
+          {
+            dimension: 'revenue_events.occurredAt',
+            dateRange: ['2026-01-01', '2026-03-31'],
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.dbType).toBe('mongosql');
+
+    // The seed has two categories: `subscription` (4 events, 100+200+125.25+300 = 725.25)
+    // and `usage` (3 events, 50.50+75+99.99 = 225.49). Sum across buckets
+    // (Cube may split each category by month).
+    const byCategory: Record<string, { count: number; total: number }> = {};
+    for (const row of body.data) {
+      const cat = String(row['revenue_events.category']);
+      const c = Number(row['revenue_events.count'] ?? 0);
+      const t = Number(row['revenue_events.totalAmount'] ?? 0);
+      if (!byCategory[cat]) byCategory[cat] = { count: 0, total: 0 };
+      byCategory[cat].count += c;
+      byCategory[cat].total += t;
+    }
+    expect(byCategory.subscription).toBeDefined();
+    expect(byCategory.usage).toBeDefined();
+    expect(byCategory.subscription.count).toBe(4);
+    expect(byCategory.subscription.total).toBeCloseTo(725.25, 2);
+    expect(byCategory.usage.count).toBe(3);
+    expect(byCategory.usage.total).toBeCloseTo(225.49, 2);
   });
 
   it('dimension query — count grouped by status (T19a regression test)', async () => {

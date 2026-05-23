@@ -95,12 +95,76 @@ async fn query_count_returns_at_least_one_row() {
         .await
         .expect("count query");
 
-    let rows = match v {
-        Value::Array(rows) => rows,
-        other => panic!("expected JSON array, got {other:?}"),
-    };
+    let (rows, types) = unwrap_query_result(&v);
     assert!(!rows.is_empty(), "COUNT(*) should return one aggregate row");
+    // Critic v3 — Issue #3: pre-fix this test only asserted
+    // `!types.is_empty()`, which passed even when the column was
+    // mistyped as `text` (the `any_of: [Int, Long]` fallthrough). Now
+    // we pin the actual contract: exactly one column, classified as
+    // `bigint` (Int/Long union widens up, never `text`).
+    assert_eq!(types.len(), 1, "single aggregate projection: {types:?}");
+    let ty = types[0]
+        .get("type")
+        .and_then(|v| v.as_str())
+        .expect("type string present");
+    assert_eq!(
+        ty, "bigint",
+        "COUNT(*) must classify as bigint (Int/Long widening), got {ty}",
+    );
     client.close().await.expect("close");
+}
+
+/// Critic v3 — Issue #3: lock the multi-column aggregate contract
+/// against the real cluster. GROUP BY + SUM + COUNT exercises three
+/// `any_of` shapes simultaneously; we assert each lands on the expected
+/// Cube generic type. Pre-fix every column would have been `text` and
+/// Cube Store would refuse to UNION partitions.
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn group_by_aggregate_emits_correct_types_per_column() {
+    let client = MongoSqlClient::new(collection_mode_config());
+    client.test_connection(None).await.expect("test_connection");
+
+    let v = client
+        .query(
+            "SELECT account_id, SUM(amount) AS total, COUNT(*) AS c \
+             FROM orders GROUP BY account_id"
+                .to_string(),
+            None,
+        )
+        .await
+        .expect("group-by aggregate query");
+
+    let (_rows, types) = unwrap_query_result(&v);
+    // Build a name → type map; the SELECT projection order is
+    // [account_id, total, c]. select_order is honoured byte-for-byte
+    // (verified separately in translate.rs unit tests), so we don't
+    // re-assert positional order here.
+    let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for t in types {
+        let obj = t.as_object().expect("column entry is object");
+        let name = obj.get("name").and_then(|v| v.as_str()).expect("name");
+        let ty = obj.get("type").and_then(|v| v.as_str()).expect("type");
+        by_name.insert(name, ty);
+    }
+    assert_eq!(by_name.get("account_id"), Some(&"string"));
+    assert_eq!(by_name.get("total"), Some(&"decimal"));
+    assert_eq!(by_name.get("c"), Some(&"bigint"));
+    client.close().await.expect("close");
+}
+
+/// Helper: pull `(rows, types)` out of the new `{rows, types}` query result.
+fn unwrap_query_result(v: &Value) -> (&Vec<Value>, &Vec<Value>) {
+    let obj = v.as_object().expect("query result is a JSON object");
+    let rows = obj
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("rows array present");
+    let types = obj
+        .get("types")
+        .and_then(|t| t.as_array())
+        .expect("types array present");
+    (rows, types)
 }
 
 #[tokio::test]
@@ -158,10 +222,8 @@ async fn file_mode_query_against_real_cluster() {
         .query("SELECT account_id FROM orders".to_string(), None)
         .await
         .expect("file-mode query");
-    match v {
-        Value::Array(rows) => assert!(!rows.is_empty(), "expected at least one orders row"),
-        other => panic!("expected JSON array, got {other:?}"),
-    }
+    let (rows, _types) = unwrap_query_result(&v);
+    assert!(!rows.is_empty(), "expected at least one orders row");
     client.close().await.expect("close");
 }
 
