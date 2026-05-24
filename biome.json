@@ -23,7 +23,9 @@
       "!Cargo.lock",
       "!tests/integration/fixtures/seed-data.js",
       "!tests/integration/fixtures/seed-schemas.js",
-      "!examples/local-dev/seed-data.js"
+      "!examples/local-dev/seed-data.js",
+      "!examples/local-dev/seed-schemas.js",
+      "!examples/comprehensive/seed/**/*.js"
     ]
   },
   "formatter": {
@@ -100,7 +102,7 @@
       }
     },
     {
-      "includes": ["scripts/**/*.ts", "scripts/**/*.js"],
+      "includes": ["scripts/**/*.ts", "scripts/**/*.js", "scripts/**/*.mjs"],
       "linter": {
         "rules": {
           "suspicious": {

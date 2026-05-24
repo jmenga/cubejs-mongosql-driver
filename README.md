@@ -115,21 +115,64 @@ If `npm install` cannot find a matching binary it will fail with a clear "no nat
 
 ## Configure
 
-All configuration is via standard Cube env vars where they exist; new `CUBEJS_MONGOSQL_*` vars where they don't.
+All configuration is via standard Cube env vars where they exist; new `CUBEJS_MONGOSQL_*` vars where they don't. Where both a Cube-standard `CUBEJS_DB_*` and a driver-specific `CUBEJS_MONGOSQL_*` exist for the same setting, the Cube-standard var wins.
 
-| Env var                              | Required?            | Default      | Purpose                                                                                                               |
-| ------------------------------------ | -------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `CUBEJS_DB_TYPE`                     | yes                  | —            | Must be `mongosql` for Cube to route to this driver                                                                   |
-| `CUBEJS_DB_URI`                      | yes                  | —            | Full MongoDB connection string (`mongodb://...` or `mongodb+srv://...`)                                               |
-| `CUBEJS_DB_NAME`                     | yes                  | —            | Database name (where `__sql_schemas` lives in collection mode)                                                        |
-| `CUBEJS_MONGOSQL_SCHEMA_SOURCE`      | no                   | `collection` | `collection` or `file`                                                                                                |
-| `CUBEJS_MONGOSQL_SCHEMA_FILE`        | yes if `SOURCE=file` | —            | Path to YAML/JSON schema file                                                                                         |
-| `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no                   | `300`        | Background refresh interval in seconds                                                                                |
-| `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN`   | no                   | `false`      | If `true`, `testConnection()` does not fail on initial schema-load failure (cache stays empty until next refresh)     |
-| `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`   | no                   | `60000`      | Per-query timeout (sets `maxTimeMS` on the aggregation)                                                               |
-| `CUBEJS_MONGOSQL_MAX_ROWS`           | no                   | `100000`     | Max rows returned per query; exceeding throws `MONGOSQL_RESULT_TOO_LARGE` (see [Pre-aggregations](#pre-aggregations)) |
+### Connection identity (one of)
 
-> **Note:** SPEC FR-7 also lists `CUBEJS_DB_HOST`, `CUBEJS_DB_USER`, `CUBEJS_DB_PASS`, `CUBEJS_DB_SSL` as legacy alternatives. The driver does **not** read these directly — embed credentials and TLS settings into `CUBEJS_DB_URI` instead (e.g. `mongodb+srv://user:pass@cluster.mongodb.net/?tls=true&authSource=admin`). Atlas connection strings already encode TLS by default.
+You must give the driver enough information to build a MongoDB connection string. The precedence order (highest → lowest) is:
+
+1. Constructor `uri` arg (only relevant when embedding the driver programmatically)
+2. `CUBEJS_DB_URL`
+3. `CUBEJS_DB_URI`
+4. Composed from `CUBEJS_DB_HOST` (+ optional `_PORT`, `_USER`, `_PASS`, `_NAME`)
+
+| Env var          | Required?    | Default | Purpose                                                                 |
+| ---------------- | ------------ | ------- | ----------------------------------------------------------------------- |
+| `CUBEJS_DB_TYPE` | yes          | —       | Must be `mongosql` for Cube to route to this driver                     |
+| `CUBEJS_DB_URL`  | one of these | —       | Full MongoDB connection string (`mongodb://…` or `mongodb+srv://…`)     |
+| `CUBEJS_DB_URI`  | one of these | —       | Alias for `CUBEJS_DB_URL` (legacy; `_URL` wins if both set)             |
+| `CUBEJS_DB_HOST` | one of these | —       | Single host, or comma-separated seed list (`host1:27017,host2:27017`)   |
+| `CUBEJS_DB_PORT` | no           | —       | Port; appended only when `CUBEJS_DB_HOST` is a single host with no port |
+| `CUBEJS_DB_USER` | no           | —       | SCRAM username (URL-encoded into the composed URI)                      |
+| `CUBEJS_DB_PASS` | no           | —       | SCRAM password (URL-encoded; requires `CUBEJS_DB_USER`)                 |
+| `CUBEJS_DB_NAME` | yes          | —       | Database name (where `__sql_schemas` lives in collection mode)          |
+
+### Connection tuning (env-driven URI params)
+
+These set MongoDB connection-string parameters on the URI handed to the [`mongodb`](https://crates.io/crates/mongodb) Rust crate. Any value the user already specifies inside `CUBEJS_DB_URL` / `CUBEJS_DB_URI` wins — env-driven values only fill in keys the URI hasn't set.
+
+| Env var                                       | Default      | URI param                  | Purpose                                                                                                             |
+| --------------------------------------------- | ------------ | -------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `CUBEJS_DB_SSL`                               | mongo crate  | `tls`                      | Enable TLS (`true` / `1` → `tls=true`; Atlas connections already enable it by default)                              |
+| `CUBEJS_DB_MAX_POOL`                          | mongo crate  | `maxPoolSize`              | Maximum concurrent connections in the pool                                                                          |
+| `CUBEJS_DB_MIN_POOL`                          | `0`          | `minPoolSize`              | Minimum connections held warm in the pool                                                                           |
+| `CUBEJS_DB_IDLE_TIMEOUT`                      | mongo crate  | `maxIdleTimeMS`            | Close idle connections after this long. Accepts ms (`60000`), `ms`/`s`/`m`/`h` suffix (`60s`, `5m`, `1h`)           |
+| `CUBEJS_MONGOSQL_MAX_CONNECTING`              | mongo crate  | `maxConnecting`            | Max concurrent in-flight pool establishment operations                                                              |
+| `CUBEJS_MONGOSQL_WAIT_QUEUE_TIMEOUT_MS`       | mongo crate  | `waitQueueTimeoutMS`       | How long a checkout call waits for a free connection                                                                |
+| `CUBEJS_MONGOSQL_CONNECT_TIMEOUT_MS`          | mongo crate  | `connectTimeoutMS`         | TCP/TLS connect timeout                                                                                             |
+| `CUBEJS_MONGOSQL_SOCKET_TIMEOUT_MS`           | mongo crate  | `socketTimeoutMS`          | Per-socket I/O timeout                                                                                              |
+| `CUBEJS_MONGOSQL_SERVER_SELECTION_TIMEOUT_MS` | mongo crate  | `serverSelectionTimeoutMS` | How long to wait for a suitable server in the topology                                                              |
+| `CUBEJS_MONGOSQL_HEARTBEAT_FREQUENCY_MS`      | mongo crate  | `heartbeatFrequencyMS`     | SDAM heartbeat cadence                                                                                              |
+| `CUBEJS_MONGOSQL_APP_NAME`                    | —            | `appName`                  | Tag connections so MongoDB ops/logs identify the Cube driver (`$currentOp.appName`, `serverStatus().connections`)   |
+| `CUBEJS_MONGOSQL_RETRY_WRITES`                | mongo crate  | `retryWrites`              | Retry retryable write commands                                                                                      |
+| `CUBEJS_MONGOSQL_RETRY_READS`                 | mongo crate  | `retryReads`               | Retry retryable read commands                                                                                       |
+| `CUBEJS_MONGOSQL_COMPRESSORS`                 | —            | `compressors`              | Wire-protocol compressors (e.g. `snappy,zstd`)                                                                      |
+
+### Driver-internal knobs
+
+These are not URI params — they control the driver layer itself.
+
+| Env var                              | Required?            | Default      | Purpose                                                                                                                       |
+| ------------------------------------ | -------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `CUBEJS_DB_QUERY_TIMEOUT`            | no                   | `10m`        | Per-query timeout (drives the aggregation pipeline's `maxTimeMS`). Accepts duration strings or bare ms; wins over the legacy var below |
+| `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`   | no                   | `60000`      | Legacy bare-ms timeout; still honoured when `CUBEJS_DB_QUERY_TIMEOUT` is unset                                                |
+| `CUBEJS_MONGOSQL_SCHEMA_SOURCE`      | no                   | `collection` | `collection`, `file`, or `atlas-sql` (required for Atlas SQL endpoints — see [Schema management](#schema-management))         |
+| `CUBEJS_MONGOSQL_SCHEMA_FILE`        | yes if `SOURCE=file` | —            | Path to YAML/JSON schema file                                                                                                 |
+| `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no                   | `300`        | Background schema-refresh interval in seconds                                                                                 |
+| `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN`   | no                   | `false`      | If `true`, `testConnection()` does not fail on initial schema-load failure (cache stays empty until next refresh)             |
+| `CUBEJS_MONGOSQL_MAX_ROWS`           | no                   | `100000`     | Max rows returned per query; exceeding throws `MONGOSQL_RESULT_TOO_LARGE` (see [Pre-aggregations](#pre-aggregations))         |
+
+> **Tip:** if you already encode parameters into `CUBEJS_DB_URL` / `CUBEJS_DB_URI` (e.g. `?maxPoolSize=20&tls=true`), those values always win — env-driven settings only fill in keys the URI hasn't specified. Cube docs source: <https://cube.dev/docs/product/configuration/reference/environment-variables>.
 
 ### Connection examples
 
@@ -175,12 +218,13 @@ CUBEJS_MONGOSQL_SCHEMA_FILE=/path/to/mongo-schema.yaml
 
 ## Schema management
 
-`mongosql` translates SQL by consulting a JSON-Schema-shaped catalog of your collections. The driver loads that catalog from one of two sources, selected by `CUBEJS_MONGOSQL_SCHEMA_SOURCE`:
+`mongosql` translates SQL by consulting a JSON-Schema-shaped catalog of your collections. The driver loads that catalog from one of three sources, selected by `CUBEJS_MONGOSQL_SCHEMA_SOURCE`:
 
-| Mode                   | Source                                             | Use case                                                          |
-| ---------------------- | -------------------------------------------------- | ----------------------------------------------------------------- |
-| `collection` (default) | `__sql_schemas` collection in `CUBEJS_DB_NAME`     | Production (Atlas SQL Interface or EA Schema Builder maintain it) |
-| `file`                 | YAML or JSON file at `CUBEJS_MONGOSQL_SCHEMA_FILE` | Local dev, schema-as-code, EA without Schema Builder, edge cases  |
+| Mode                   | Source                                                      | Use case                                                                                                |
+| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `collection` (default) | `__sql_schemas` collection in `CUBEJS_DB_NAME`              | Production (Atlas SQL Interface or EA Schema Builder maintain it)                                       |
+| `file`                 | YAML or JSON file at `CUBEJS_MONGOSQL_SCHEMA_FILE`          | Local dev, schema-as-code, EA without Schema Builder, edge cases                                        |
+| `atlas-sql`            | `sqlGetSchema` admin command per collection in the database | Atlas SQL endpoints (`*.a.query.mongodb.net`) — schemas live in an internal store, not as a collection  |
 
 The driver loads schema once on `testConnection()` (fail-closed by default; toggle with `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN=true`), caches it under an `Arc<RwLock<Catalog>>`, refreshes it every `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` seconds, and atomically swaps cache contents on each successful refresh. Refresh failures log a warning and keep serving cached schema; queries never block on schema I/O.
 
@@ -223,6 +267,41 @@ schema:
 ```
 
 > **Limitation (T05/T09 discovery):** file-mode envelopes carry no database name. Internally the loader keys collections under an empty-string placeholder; the napi surface re-keys translation results to `CUBEJS_DB_NAME` so the executor targets the right database. The user-visible behaviour is identical to collection mode — but if you're authoring tooling that introspects the catalog, be aware of the asymmetry. See [`examples/local-dev/`](./examples/local-dev/) for a working file-mode setup.
+
+### Atlas SQL mode (required for `*.a.query.mongodb.net` endpoints)
+
+Atlas SQL endpoints — the dedicated SQL fronts Atlas provisions for the SQL Interface, with hostnames of the form `<cluster>-<id>.a.query.mongodb.net` — do NOT expose `__sql_schemas` as a queryable collection. Schemas live in an internal store and are reachable only via the `sqlGetSchema` admin-style command. Collection-mode discovery fails on these endpoints because the document `db.<dbname>.__sql_schemas.find()` returns nothing even though the schemas exist.
+
+Set `CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql` for these endpoints:
+
+```bash
+CUBEJS_DB_TYPE=mongosql
+CUBEJS_DB_URI='mongodb://USER:PASS@atlas-sql-685d57005fe09d047b8f2d31-zlj67.a.query.mongodb.net/?ssl=true&authSource=admin&appName=cube'
+CUBEJS_DB_NAME=dev-convo-hub
+CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql
+```
+
+In this mode the driver:
+
+1. Calls `listCollections` on `CUBEJS_DB_NAME` to enumerate candidate collections.
+2. Filters out `system.*` collections and `__sql_schemas`.
+3. Runs `sqlGetSchema` per remaining collection with **bounded parallelism** (up to 8 in flight at once — see `ATLAS_SQL_FAN_OUT_CONCURRENCY` in `crates/native/src/schema.rs`). Empty-schema responses (`{ok: 1, metadata: {}, schema: {}}`) — the canonical "no schema set for this name" shape — are SKIPPED, not errored. Populated responses (`{ok: 1, metadata: {description}, schema: {version, jsonSchema}}`) are added to the catalog. The parallel fan-out turns an `N × RTT` refresh into roughly `ceil(N / 8) × RTT`, which matters on databases with 100+ collections.
+4. Re-runs the same enumeration on the `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` cadence (default 300 s) so Atlas-driven schema updates surface without a driver restart.
+
+Canonical command spec: <https://www.mongodb.com/docs/sql-interface/schema/view/>. There is no `sqlListSchemas` command — enumeration is `listCollections` + per-collection `sqlGetSchema`, which is what the driver does.
+
+#### Required Atlas role grants
+
+`sqlGetSchema` is an admin-style command. The connecting user MUST hold either:
+
+- the built-in `atlasAdmin` role on the Atlas project, OR
+- a database-user role combination granting `clusterMonitor` (on `admin`) plus `readAnyDatabase` (on `admin`).
+
+A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privileges will surface a MongoDB error with code **13 (`Unauthorized`)**. The driver detects this and raises `MONGOSQL_SCHEMA_INVALID` with a hint that embeds the required role names directly (no documentation-traversal needed) and points at the Atlas "Configure Database Users" page where the operator actually performs the fix: <https://www.mongodb.com/docs/atlas/security-add-mongodb-users/> (Atlas UI: Project → Security → Database Access → Edit user).
+
+> **Why this URL?** MongoDB's docs do not publish a single deep-linkable page that says "these are the roles `sqlGetSchema` requires" — the privilege table lives in the dynamically-rendered built-in-roles reference which is unstable to deep-link. The role names are therefore embedded directly in the error message; the URL is the operator-facing landing page for the actual fix.
+
+If `sqlGetSchema` fails with code **59 (`CommandNotFound`)** the endpoint isn't an Atlas SQL endpoint at all (the typical "I'm pointing atlas-sql mode at a regular cluster" misconfiguration). The driver surfaces a distinct hint suggesting collection mode for that case. Any other failure is reported with the underlying message routed through the credential-redactor so connection strings don't leak.
 
 ## Pre-aggregations
 
@@ -310,7 +389,7 @@ All driver errors thrown to Cube are `Error` instances with `name = 'MongoSqlErr
 | `MONGOSQL_SCHEMA_FILE_NOT_FOUND` | File mode: file missing                                   | Check `CUBEJS_MONGOSQL_SCHEMA_FILE` path                                 |
 | `MONGOSQL_TRANSLATE_FAILED`      | `mongosql::translate_sql` rejected the SQL                | Check column names, types vs schema; check ambiguous JOINs               |
 | `MONGOSQL_EXECUTE_FAILED`        | Aggregation pipeline failed at MongoDB                    | Check Mongo logs; reproduce with `mongosql-cli`                          |
-| `MONGOSQL_TIMEOUT`               | Query exceeded `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`         | Add a pre-agg, optimize the query, or raise the timeout                  |
+| `MONGOSQL_TIMEOUT`               | Query exceeded `CUBEJS_DB_QUERY_TIMEOUT` / legacy `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | Add a pre-agg, optimize the query, or raise the timeout                  |
 | `MONGOSQL_RESULT_TOO_LARGE`      | Cursor returned more rows than `CUBEJS_MONGOSQL_MAX_ROWS` | Add a pre-agg, narrow filters, partition smaller, or raise the cap       |
 | `MONGOSQL_CANCELLED`             | Caller fired an `AbortSignal`, or `release()` cancelled the in-flight query | Expected on shutdown / user-cancel — no retry needed                     |
 
@@ -343,6 +422,38 @@ The driver buffers query results into a JSON array before crossing the napi boun
 4. **Raise the cap** with `CUBEJS_MONGOSQL_MAX_ROWS=500000` (or wherever your pod's memory budget allows ~ 1 KB / row).
 
 Streaming via `ThreadsafeFunction` is a planned post-MVP enhancement — see [SPEC §8](./SPEC.md#8-open-questions).
+
+### Large `IN (...)` / `NOT IN (...)` lists — Atlas SQL endpoint re-expands large boolean arrays
+
+Real-world Cube queries with `equals` (`IN`) or `notEquals` (`NOT IN`) filters carrying hundreds of identifiers (e.g. `agent_id IN (160 ids)`) hit MongoDB's max BSON nested-object depth (100) on the Atlas SQL endpoint. The failure mode is subtle:
+
+1. **`mongosql` v1.8.5 outputs a *flat* boolean array.** Both `IN (v1..vN)` (and the equivalent `field = v1 OR field = v2 OR …`) and `NOT IN (v1..vN)` translate to a *flat* `$or` / `$and` array (depth 1) — verified empirically against both the local YAML fixture catalog AND a real Atlas SQL endpoint's `sqlGetSchema`-derived catalog (see `crates/native/tests/critic_probe.rs`).
+2. **The Atlas SQL proxy re-expands the flat array.** When the driver sends that flat pipeline over the wire to an Atlas SQL endpoint (`*.a.query.mongodb.net`), the proxy / server-side query layer re-expands the array into a right-leaning chain of binary `$or` / `$and`s before passing the aggregate to the underlying MongoDB query engine:
+
+   ```text
+   { $or: [LEAF, { $or: [LEAF, { $or: [LEAF, … ] }] }] }
+   ```
+
+3. **MongoDB rejects the chain.** For N ≥ ~100 the materialised BSON exceeds the maximum nested-object depth (100), and the server rejects the aggregate with:
+
+   ```text
+   Error code 15 (Overflow): BSONObj exceeds maximum nested object depth
+   ```
+
+   The error path on a Cube query with 161 `agent_id` values:
+
+   ```text
+   pipeline.0.$match.$expr.$let.vars.desugared_sqlAnd_input2.$let.in.$cond.if.$or.0.$or.0.$or.0…
+   ```
+
+   (Note: this path is from the *server's* error message — the path the driver SENDS over the wire is flat.)
+
+4. **Collapsing to `$in` / `{$not: {$in: …}}` defeats the re-expansion.** There is no n-ary boolean array left for the proxy to chain-ify. The driver applies a pure pipeline rewrite immediately after translation:
+   - **Flatten** any nested `$or` / `$and` chain into a single flat array (defensive; defends against any client-side chain shape from future translators).
+   - **Collapse to `$in`** when every `$or` element is a `$eq` against the same field with literal scalars.
+   - **Collapse to `{$not: {$in: …}}`** when every `$and` element is a `$ne` against the same field with literal scalars (the `NOT IN` symmetric path). NOTE: this emits `{$not: {$in: …}}` and NOT `{$nin: …}`. MongoDB's `$nin` is a *query* operator (valid only inside `$match.<field>: {$nin: …}`), not an aggregation expression operator. mongosql lands its NOT IN translation inside `$expr`, where `$nin` is rejected with `code 168: Unrecognized expression '$nin'`. Verified empirically against atlas-local.
+
+Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. If a future Atlas SQL release stops re-expanding flat boolean arrays, this rewrite becomes a no-op (the walker is shape-agnostic and runs in linear time per pipeline node).
 
 ### `MONGOSQL_SCHEMA_NOT_FOUND`
 

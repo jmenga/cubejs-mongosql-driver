@@ -22,6 +22,24 @@ interface NativeMongoSqlClient {
   close(): Promise<void>;
 }
 
+/**
+ * Authoritative `(name, type)` column descriptor produced by the native
+ * layer from `mongosql::Translation::{select_order, result_set_schema}`.
+ * Used by `downloadQueryResults` to drive Cube Store's LOAD ROWS column
+ * list, replacing the old value-sniffing heuristic.
+ */
+export interface ColumnType {
+  name: string;
+  /** Cube generic-type string: `timestamp` | `int` | `bigint` | `decimal` | `boolean` | `string` | `text`. */
+  type: string;
+}
+
+/** Shape returned by the native `query()` napi binding. */
+export interface NativeQueryResult {
+  rows: unknown[];
+  types: ColumnType[];
+}
+
 interface NativeModule {
   MongoSqlClient: new (config: MongoSqlConfig) => NativeMongoSqlClient;
   // Optional in the typed surface so test mocks that only stub
@@ -106,11 +124,37 @@ export class MongoSqlClient {
   }
 
   async query<R = Record<string, unknown>>(sql: string, signal?: AbortSignal): Promise<R[]> {
+    // `query()` keeps its historical `R[]` signature for ergonomic
+    // consumption — pre-aggregation paths that need the type list call
+    // `queryWithTypes` instead and pay the extra unwrap.
+    const { rows } = await this.queryWithTypes(sql, signal);
+    return rows as R[];
+  }
+
+  /**
+   * Like `query()` but returns the authoritative `(name, type)` list
+   * alongside the rows. Used by `downloadQueryResults` to drive Cube
+   * Store's column-list payload; replaces the value-sniffed inference
+   * the driver used pre-fix.
+   *
+   * The shape mirrors the native binding exactly:
+   *   `{ rows: R[], types: Array<{name, type}> }`.
+   * `types` is empty when (and only when) `mongosql::select_order` is
+   * empty — a degenerate case in practice but possible if upstream
+   * doesn't parse a projection list.
+   */
+  async queryWithTypes<R = Record<string, unknown>>(
+    sql: string,
+    signal?: AbortSignal,
+  ): Promise<{ rows: R[]; types: ColumnType[] }> {
     const result = await this.runCancellable(signal, (handle) => this.inner.query(sql, handle));
-    if (!Array.isArray(result)) {
-      throw createError('MONGOSQL_EXECUTE_FAILED', `expected query result to be an array, got ${typeof result}`);
+    if (!isQueryResult(result)) {
+      throw createError(
+        'MONGOSQL_EXECUTE_FAILED',
+        `expected query result to be an object with rows + types arrays, got ${describe(result)}`,
+      );
     }
-    return result as R[];
+    return { rows: result.rows as R[], types: result.types };
   }
 
   async tablesSchema(signal?: AbortSignal): Promise<TablesSchema> {
@@ -184,4 +228,23 @@ function createError(code: ErrorCode, message: string): MongoSqlError {
   err.code = code;
   err.name = 'MongoSqlError';
   return err;
+}
+
+function isQueryResult(value: unknown): value is NativeQueryResult {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (!Array.isArray(v.rows)) return false;
+  if (!Array.isArray(v.types)) return false;
+  for (const t of v.types) {
+    if (typeof t !== 'object' || t === null) return false;
+    const ct = t as Record<string, unknown>;
+    if (typeof ct.name !== 'string' || typeof ct.type !== 'string') return false;
+  }
+  return true;
+}
+
+function describe(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
 }

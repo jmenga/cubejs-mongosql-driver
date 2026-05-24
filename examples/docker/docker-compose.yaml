@@ -84,6 +84,15 @@ services:
       CUBEJS_MONGOSQL_SCHEMA_SOURCE: collection
       # Snappier refresh for the test run; production default is 300 s.
       CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '60'
+      # Tag the connection so the cube-e2e test can assert that env-driven
+      # Mongo URI knobs reach the server. Verified via $currentOp /
+      # serverStatus().connections.appName.
+      CUBEJS_MONGOSQL_APP_NAME: cube-e2e-driver
+      # Smoke-test that pool tuning flows through; e2e assertion is via
+      # the driver-internal URI (resolved by src/config.ts), not via the
+      # server (mongo doesn't surface per-client pool limits in
+      # serverStatus).
+      CUBEJS_DB_MAX_POOL: '20'
       # Verbose logs help diagnose the integration test if Cube fails to
       # resolve our driver. Comment out for a quieter run.
       CUBEJS_LOG_LEVEL: trace

@@ -274,13 +274,19 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     expect(SEEDED_USER_EMAILS).toContain(rows[0].email);
   });
 
-  it('tablesSchema returns the expected three namespaces with column metadata', async () => {
+  it('tablesSchema returns the expected namespaces with column metadata', async () => {
     const schema: TablesSchema = await driver.tablesSchema();
     // T09 shape: `{ <db>: { <coll>: ColumnInfo[] } }`.
     expect(schema).toHaveProperty(TEST_DB);
     const db = schema[TEST_DB];
     expect(db).toBeDefined();
-    expect(Object.keys(db).sort()).toEqual(['accounts', 'orders', 'users']);
+    // The fixture seeds four collections in `__sql_schemas`:
+    //   accounts, orders, users — the original integration set;
+    //   revenue_events — added for the cube-e2e rollup-partition test.
+    // Older builds saw only 3; we now require the multi-month
+    // revenue_events row to be registered so the cube-e2e test can
+    // build a partitioned pre-aggregation against it.
+    expect(Object.keys(db).sort()).toEqual(['accounts', 'orders', 'revenue_events', 'users']);
 
     // users columns
     const userColNames = db.users.map((c) => c.name).sort();
@@ -308,5 +314,46 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
         expect(Array.isArray(c.attributes)).toBe(true);
       }
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // downloadQueryResults — authoritative (name, type) list from mongosql
+  // ---------------------------------------------------------------------------
+  it('downloadQueryResults returns authoritative types in projection order', async () => {
+    // Projection order is `amount, status, created_at`. The native side
+    // derives this from `mongosql::Translation::{select_order, result_set_schema}`
+    // — NOT from `Object.keys(firstRow)`. mongosql's `$project` stage
+    // construction iterates a HashMap-backed schema, so the row's BSON
+    // field order is not stable across translations; the SELECT-clause
+    // order in `select_order` is, so we rely on it instead. Any ordering
+    // mismatch immediately surfaces.
+    const result = await driver.downloadQueryResults('SELECT amount, status, created_at FROM orders LIMIT 3', []);
+    expect(result).toHaveProperty('rows');
+    expect(result).toHaveProperty('types');
+    const names = result.types.map((t) => t.name);
+    expect(names).toEqual(['amount', 'status', 'created_at']);
+    const types = Object.fromEntries(result.types.map((t) => [t.name, t.type]));
+    // Cube generic-type strings sourced from BSON types in __sql_schemas.
+    expect(types.amount).toBe('decimal');
+    expect(types.status).toBe('string');
+    expect(types.created_at).toBe('timestamp');
+  });
+
+  it('downloadQueryResults types are stable across repeated calls (regression: multi-partition UNION)', async () => {
+    // The OLD value-sniffing path produced column lists in different
+    // orders when mongosql's HashMap-backed `$project` construction
+    // happened to materialize fields in different order across
+    // translations of the same SQL. The new mongosql-metadata path
+    // (`select_order` is a deterministic `Vec`) eliminates the
+    // non-determinism by construction; lock that in.
+    const sql = 'SELECT account_id, amount, status FROM orders LIMIT 5';
+    const r1 = await driver.downloadQueryResults(sql, []);
+    const r2 = await driver.downloadQueryResults(sql, []);
+    expect(r1.types).toEqual(r2.types);
+    // Ordering is also stable WITHIN a single result.
+    const names1 = r1.types.map((t) => t.name);
+    const names2 = r2.types.map((t) => t.name);
+    expect(names1).toEqual(['account_id', 'amount', 'status']);
+    expect(names2).toEqual(['account_id', 'amount', 'status']);
   });
 });

@@ -37,6 +37,7 @@
  * "dimension query" test, which would have failed pre-fix.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { execSync } from 'node:child_process';
 
 const CUBE_URL = process.env.CUBE_E2E_URL ?? 'http://localhost:4000';
 const LOAD_ENDPOINT = `${CUBE_URL}/cubejs-api/v1/load`;
@@ -50,6 +51,11 @@ interface CubeLoadResponse {
   query?: unknown;
   lastRefreshTime?: string;
   dbType?: string;
+  // Top-level `usedPreAggregations` is emitted whenever Cube routes
+  // the query through a materialized rollup. Asserting it is non-empty
+  // in the partitioned-rollup tests guards against a silent fallback
+  // to direct query — see those tests for the regression rationale.
+  usedPreAggregations?: Record<string, unknown>;
   // Cube returns more fields (annotation, slowQuery, etc.); we only
   // assert what we depend on.
 }
@@ -100,6 +106,10 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(res.ok, `Cube /meta returned ${res.status}`).toBe(true);
     const meta = (await res.json()) as CubeMetaResponse;
     expect(meta.cubes.map((c) => c.name)).toContain('orders');
+    // revenue_events cube was added for the multi-partition rollup test
+    // (Critic v3 — Issue #2). Failing here means the model didn't compile
+    // — typically a missing __sql_schemas row or a Cube model syntax error.
+    expect(meta.cubes.map((c) => c.name)).toContain('revenue_events');
   }, 60_000);
 
   afterAll(() => {
@@ -108,6 +118,43 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     // consistent shape and any test-specific resources can be released
     // here in future without restructuring.
   });
+
+  it('CUBEJS_MONGOSQL_APP_NAME reaches MongoDB (env → URI → server)', async () => {
+    // The docker-compose under examples/docker sets
+    // `CUBEJS_MONGOSQL_APP_NAME=cube-e2e-driver`. The driver's
+    // src/config.ts maps that to `appName=cube-e2e-driver` on the URI,
+    // and the mongodb crate forwards it as the client `appName` on every
+    // connection. MongoDB surfaces it via `$currentOp.appName` and
+    // `db.serverStatus().connections`-adjacent reflections.
+    //
+    // We trigger an active op (a real query through Cube), then poll
+    // `$currentOp` from atlas-local for an op whose `appName` matches.
+    // Polling rather than a single check, because Mongo retires the op
+    // entry as soon as the query completes.
+    const appName = 'cube-e2e-driver';
+
+    // Issue a query so a client connection is live.
+    await loadQuery({ query: { measures: ['orders.count'] } });
+
+    // execSync wraps the command in `/bin/sh -c '<cmd>'`. Feed the
+    // script to mongosh on stdin so the outer shell never sees the
+    // `$` characters used by mongo aggregation operators (`$currentOp`,
+    // `$match`, ...). Wrap with `print(...)` so the REPL emits a
+    // single-line marker we can match against. `--norc` skips
+    // ~/.mongoshrc on the container.
+    const compose = (script: string): string =>
+      execSync(
+        `docker compose -f examples/docker/docker-compose.yaml exec -T atlas-local mongosh --quiet --norc -u admin -p admin --authenticationDatabase admin`,
+        { encoding: 'utf-8', input: `print(${script})\n` },
+      ).trim();
+
+    // idleConnections:true so the appName tag on a recently-served-then-
+    // pooled connection is still visible after the query returned.
+    const out = compose(
+      `JSON.stringify(db.getSiblingDB('admin').aggregate([{$currentOp:{allUsers:true,idleConnections:true}},{$match:{appName:${JSON.stringify(appName)}}},{$limit:1},{$project:{appName:1,_id:0}}]).toArray())`,
+    );
+    expect(out).toContain(appName);
+  }, 30_000);
 
   it('count measure — basic load returns the documented Cube load shape', async () => {
     const body = await loadQuery({
@@ -199,6 +246,217 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(dimNames).toContain('orders.createdAt');
   });
 
+  // ---------------------------------------------------------------------------
+  // Multi-partition rollup — Critic v3 — Issue #2.
+  //
+  // The `revenue_events` cube declares a monthly-partitioned
+  // pre-aggregation over `occurred_at`. The seed data spans Jan/Feb/Mar
+  // 2026, so a query covering the full range forces Cube Store to
+  // materialize and UNION three partitions. Pre-fix, the UNION failed
+  // with `type_coercion ... Timestamp vs Int64` because the driver's
+  // `downloadQueryResults` typed every aggregate column as `text`
+  // (mongosql emits `any_of: [Decimal, Null]` / `[Int, Long]` for
+  // SUM/COUNT and the old code couldn't see past `bson_type: None`).
+  //
+  // Asserts:
+  //   - measures come back as numeric-compatible values (the JSON
+  //     wire form may stringify the decimal SUM per the BSON-marshal
+  //     contract; `Number(...)` must still produce the expected total).
+  //   - count = 7 rows total across all three months.
+  //   - totalAmount = 350.50 + 200.25 + 399.99 = 950.74.
+  // ---------------------------------------------------------------------------
+  it('partitioned rollup — query spanning 3 months UNIONs partitions correctly', async () => {
+    const body = await loadQuery({
+      query: {
+        measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+        // Time dimension with date range forces Cube to expand the
+        // partitions and UNION them. Per the seed, the data is
+        // 2026-01-05..2026-03-28; we request a slightly wider window
+        // so all three partitions definitely participate.
+        timeDimensions: [
+          {
+            dimension: 'revenue_events.occurredAt',
+            dateRange: ['2026-01-01', '2026-03-31'],
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.dbType).toBe('mongosql');
+
+    // Prove the rollup was actually used. The whole point of this test
+    // is to exercise the multi-partition UNION codepath; a future
+    // regression that silently disables pre-aggregations (e.g. a
+    // schema-compile race) could let the numeric totals still pass by
+    // falling back to direct query — silently weakening the regression
+    // harness. The top-level `usedPreAggregations` field is emitted
+    // only when Cube routes through a materialized rollup.
+    expect(body.usedPreAggregations).toBeDefined();
+    expect(typeof body.usedPreAggregations).toBe('object');
+    expect(Object.keys(body.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+
+    // The query has no dimension groupings, so it collapses to one
+    // row per time bucket emitted by Cube's `granularity` default.
+    // Sum across all returned buckets — the totals must match the seed
+    // exactly regardless of how Cube rolls them up.
+    const totalCount = body.data.reduce((acc, r) => acc + Number(r['revenue_events.count'] ?? 0), 0);
+    expect(totalCount).toBe(7);
+
+    const totalAmountSum = body.data.reduce((acc, r) => acc + Number(r['revenue_events.totalAmount'] ?? 0), 0);
+    expect(totalAmountSum).toBeCloseTo(950.74, 2);
+  });
+
+  it('partitioned rollup — count by category preserves numeric type across partitions', async () => {
+    // Group by `category` AND time. With monthly partitioning, the
+    // multi-month UNION exercises the exact `account_id-style + Int+Long`
+    // shape the regression test pins at the Rust level.
+    const body = await loadQuery({
+      query: {
+        measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+        dimensions: ['revenue_events.category'],
+        timeDimensions: [
+          {
+            dimension: 'revenue_events.occurredAt',
+            dateRange: ['2026-01-01', '2026-03-31'],
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.dbType).toBe('mongosql');
+
+    // Same rollup-usage assertion as the previous test — the multi-
+    // partition UNION codepath only fires when the rollup is
+    // materialized, so a silently-disabled pre-aggregation would
+    // weaken the regression harness without failing the numeric
+    // assertions below.
+    expect(body.usedPreAggregations).toBeDefined();
+    expect(typeof body.usedPreAggregations).toBe('object');
+    expect(Object.keys(body.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+
+    // The seed has two categories: `subscription` (4 events, 100+200+125.25+300 = 725.25)
+    // and `usage` (3 events, 50.50+75+99.99 = 225.49). Sum across buckets
+    // (Cube may split each category by month).
+    const byCategory: Record<string, { count: number; total: number }> = {};
+    for (const row of body.data) {
+      const cat = String(row['revenue_events.category']);
+      const c = Number(row['revenue_events.count'] ?? 0);
+      const t = Number(row['revenue_events.totalAmount'] ?? 0);
+      if (!byCategory[cat]) byCategory[cat] = { count: 0, total: 0 };
+      byCategory[cat].count += c;
+      byCategory[cat].total += t;
+    }
+    expect(byCategory.subscription).toBeDefined();
+    expect(byCategory.usage).toBeDefined();
+    expect(byCategory.subscription.count).toBe(4);
+    expect(byCategory.subscription.total).toBeCloseTo(725.25, 2);
+    expect(byCategory.usage.count).toBe(3);
+    expect(byCategory.usage.total).toBeCloseTo(225.49, 2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Large-IN-list workaround — Cube /load with 200 `equals` values.
+  //
+  // Real failure mode: `mongosql::translate_sql` v1.8.5 outputs a FLAT
+  // `$or` (depth 1) for `IN (v1..vN)` both locally and against the
+  // Atlas SQL endpoint. The Atlas SQL **proxy / server-side query
+  // layer re-expands** the flat array into a right-leaning binary-`$or`
+  // chain before passing the aggregate to MongoDB. For N ≥ ~100 the
+  // chain busts MongoDB's max BSON nested-object depth (100) and the
+  // server rejects with `Error code 15 (Overflow)`. The driver's
+  // pipeline_rewrite pass collapses the same-field `$eq` disjunction
+  // to `$in` (no n-ary boolean array left to chain-ify), defeating the
+  // re-expansion.
+  //
+  // The atlas-local container is plain MongoDB without the proxy, so
+  // this cube-e2e test pins the end-to-end correctness path: the
+  // rewriter must NOT corrupt a valid query, and the server must
+  // accept the result. The dedicated Atlas-SQL test
+  // (`query_with_large_in_list_against_atlas_sql` in
+  // `crates/native/tests/client_e2e.rs`) exercises the actual
+  // re-expansion failure mode.
+  // ---------------------------------------------------------------------------
+  it('large IN list — Cube /load with 200 equals values returns rows, not BSON depth overflow', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 200; i++) values.push(`synthetic_v${i}`);
+    // Append a real seeded `acct_a` value so the query has both
+    // a non-trivial IN size AND a non-empty result set.
+    values.push('acct_a');
+
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.accountId'],
+        filters: [
+          {
+            member: 'orders.accountId',
+            operator: 'equals',
+            values,
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    // The seed has 3 acct_a orders, so the count must be 3 when grouped
+    // by accountId. Synthetic values match nothing. The important
+    // assertion is that the query SUCCEEDED — pre-fix it would have
+    // failed with the server-side BSON depth overflow.
+    expect(body.data.length).toBe(1);
+    expect(body.data[0]?.['orders.accountId']).toBe('acct_a');
+    expect(Number(body.data[0]?.['orders.count'])).toBe(3);
+  });
+
+  // ---------------------------------------------------------------------------
+  // NOT IN coverage gap — Cube /load with 200 `notEquals` values.
+  //
+  // The Atlas SQL proxy re-expands flat `$and`s the same way it
+  // re-expands `$or`s (verified empirically against the real endpoint
+  // with `cargo test ... probe_atlas_sql_not_in_execute_200`: a
+  // 200-value `NOT IN` overflows BSON depth at the proxy with the
+  // chain visible in `pipeline.0.$match.$expr.$and.0.$and.0…`).
+  // The driver's pipeline_rewrite pass now extends to `$and → $nin`
+  // for the symmetric collapse.
+  // ---------------------------------------------------------------------------
+  it('large NOT IN list — Cube /load with 200 notEquals values returns rows, not BSON depth overflow', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 200; i++) values.push(`synthetic_v${i}`);
+    // Append a real seeded value to be EXCLUDED — `acct_a` matches 3
+    // orders. With it in the NOT-IN list, the remaining rows are
+    // `acct_b` (2 orders).
+    values.push('acct_a');
+
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.accountId'],
+        filters: [
+          {
+            member: 'orders.accountId',
+            operator: 'notEquals',
+            values,
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    // Seed: 3 `acct_a` excluded + 2 `acct_b` remain. The remaining 2
+    // group under `acct_b` with count=2.
+    expect(body.data.length).toBe(1);
+    expect(body.data[0]?.['orders.accountId']).toBe('acct_b');
+    expect(Number(body.data[0]?.['orders.count'])).toBe(2);
+  });
+
   it('dimension query — count grouped by status (T19a regression test)', async () => {
     // Pre-T19a fix: this query failed with mongosql Error 3008 because
     // BaseQuery emitted `\`orders\`.status` in the SELECT projection.
@@ -218,5 +476,123 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(byStatus.paid).toBe(3);
     expect(byStatus.pending).toBe(1);
     expect(byStatus.refunded).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Atlas SQL endpoint — separate cube container, overlay compose.
+//
+// Gated on `ATLAS_SQL_URI` + `ATLAS_SQL_DB`. The overlay compose file
+// (`examples/docker/docker-compose.atlas-sql.yaml`) starts a SECOND
+// cube container on port 4001 pointed at the real Atlas SQL endpoint
+// (`*.a.query.mongodb.net`) with `CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql`.
+//
+// The test brings the overlay up and tears it down itself (the global
+// setup already built the cube docker image we reuse here). Cube model:
+// `examples/docker/cube/model-atlas-sql/calllogs.js` over the real
+// `calllogs` collection on `dev-convo-hub` — chosen because its schema
+// is verified-populated on the Atlas SQL endpoint (see
+// `crates/native/src/schema.rs` module docs for the canonical
+// `sqlGetSchema` spec).
+//
+// Without `ATLAS_SQL_URI` the whole block skips — useful for local CI
+// runs that don't have network egress to the Atlas cloud.
+// ---------------------------------------------------------------------------
+const ATLAS_SQL_URI = process.env.ATLAS_SQL_URI;
+const ATLAS_SQL_DB = process.env.ATLAS_SQL_DB ?? 'dev-convo-hub';
+const ATLAS_SQL_CUBE_URL = 'http://localhost:4001';
+const ATLAS_SQL_META_ENDPOINT = `${ATLAS_SQL_CUBE_URL}/cubejs-api/v1/meta`;
+const ATLAS_SQL_LOAD_ENDPOINT = `${ATLAS_SQL_CUBE_URL}/cubejs-api/v1/load`;
+const ATLAS_SQL_COMPOSE_FILE = 'examples/docker/docker-compose.atlas-sql.yaml';
+
+async function waitForOverlayReadyz(maxSeconds = 180): Promise<void> {
+  const deadline = Date.now() + maxSeconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${ATLAS_SQL_CUBE_URL}/readyz`);
+      if (res.ok) return;
+    } catch {
+      // not yet listening
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`atlas-sql cube /readyz did not return 200 within ${maxSeconds}s`);
+}
+
+async function atlasSqlLoadQuery(body: object, attempt = 1): Promise<CubeLoadResponse> {
+  const res = await fetch(ATLAS_SQL_LOAD_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: AUTH_HEADER,
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.ok) {
+    const json = (await res.json()) as CubeLoadResponse | { error: string };
+    if ('error' in json && typeof json.error === 'string' && /continue wait/i.test(json.error)) {
+      if (attempt > 30) {
+        throw new Error(`atlas-sql cube returned "Continue wait" 30 times — aborting`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      return atlasSqlLoadQuery(body, attempt + 1);
+    }
+    return json as CubeLoadResponse;
+  }
+  const text = await res.text();
+  throw new Error(`atlas-sql cube load failed: HTTP ${res.status} — ${text}`);
+}
+
+describe.runIf(!!ATLAS_SQL_URI)('Cube E2E — atlas-sql schema source against real endpoint', () => {
+  beforeAll(async () => {
+    // Bring up the overlay cube container. Image already built by the
+    // outer global setup (the overlay reuses
+    // `mongosql-cubejs-driver-e2e:latest`).
+    execSync(`docker compose -f ${ATLAS_SQL_COMPOSE_FILE} up -d`, {
+      stdio: 'inherit',
+      env: { ...process.env, ATLAS_SQL_URI: ATLAS_SQL_URI!, ATLAS_SQL_DB },
+    });
+    await waitForOverlayReadyz();
+  }, 240_000);
+
+  afterAll(() => {
+    try {
+      execSync(`docker compose -f ${ATLAS_SQL_COMPOSE_FILE} down`, {
+        stdio: 'inherit',
+        env: { ...process.env, ATLAS_SQL_URI: ATLAS_SQL_URI!, ATLAS_SQL_DB },
+      });
+    } catch (err) {
+      console.error('atlas-sql cube teardown error (ignored):', err);
+    }
+  });
+
+  it('/meta lists the calllogs cube discovered via atlas-sql schema source', async () => {
+    const res = await fetch(ATLAS_SQL_META_ENDPOINT, {
+      headers: { Authorization: AUTH_HEADER },
+    });
+    expect(res.ok, `cube /meta returned ${res.status}`).toBe(true);
+    const meta = (await res.json()) as CubeMetaResponse;
+    const names = meta.cubes.map((c) => c.name);
+    // The cube model (model-atlas-sql/calllogs.js) defines a single
+    // `calllogs` cube. Cube can only compile it if `tablesSchema()`
+    // produces an entry for `calllogs` — which exclusively happens via
+    // the atlas-sql code path on this endpoint (no `__sql_schemas`
+    // collection exists).
+    expect(names).toContain('calllogs');
+  });
+
+  it('count query — calllogs.count runs end-to-end through Cube + atlas-sql', async () => {
+    const body = await atlasSqlLoadQuery({
+      query: { measures: ['calllogs.count'] },
+    });
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    expect(body.data.length).toBe(1);
+    const count = Number(body.data[0]?.['calllogs.count']);
+    // Endpoint has live data; we don't pin the exact count, only that
+    // a real bigint > 0 surfaced through the atlas-sql column-type path.
+    expect(Number.isFinite(count)).toBe(true);
+    expect(count).toBeGreaterThan(0);
   });
 });

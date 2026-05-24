@@ -12,6 +12,19 @@
 //!    translates to a database-level aggregate (e.g. some cross-collection
 //!    queries) and the executor must call `db.aggregate` rather than
 //!    `db.collection(...).aggregate`.
+//! 4. Carries through the upstream `result_set_schema` (`json_schema::Schema`)
+//!    and `select_order` (`Vec<Vec<String>>`) so the executor can emit an
+//!    ordered, type-authoritative `(name, type)` list for callers. Without
+//!    these the driver previously sniffed types from the first row's
+//!    `Object.keys()` order, which is not stable across translations of the
+//!    same SQL: mongosql constructs its `$project` stage by iterating a
+//!    HashMap-backed `Schema::Document`, so the projected field order in
+//!    each row differs partition-to-partition. Divergent column orders
+//!    across partition rebuilds broke Cube Store UNIONs with
+//!    `type_coercion` errors. The `select_order` field is itself a
+//!    deterministic `Vec` (parse-order from the SQL SELECT clause), and the
+//!    `result_set_schema` provides the authoritative per-field BSON type
+//!    declaration including `any_of` unions for nullable/aggregated columns.
 //!
 //! ## Database-name strategy
 //!
@@ -46,6 +59,8 @@
 //! Tests in this module pass `FILE_MODE_DB_PLACEHOLDER` because the fixture
 //! catalog is loaded via `load_from_file`.
 
+use mongosql::json_schema;
+
 use crate::error::{Error, Result};
 use crate::schema::MongoSqlCatalog;
 
@@ -77,6 +92,19 @@ pub struct Translation {
     /// non-Array, or an array element that isn't a Document) is surfaced as
     /// `Error::TranslateFailed`.
     pub pipeline: Vec<bson::Document>,
+    /// Authoritative JSON Schema for the result set, as produced by
+    /// `mongosql`. Drives the column-name + type list returned alongside
+    /// each query — replaces the old value-sniffing heuristic. Cloned
+    /// straight from `mongosql::Translation::result_set_schema`.
+    pub result_set_schema: json_schema::Schema,
+    /// Projection order as parsed from the SQL SELECT clause.
+    ///
+    /// Each entry is a path: with the default `IncludeNamespaces` option
+    /// (what we use) the inner vector is `[namespace, column]`; with
+    /// `ExcludeNamespaces` it would be `[column]`. We pass entries through
+    /// as-is; the executor flattens them to `<namespace>__<column>` keys
+    /// to match the `flattenRow` rule in the TS wrapper.
+    pub select_order: Vec<Vec<String>>,
 }
 
 /// Translate a SQL string into an MQL pipeline using the provided catalog.
@@ -100,12 +128,20 @@ pub fn translate(sql: &str, schema: &MongoSqlCatalog, default_db: &str) -> Resul
     )
     .map_err(|err| translate_error(sql, &err))?;
 
-    let pipeline = unwrap_pipeline(upstream.pipeline)?;
+    let mut pipeline = unwrap_pipeline(upstream.pipeline)?;
+    // Post-translation rewrite: flatten right-leaning `$or` chains and
+    // collapse same-field `$eq` disjunctions to `$in`. Defends against
+    // mongosql v1.8.5's `IN (v1, ..., vN)` → right-leaning binary-`$or`
+    // chain that overflows MongoDB's max BSON nesting depth (100) when
+    // N is large. See `pipeline_rewrite` module docs.
+    crate::pipeline_rewrite::flatten_or_chains_and_collapse_to_in(&mut pipeline);
 
     Ok(Translation {
         target_db: upstream.target_db,
         target_collection: upstream.target_collection,
         pipeline,
+        result_set_schema: upstream.result_set_schema,
+        select_order: upstream.select_order,
     })
 }
 
@@ -565,6 +601,170 @@ mod tests {
             }
             other => panic!("expected TranslateFailed, got {other:?}"),
         }
+    }
+
+    // ----- result_set_schema / select_order passthrough -----
+
+    #[test]
+    fn select_order_passthrough_for_explicit_projection() {
+        // Explicit projection list must appear in `select_order` in the
+        // *projection order*, not whatever HashMap order
+        // `result_set_schema.properties` happens to enumerate. Default
+        // SqlOptions use `IncludeNamespaces`, so each entry is
+        // `[<namespace>, <column>]`.
+        let cat = fixture_catalog();
+        let t = translate("SELECT account_id, status, amount FROM orders", &cat, db())
+            .expect("translate");
+        let columns: Vec<&str> = t
+            .select_order
+            .iter()
+            .map(|p| p.last().expect("non-empty path").as_str())
+            .collect();
+        assert_eq!(columns, vec!["account_id", "status", "amount"]);
+        // Namespace component must be present (default IncludeNamespaces).
+        for path in &t.select_order {
+            assert_eq!(path.len(), 2, "expected [namespace, column], got {path:?}");
+        }
+    }
+
+    #[test]
+    fn result_set_schema_populated_with_field_types() {
+        // The schema must enumerate the projected columns with their BSON
+        // types. We don't enforce a specific shape (mongosql may wrap the
+        // root in an extra envelope) but a known column must be reachable
+        // and carry a non-empty `bson_type`.
+        let cat = fixture_catalog();
+        let t = translate("SELECT account_id FROM orders", &cat, db()).expect("translate");
+        // Walk: top-level Schema has a `properties` map keyed by namespace,
+        // each value is itself a Schema whose `properties` carry columns.
+        let top_props = t
+            .result_set_schema
+            .properties
+            .as_ref()
+            .expect("top-level properties present");
+        // Find any property whose nested schema mentions `account_id`.
+        let mut found = false;
+        for schema in top_props.values() {
+            if let Some(cols) = &schema.properties {
+                if cols.contains_key("account_id") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found,
+            "result_set_schema should expose `account_id` somewhere in the projection tree: {top_props:?}"
+        );
+    }
+
+    #[test]
+    fn select_order_and_schema_are_deterministic() {
+        // Same SQL → same select_order *and* the same projected columns in
+        // the schema. This is the property that lets the executor produce
+        // a stable column ordering across partitions; the BSON cursor's
+        // first-row Object.keys() does not guarantee it.
+        let cat = fixture_catalog();
+        let sql = "SELECT account_id, status FROM orders";
+        let a = translate(sql, &cat, db()).expect("first translate");
+        let b = translate(sql, &cat, db()).expect("second translate");
+        assert_eq!(a.select_order, b.select_order);
+        assert_eq!(
+            a.result_set_schema.properties.as_ref().map(|p| {
+                let mut ks: Vec<&str> = p.keys().map(|s| s.as_str()).collect();
+                ks.sort();
+                ks
+            }),
+            b.result_set_schema.properties.as_ref().map(|p| {
+                let mut ks: Vec<&str> = p.keys().map(|s| s.as_str()).collect();
+                ks.sort();
+                ks
+            }),
+        );
+    }
+
+    // ----- any_of-resolution end-to-end via translate_sql (Critic v3 — Issue #3) -----
+    //
+    // These tests close the loop on the `any_of` regression: drive a
+    // real `mongosql::translate_sql` against the YAML fixture catalog,
+    // then run the resulting Translation through
+    // `execute::column_types_from_schema`. The fixture's `orders` schema
+    // declares `amount` as Decimal128 and the seed-data fixture mirrors
+    // the e2e cluster; aggregation SQL exercises the very `any_of`
+    // shapes (`[Decimal, Null]`, `[Int, Long]`, `[String, Null]`) the
+    // critic flagged.
+
+    use crate::execute::column_types_from_schema;
+
+    #[test]
+    fn aggregate_sum_decimal_yields_decimal_type() {
+        let cat = fixture_catalog();
+        let t =
+            translate("SELECT SUM(amount) AS total FROM orders", &cat, db()).expect("translate");
+        let types = column_types_from_schema(&t.select_order, &t.result_set_schema);
+        assert_eq!(types.len(), 1, "single projection");
+        // Per the fixture's `amount: { bsonType: decimal }`, mongosql
+        // models `SUM(decimal)` as `AnyOf{Decimal, Null}`. We must
+        // collapse to `decimal` — NOT `text` (the pre-fix behaviour).
+        assert_eq!(types[0].ty, "decimal", "got {:?}", types);
+    }
+
+    #[test]
+    fn aggregate_count_star_yields_bigint_type() {
+        let cat = fixture_catalog();
+        let t = translate("SELECT COUNT(*) AS n FROM orders", &cat, db()).expect("translate");
+        let types = column_types_from_schema(&t.select_order, &t.result_set_schema);
+        assert_eq!(types.len(), 1, "single projection");
+        // `COUNT(*)` produces `AnyOf{Int, Long}` per mongosql's
+        // accumulator types. Widens to bigint, not text.
+        assert_eq!(types[0].ty, "bigint", "got {:?}", types);
+    }
+
+    #[test]
+    fn group_by_with_aggregates_types_each_column_correctly() {
+        // The shape that caused the multi-partition UNION failure:
+        // GROUP BY a string column, projecting SUM + COUNT alongside.
+        // All three columns return `any_of` shapes from mongosql; all
+        // three must classify correctly.
+        let cat = fixture_catalog();
+        let sql = "SELECT account_id, SUM(amount) AS total, COUNT(*) AS c \
+                   FROM orders GROUP BY account_id";
+        let t = translate(sql, &cat, db()).expect("translate");
+        let types = column_types_from_schema(&t.select_order, &t.result_set_schema);
+        let by_name: std::collections::HashMap<&str, &str> =
+            types.iter().map(|c| (c.name.as_str(), c.ty)).collect();
+        // account_id is nullable string per the fixture (no `required`).
+        assert_eq!(
+            by_name.get("account_id"),
+            Some(&"string"),
+            "got {:?}",
+            types
+        );
+        assert_eq!(by_name.get("total"), Some(&"decimal"), "got {:?}", types);
+        assert_eq!(by_name.get("c"), Some(&"bigint"), "got {:?}", types);
+    }
+
+    #[test]
+    fn select_order_for_grouped_aggregate_is_stable_across_translations() {
+        // Two translations of the same SQL must yield byte-identical
+        // type lists. Pre-fix, the value-sniffing path could rotate
+        // column order between calls; post-fix, mongosql's `select_order`
+        // is the source of truth and is itself a `Vec<Vec<String>>` (no
+        // HashMap involvement). Lock that contract here for the
+        // aggregate-driven shape, since that's what partitioned
+        // pre-aggregations exercise.
+        let cat = fixture_catalog();
+        let sql = "SELECT account_id, SUM(amount) AS total, COUNT(*) AS c \
+                   FROM orders GROUP BY account_id";
+        let a = translate(sql, &cat, db()).expect("a");
+        let b = translate(sql, &cat, db()).expect("b");
+        let types_a = column_types_from_schema(&a.select_order, &a.result_set_schema);
+        let types_b = column_types_from_schema(&b.select_order, &b.result_set_schema);
+        let order_a: Vec<&str> = types_a.iter().map(|c| c.name.as_str()).collect();
+        let order_b: Vec<&str> = types_b.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(order_a, order_b);
+        // And the named-order matches the SELECT projection order.
+        assert_eq!(order_a, vec!["account_id", "total", "c"]);
     }
 
     #[test]

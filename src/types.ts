@@ -3,7 +3,18 @@
  * See SPEC.md §5.1 for the contract.
  */
 
-export type SchemaSource = { kind: 'collection' } | { kind: 'file'; path: string };
+/**
+ * Driver schema-source discriminator.
+ *
+ * - `collection` — read `__sql_schemas` from the configured database.
+ * - `file` — load YAML/JSON from `path` on disk.
+ * - `atlas-sql` — enumerate collections via `listCollections` and call the
+ *   Atlas SQL `sqlGetSchema` admin command per collection. Required for
+ *   Atlas SQL endpoints (`*.a.query.mongodb.net`), which do not expose
+ *   `__sql_schemas` as a queryable collection. See
+ *   https://www.mongodb.com/docs/sql-interface/schema/view/
+ */
+export type SchemaSource = { kind: 'collection' } | { kind: 'file'; path: string } | { kind: 'atlas-sql' };
 
 export interface MongoSqlConfig {
   /** MongoDB connection URI (mongodb:// or mongodb+srv://). */

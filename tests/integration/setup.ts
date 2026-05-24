@@ -63,6 +63,26 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
   throw new Error(`__sql_schemas was not populated within ${maxSeconds}s`);
 }
 
+/**
+ * Re-apply seed scripts so existing volumes pick up new collections /
+ * schema rows. The scripts are idempotent (insert guards on
+ * `countDocuments() === 0`; schema upserts via `replaceOne(..., {upsert:
+ * true})`), so re-running is safe even on freshly-initialized volumes.
+ * Without this the cube-e2e + integration suites would silently miss
+ * the newly-seeded `revenue_events` collection added in Critic v3 —
+ * Issue #2 if the user's existing `atlas-data` volume predates the seed
+ * change.
+ */
+function reseed(): void {
+  const scripts = ['/docker-entrypoint-initdb.d/01-seed-data.js', '/docker-entrypoint-initdb.d/02-seed-schemas.js'];
+  for (const script of scripts) {
+    execSync(
+      `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --file ${script}`,
+      { stdio: 'inherit' },
+    );
+  }
+}
+
 export default async function setup() {
   if (!process.env.TEST_MONGO_URI) process.env.TEST_MONGO_URI = DEFAULT_URI;
 
@@ -76,6 +96,12 @@ export default async function setup() {
 
   await waitForSqlSchemas();
   console.log('integration setup: __sql_schemas populated');
+
+  // Re-apply seeds (idempotent) so pre-existing volumes pick up new
+  // collections (revenue_events). On a fresh volume the initdb path
+  // already ran them; this is a no-op there.
+  console.log('integration setup: re-applying seed scripts (idempotent)...');
+  reseed();
 
   return async () => {
     if (teardownMode === 'keep') {

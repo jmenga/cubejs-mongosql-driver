@@ -46,7 +46,10 @@ function installMockNative(overrides: Partial<FakeClient> = {}): void {
       const client: FakeClient = {
         config,
         testConnection: vi.fn().mockResolvedValue(undefined),
-        query: vi.fn().mockResolvedValue([]),
+        // Default to the new `{rows, types}` shape so tests that don't
+        // explicitly override the query mock still satisfy the wrapper's
+        // structural check.
+        query: vi.fn().mockResolvedValue({ rows: [], types: [] }),
         tablesSchema: vi.fn().mockResolvedValue({}),
         close: vi.fn().mockResolvedValue(undefined),
         ...overrides,
@@ -98,6 +101,22 @@ describe('MongoSqlClient — constructor', () => {
   it('does not throw on construction', () => {
     installMockNative();
     expect(() => new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' })).not.toThrow();
+  });
+
+  it('passes the atlas-sql schemaSource through to the native module verbatim', () => {
+    // atlas-sql is a tag-only discriminator (no `path`). The wrapper must
+    // marshal it across the napi-rs boundary unchanged; the Rust side then
+    // routes the load through `load_from_atlas_sql_with_columns` instead
+    // of the collection path. A regression that drops the discriminator
+    // here would silently fall back to collection mode.
+    installMockNative();
+    new MongoSqlClient({
+      uri: 'mongodb+srv://atlas-sql-xxx.a.query.mongodb.net/?ssl=true',
+      database: 'dev-convo-hub',
+      schemaSource: { kind: 'atlas-sql' },
+    });
+    expect(lastClient).toBeDefined();
+    expect((lastClient!.config as { schemaSource: unknown }).schemaSource).toEqual({ kind: 'atlas-sql' });
   });
 });
 
@@ -180,20 +199,31 @@ describe('MongoSqlClient — close', () => {
 });
 
 describe('MongoSqlClient — query', () => {
-  it('returns array results untouched', async () => {
+  it('returns just the rows from the native `{rows, types}` shape', async () => {
     const rows = [{ a: 1 }, { a: 2 }];
-    installMockNative({ query: vi.fn().mockResolvedValue(rows) });
+    installMockNative({
+      query: vi.fn().mockResolvedValue({ rows, types: [{ name: 'a', type: 'int' }] }),
+    });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     await expect(c.query('SELECT * FROM x')).resolves.toEqual(rows);
   });
 
-  it('throws MONGOSQL_EXECUTE_FAILED when the result is not an array', async () => {
-    installMockNative({ query: vi.fn().mockResolvedValue({ not: 'an array' }) });
+  it('throws MONGOSQL_EXECUTE_FAILED when the native result is not the expected shape', async () => {
+    installMockNative({ query: vi.fn().mockResolvedValue([1, 2, 3]) });
     const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
     const err = (await c.query('SELECT 1').catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_EXECUTE_FAILED');
     expect(err.name).toBe('MongoSqlError');
-    expect(err.message).toContain('expected query result to be an array');
+    expect(err.message).toContain('expected query result');
+  });
+
+  it('throws MONGOSQL_EXECUTE_FAILED when `types` entries are malformed', async () => {
+    installMockNative({
+      query: vi.fn().mockResolvedValue({ rows: [], types: [{ name: 'a' /* missing type */ }] }),
+    });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const err = (await c.query('SELECT 1').catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_EXECUTE_FAILED');
   });
 
   it('forwards the SQL string to the native call', async () => {
@@ -203,6 +233,32 @@ describe('MongoSqlClient — query', () => {
     // Second arg is the optional AbortHandle slot; without a signal we
     // pass `null` to match the napi-rs `Option<&AbortHandle>` shape.
     expect(lastClient!.query).toHaveBeenCalledWith('SELECT 1 FROM users', null);
+  });
+});
+
+describe('MongoSqlClient — queryWithTypes', () => {
+  it('returns the rows AND types from the native binding', async () => {
+    const rows = [{ a: 1, b: 'x' }];
+    const types = [
+      { name: 'a', type: 'int' },
+      { name: 'b', type: 'string' },
+    ];
+    installMockNative({ query: vi.fn().mockResolvedValue({ rows, types }) });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    await expect(c.queryWithTypes('SELECT * FROM x')).resolves.toEqual({ rows, types });
+  });
+
+  it('preserves the column order produced by the native binding', async () => {
+    const rows = [{ c: 1, a: 1, b: 1 }];
+    const types = [
+      { name: 'c', type: 'int' },
+      { name: 'a', type: 'int' },
+      { name: 'b', type: 'int' },
+    ];
+    installMockNative({ query: vi.fn().mockResolvedValue({ rows, types }) });
+    const c = new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' });
+    const out = await c.queryWithTypes('SELECT c, a, b FROM x');
+    expect(out.types.map((t) => t.name)).toEqual(['c', 'a', 'b']);
   });
 });
 
@@ -240,8 +296,9 @@ describe('MongoSqlClient — cancellation (AbortSignal bridge)', () => {
     ctrl.abort();
     expect(lastAbortHandle).toBeDefined();
     expect(lastAbortHandle!.abort).toHaveBeenCalledTimes(1);
-    // Tidy: resolve the slow promise so the test doesn't hang.
-    resolveQuery!([]);
+    // Tidy: resolve the slow promise so the test doesn't hang. Resolve
+    // with the new `{rows, types}` shape so the structural check passes.
+    resolveQuery!({ rows: [], types: [] });
     await p;
   });
 

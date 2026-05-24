@@ -52,6 +52,28 @@ const schemas = [
       },
     },
   },
+  // Multi-month revenue dataset used by the cube-e2e rollup-partition
+  // test (Critic v3 — Issue #2). The schema mirrors `orders` but with
+  // an `occurred_at` time dimension; the partitioned pre-aggregation
+  // on this cube buckets monthly so a query spanning 2026-01..2026-03
+  // forces Cube Store to UNION three partitions — the exact codepath
+  // that broke with the old value-sniffed types.
+  {
+    _id: 'revenue_events',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:         { bsonType: 'objectId' },
+          account_id:  { bsonType: 'string'   },
+          amount:      { bsonType: 'decimal'  },
+          category:    { bsonType: 'string'   },
+          occurred_at: { bsonType: 'date'     },
+        },
+      },
+    },
+  },
 ];
 
 // Use bracket-property access; mongosh's `db` proxy chokes on the dot-form

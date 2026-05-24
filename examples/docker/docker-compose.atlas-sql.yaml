@@ -1,0 +1,63 @@
+# Docker Compose overlay — Cube against a real Atlas SQL endpoint.
+#
+# Brings up ONLY the cube service (no atlas-local) and points it at the
+# Atlas SQL endpoint provided via env vars. Uses the same prebuilt image
+# as the local-fixture compose file (`docker-compose.yaml`), so this
+# overlay is a thin env-only differentiator — no separate Dockerfile.
+#
+# Required env vars when launching:
+#   ATLAS_SQL_URI  — full mongodb:// URI for the Atlas SQL endpoint
+#                    (mongodb://USER:PASS@<cluster>-<id>.a.query.mongodb.net/...).
+#   ATLAS_SQL_DB   — database name on that endpoint.
+#
+# Run via:
+#   ATLAS_SQL_URI="mongodb://..." \
+#   ATLAS_SQL_DB="dev-convo-hub" \
+#   docker compose -f examples/docker/docker-compose.atlas-sql.yaml up -d
+#
+# The cube container resolves the driver via `CUBEJS_DB_TYPE=mongosql`
+# and uses the schema source `atlas-sql`, which routes the catalog load
+# through `sqlGetSchema` instead of `__sql_schemas`.
+#
+# Cube serves on http://localhost:4000 in dev mode (no JWT required).
+#
+# See cube/model-atlas-sql/ for the cube model that targets the
+# `calllogs` collection on `dev-convo-hub` — pinning a real Atlas SQL
+# collection lets the cube-e2e test assert specific cube names against
+# the /meta endpoint.
+services:
+  cube-atlas-sql:
+    image: mongosql-cubejs-driver-e2e:latest
+    container_name: cubejs-mongosql-e2e-cube-atlas-sql
+    ports:
+      - '4001:4000'
+    volumes:
+      # Override the bundled model directory with the atlas-sql-specific
+      # one. The image's default WORKDIR/cube directory contains cube.js
+      # and the model/ used for the atlas-local fixture; mounting a
+      # different model file at /cube/conf/model points cube at the real
+      # Atlas SQL collection.
+      - ./cube/model-atlas-sql:/cube/conf/model:ro
+    environment:
+      CUBEJS_DB_TYPE: mongosql
+      # ATLAS_SQL_URI is passed through verbatim; the URI is the full
+      # connection string including credentials + TLS query params.
+      CUBEJS_DB_URI: ${ATLAS_SQL_URI?ATLAS_SQL_URI must be set}
+      CUBEJS_DB_NAME: ${ATLAS_SQL_DB?ATLAS_SQL_DB must be set}
+      CUBEJS_DEV_MODE: 'true'
+      CUBEJS_API_SECRET: e2e-test-secret-not-for-prod
+      # The whole point of this overlay: enable atlas-sql schema discovery.
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: atlas-sql
+      CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '300'
+      CUBEJS_MONGOSQL_APP_NAME: cube-e2e-atlas-sql
+      # Atlas SQL endpoints sit over the public internet; a higher
+      # connect timeout avoids spurious connect failures on cold starts.
+      CUBEJS_MONGOSQL_CONNECT_TIMEOUT_MS: '15000'
+      CUBEJS_MONGOSQL_SERVER_SELECTION_TIMEOUT_MS: '15000'
+      CUBEJS_LOG_LEVEL: trace
+      NODE_ENV: production
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O- http://localhost:4000/readyz || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 60

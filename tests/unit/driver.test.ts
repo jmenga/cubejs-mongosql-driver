@@ -22,13 +22,24 @@ interface FakeClient {
 let lastClient: FakeClient | undefined;
 let createdClients = 0;
 
+/**
+ * Build a fake native `query()` mock from a list of plain rows. Wraps each
+ * call's return value in the new `{rows, types}` shape the wrapper expects.
+ *
+ * `types` defaults to an empty list; tests that exercise
+ * `downloadQueryResults` override it explicitly.
+ */
+function mockQueryRows<R>(rows: R[], types: Array<{ name: string; type: string }> = []): ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue({ rows, types });
+}
+
 function installMockNative(overrides: Partial<FakeClient> = {}): void {
   _setNativeModuleForTests({
     MongoSqlClient: function (config: unknown): FakeClient {
       const client: FakeClient = {
         config,
         testConnection: vi.fn().mockResolvedValue(undefined),
-        query: vi.fn().mockResolvedValue([]),
+        query: mockQueryRows([]),
         tablesSchema: vi.fn().mockResolvedValue({}),
         close: vi.fn().mockResolvedValue(undefined),
         ...overrides,
@@ -122,6 +133,49 @@ describe('MongoSqlDriver — constructor / config', () => {
     expect(cfg.schemaSource).toEqual({ kind: 'file', path: '/tmp/schema.yaml' });
   });
 
+  it('parses atlas-sql schema source from env (Atlas SQL endpoint mode)', async () => {
+    // Atlas SQL endpoints (`*.a.query.mongodb.net`) discover schemas via
+    // the `sqlGetSchema` admin command rather than `__sql_schemas`. The
+    // env-var value mirrors the docs nomenclature ("Atlas SQL").
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'atlas-sql';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    const cfg = lastClient!.config as Record<string, unknown>;
+    expect(cfg.schemaSource).toEqual({ kind: 'atlas-sql' });
+  });
+
+  it('atlas-sql schema source does NOT require CUBEJS_MONGOSQL_SCHEMA_FILE', async () => {
+    // Defence-in-depth: the file-only env-var must not leak its
+    // "required" check into atlas-sql mode.
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'atlas-sql';
+    installMockNative();
+    expect(() => new MongoSqlDriver()).not.toThrow();
+  });
+
+  it('rejects unknown CUBEJS_MONGOSQL_SCHEMA_SOURCE values; error enumerates all three valid kinds', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'mystery-mode';
+    installMockNative();
+    let thrown: unknown;
+    try {
+      new MongoSqlDriver();
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as MongoSqlError).code).toBe('MONGOSQL_CONFIG_INVALID');
+    const msg = (thrown as Error).message;
+    expect(msg).toMatch(/collection/);
+    expect(msg).toMatch(/file/);
+    expect(msg).toMatch(/atlas-sql/);
+    expect(msg).toMatch(/mystery-mode/);
+  });
+
   it('throws MONGOSQL_CONFIG_INVALID when uri is missing', () => {
     process.env.CUBEJS_DB_NAME = 'analytics';
     installMockNative();
@@ -170,12 +224,59 @@ describe('MongoSqlDriver — constructor / config', () => {
     new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     expect(createdClients).toBe(0);
   });
+
+  // ---------- Cube-standard env var integration (see src/config.ts) ----------
+
+  it('reads CUBEJS_DB_URL when CUBEJS_DB_URI is not set', async () => {
+    process.env.CUBEJS_DB_URL = 'mongodb://from-url/x';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { uri: string }).uri).toBe('mongodb://from-url/x');
+  });
+
+  it('appends env-driven Mongo URI params to the configured URI', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_MAX_POOL = '50';
+    process.env.CUBEJS_DB_IDLE_TIMEOUT = '60s';
+    process.env.CUBEJS_MONGOSQL_APP_NAME = 'cube-test';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    const uri = (lastClient!.config as { uri: string }).uri;
+    expect(uri).toMatch(/maxPoolSize=50/);
+    expect(uri).toMatch(/maxIdleTimeMS=60000/);
+    expect(uri).toMatch(/appName=cube-test/);
+  });
+
+  it('CUBEJS_DB_QUERY_TIMEOUT (duration) maps to queryTimeoutMs', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_QUERY_TIMEOUT = '5s';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { queryTimeoutMs: number }).queryTimeoutMs).toBe(5_000);
+  });
+
+  it('CUBEJS_DB_QUERY_TIMEOUT takes precedence over CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_QUERY_TIMEOUT = '5s';
+    process.env.CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS = '99999';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { queryTimeoutMs: number }).queryTimeoutMs).toBe(5_000);
+  });
 });
 
 describe('MongoSqlDriver — query() row flattening', () => {
   it('unwraps single-key envelope: [{users: {a:1}}] -> [{a:1}]', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ users: { a: 1, b: 'x' } }, { users: { a: 2, b: 'y' } }]),
+      query: mockQueryRows([{ users: { a: 1, b: 'x' } }, { users: { a: 2, b: 'y' } }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query('SELECT a, b FROM users');
@@ -187,7 +288,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
 
   it('passes through rows that lack the envelope', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ a: 1 }, { a: 2 }]),
+      query: mockQueryRows([{ a: 1 }, { a: 2 }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query('SELECT a FROM users');
@@ -195,7 +296,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
   });
 
   it('handles empty result set', async () => {
-    installMockNative({ query: vi.fn().mockResolvedValue([]) });
+    installMockNative({ query: mockQueryRows([]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query('SELECT * FROM users WHERE 1=0');
     expect(rows).toEqual([]);
@@ -203,7 +304,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
 
   it('merges multi-table JOIN envelope with table-prefixed keys', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([
+      query: mockQueryRows([
         {
           users: { id: 'u1', email: 'a@b' },
           orders: { id: 'o1', total: 100 },
@@ -224,7 +325,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
 
   it('passes scalar top-level values through unchanged', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ count: 42 }]),
+      query: mockQueryRows([{ count: 42 }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query('SELECT COUNT(*) AS count FROM users');
@@ -269,7 +370,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
   });
 
   it('allows JOIN projections where the colliding columns are aliased (Issue 2)', async () => {
-    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { u_id: 'u1', o_id: 'o1' } }]) });
+    installMockNative({ query: mockQueryRows([{ '': { u_id: 'u1', o_id: 'o1' } }]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query<Record<string, unknown>>(
       'SELECT users.account_id AS u_id, orders.account_id AS o_id FROM users JOIN orders ON 1=1',
@@ -279,7 +380,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
 
   it('allows JOIN projections with non-colliding qualified column names (Issue 2)', async () => {
     // Two qualified columns with different trailing names → no collision risk.
-    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { email: 'a@b', amount: '1.0' } }]) });
+    installMockNative({ query: mockQueryRows([{ '': { email: 'a@b', amount: '1.0' } }]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query<Record<string, unknown>>(
       'SELECT users.email, orders.amount FROM users JOIN orders ON 1=1',
@@ -291,7 +392,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
     // `SELECT col, col2 FROM users` produces a `{"": {col, col2}}` envelope
     // but cannot collide because mongosql guarantees uniqueness within a
     // single-table projection. The flatten path keeps unwrapping it.
-    installMockNative({ query: vi.fn().mockResolvedValue([{ '': { email: 'a@b', name: 'A' } }]) });
+    installMockNative({ query: mockQueryRows([{ '': { email: 'a@b', name: 'A' } }]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query<Record<string, unknown>>('SELECT email, name FROM users');
     expect(rows).toEqual([{ email: 'a@b', name: 'A' }]);
@@ -299,7 +400,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
 
   it('regression: non-empty single-key envelope still unwraps cleanly', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ users: { id: 'u1', email: 'a@b' } }]),
+      query: mockQueryRows([{ users: { id: 'u1', email: 'a@b' } }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const rows = await d.query<{ id: string; email: string }>('SELECT * FROM users');
@@ -312,7 +413,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
   // the SQL to mongosql — equivalent to what `BaseQuery.paramAllocator`
   // would emit when the dialect declares no param support.
   it('inlines ? placeholders from non-empty values into the SQL sent to mongosql', async () => {
-    const queryMock = vi.fn().mockResolvedValue([]);
+    const queryMock = mockQueryRows([]);
     installMockNative({ query: queryMock });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     await d.query('SELECT * FROM users WHERE id = ? AND created_at >= CAST(? AS TIMESTAMP)', [
@@ -326,7 +427,7 @@ describe('MongoSqlDriver — query() row flattening', () => {
   });
 
   it('parameter substitution skips ? characters inside string literals', async () => {
-    const queryMock = vi.fn().mockResolvedValue([]);
+    const queryMock = mockQueryRows([]);
     installMockNative({ query: queryMock });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     await d.query("SELECT * FROM users WHERE comment = 'is this a ?' AND id = ?", [7]);
@@ -337,28 +438,30 @@ describe('MongoSqlDriver — query() row flattening', () => {
   it('parameter substitution rejects placeholder/value count mismatch', async () => {
     installMockNative();
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
-    const err = (await d.query('SELECT * FROM users WHERE id = ? AND name = ?', [1]).catch((e: unknown) => e)) as MongoSqlError;
+    const err = (await d
+      .query('SELECT * FROM users WHERE id = ? AND name = ?', [1])
+      .catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_CONFIG_INVALID');
     expect(err.message).toMatch(/more '\?' placeholders than provided values/i);
   });
 
   it('quotes string values and doubles embedded single quotes', async () => {
-    const queryMock = vi.fn().mockResolvedValue([]);
+    const queryMock = mockQueryRows([]);
     installMockNative({ query: queryMock });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
-    await d.query("SELECT * FROM users WHERE name = ?", ["O'Brien"]);
+    await d.query('SELECT * FROM users WHERE name = ?', ["O'Brien"]);
     const sentSql = queryMock.mock.calls[0][0] as string;
     expect(sentSql).toBe("SELECT * FROM users WHERE name = 'O''Brien'");
   });
 
   it('accepts query() with no values argument (Issue 4)', async () => {
-    installMockNative({ query: vi.fn().mockResolvedValue([]) });
+    installMockNative({ query: mockQueryRows([]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     await expect(d.query('SELECT * FROM users')).resolves.toEqual([]);
   });
 
   it('accepts query() with explicit empty-array values (Issue 4)', async () => {
-    installMockNative({ query: vi.fn().mockResolvedValue([]) });
+    installMockNative({ query: mockQueryRows([]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     await expect(d.query('SELECT * FROM users', [])).resolves.toEqual([]);
   });
@@ -503,28 +606,24 @@ describe('MongoSqlDriver — unsupported BaseDriver methods', () => {
 });
 
 describe('MongoSqlDriver — downloadQueryResults', () => {
-  it('routes through query() and returns BaseDriver memory shape with sniffed types', async () => {
+  it('routes through query() and returns BaseDriver memory shape with authoritative types', async () => {
+    // Native binding returns the `(name, type)` list derived from
+    // mongosql's select_order + result_set_schema. The driver passes the
+    // list through unchanged; we no longer sniff types from row values.
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ users: { a: 1 } }]),
+      query: mockQueryRows([{ users: { a: 1 } }], [{ name: 'a', type: 'int' }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const result = await d.downloadQueryResults('SELECT a FROM users', [], {
       highWaterMark: 100,
     });
-    // BaseDriver expects DownloadQueryResultsResult: { rows, types }.
-    // Types are inferred from the row shape — required by Cube Store ingest
-    // (empty types throws "empty columns. introspection has failed.").
     expect(result).toMatchObject({ rows: [{ a: 1 }] });
-    // Mirrors @cubejs-backend/base-driver's DbTypeValueMatcher: small
-    // integers classify as 'int', large ones as 'bigint'.
-    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
-      { name: 'a', type: 'int' },
-    ]);
+    expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([{ name: 'a', type: 'int' }]);
   });
 
-  it('infers decimal type from fixed-point string values (Decimal128 round-trip)', async () => {
+  it('passes through decimal type tagged by mongosql for fixed-point columns', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ orders: { total: '1234.56' } }]),
+      query: mockQueryRows([{ orders: { total: '1234.56' } }], [{ name: 'total', type: 'decimal' }]),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const result = await d.downloadQueryResults('SELECT total FROM orders', []);
@@ -533,9 +632,12 @@ describe('MongoSqlDriver — downloadQueryResults', () => {
     ]);
   });
 
-  it('infers timestamp type from ISO-8601 string values', async () => {
+  it('passes through timestamp type tagged by mongosql for date columns', async () => {
     installMockNative({
-      query: vi.fn().mockResolvedValue([{ orders: { created_at: '2026-03-01T10:00:00.000Z' } }]),
+      query: mockQueryRows(
+        [{ orders: { created_at: '2026-03-01T10:00:00.000Z' } }],
+        [{ name: 'created_at', type: 'timestamp' }],
+      ),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const result = await d.downloadQueryResults('SELECT created_at FROM orders', []);
@@ -544,30 +646,101 @@ describe('MongoSqlDriver — downloadQueryResults', () => {
     ]);
   });
 
-  it('returns empty types for empty row sets (vs throwing)', async () => {
-    installMockNative({
-      query: vi.fn().mockResolvedValue([]),
-    });
+  it('returns an empty types list when the native binding does (e.g. empty result set)', async () => {
+    installMockNative({ query: mockQueryRows([], []) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     const result = await d.downloadQueryResults('SELECT a FROM users', []);
     expect(result).toMatchObject({ rows: [], types: [] });
   });
 
-  it('classifies mixed int + decimal-string column as decimal (filtered SUM case)', async () => {
-    // Reproduces the byStatus pre-agg shape: a filtered SUM yields 0 (int)
-    // for rows that don't match the filter and a decimal string for rows
-    // that do. Cube Store rejects a column typed `int` if any row has a
-    // decimal-shaped value, so the column must classify as `decimal`.
+  it('returns authoritative types even for an empty row set (no value-sniffing required)', async () => {
+    // Pre-fix this case would have returned `types: []` because the row
+    // set is empty. Post-fix the native side derives types from the SQL
+    // metadata, so Cube Store always gets a real column list.
     installMockNative({
-      query: vi.fn().mockResolvedValue([
-        { orders: { paid_amount: 0 } },
-        { orders: { paid_amount: '400.00' } },
-      ]),
+      query: mockQueryRows(
+        [],
+        [
+          { name: 'paid_amount', type: 'decimal' },
+          { name: 'status', type: 'string' },
+        ],
+      ),
     });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
-    const result = await d.downloadQueryResults('SELECT paid_amount FROM orders', []);
+    const result = await d.downloadQueryResults('SELECT paid_amount, status FROM orders', []);
     expect((result as { types: Array<{ name: string; type: string }> }).types).toEqual([
       { name: 'paid_amount', type: 'decimal' },
+      { name: 'status', type: 'string' },
     ]);
+  });
+
+  it('column type list is stable when row JS-object key order differs between calls', async () => {
+    // Regression test for the multi-partition UNION failure: mongosql's
+    // `$project` stage is built by iterating a HashMap-backed
+    // `Schema::Document`, so the projected field order in each returned
+    // row is not stable across translations of the same SQL. The OLD
+    // value-sniffing path keyed off `Object.keys(firstRow)` and so
+    // produced column lists in different orders across partition
+    // rebuilds. The driver now sources types from the native (mongosql)
+    // metadata (`select_order`, a deterministic `Vec`) — so two calls
+    // with the SAME `types` argument but DIFFERENT row key orders both
+    // produce the same (column order, type) tuple.
+    const types = [
+      { name: 'agent_hangup_count', type: 'timestamp' },
+      { name: 'agent_id', type: 'string' },
+    ];
+    installMockNative({
+      query: mockQueryRows([{ call_logs: { agent_hangup_count: '2026-01-01T00:00:00Z', agent_id: 'a1' } }], types),
+    });
+    const d1 = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const r1 = await d1.downloadQueryResults('SELECT agent_hangup_count, agent_id FROM call_logs', []);
+    expect((r1 as { types: Array<{ name: string; type: string }> }).types).toEqual(types);
+
+    // Second "partition" with the row keys reversed but the SAME types.
+    installMockNative({
+      query: mockQueryRows([{ call_logs: { agent_id: 'a1', agent_hangup_count: '2026-01-01T00:00:00Z' } }], types),
+    });
+    const d2 = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const r2 = await d2.downloadQueryResults('SELECT agent_hangup_count, agent_id FROM call_logs', []);
+    expect((r2 as { types: Array<{ name: string; type: string }> }).types).toEqual(types);
+  });
+
+  it('applies flattenRow to the rows the same way query() does', async () => {
+    // Multi-key envelope (JOIN-shape) — rows flatten to `<ns>__<col>`.
+    installMockNative({
+      query: mockQueryRows(
+        [
+          {
+            users: { id: 'u1' },
+            orders: { id: 'o1' },
+          },
+        ],
+        [
+          { name: 'users__id', type: 'string' },
+          { name: 'orders__id', type: 'string' },
+        ],
+      ),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT * FROM users JOIN orders ON 1=1', []);
+    expect(result).toMatchObject({
+      rows: [{ users__id: 'u1', orders__id: 'o1' }],
+      types: [
+        { name: 'users__id', type: 'string' },
+        { name: 'orders__id', type: 'string' },
+      ],
+    });
+  });
+
+  it('rejects ambiguous JOIN projections at the SQL gate (matches query() behaviour)', async () => {
+    // The empty-string-envelope collision check that the regular query()
+    // path enforces also applies here — both go through the same SQL.
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const err = (await d
+      .downloadQueryResults('SELECT users.account_id, orders.account_id FROM users JOIN orders ON 1=1', [])
+      .catch((e: unknown) => e)) as MongoSqlError;
+    expect(err.code).toBe('MONGOSQL_TRANSLATE_FAILED');
+    expect(createdClients).toBe(0);
   });
 });

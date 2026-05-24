@@ -66,8 +66,9 @@ import type {
   TableStructure,
 } from '@cubejs-backend/base-driver';
 
-import { MongoSqlClient, type TablesSchema } from './native.js';
+import { MongoSqlClient, type ColumnType, type TablesSchema } from './native.js';
 import { MongoSqlQuery } from './MongoSqlQuery.js';
+import { resolveUriConfig } from './config.js';
 import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
 
 /**
@@ -78,6 +79,39 @@ import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
  * `testConnection()` / `query()` / `tablesSchema()` call so that throwing in
  * the constructor reports config errors crisply (Cube wraps construction
  * exceptions less helpfully than runtime ones).
+ *
+ * **Configuration env vars (see `./config.ts` and README "Configuration"):**
+ *
+ *   Cube-standard (`CUBEJS_DB_*`):
+ *     - `CUBEJS_DB_URL` / `CUBEJS_DB_URI` — full MongoDB connection string
+ *     - `CUBEJS_DB_HOST` / `_PORT` / `_USER` / `_PASS` / `_NAME` — composed URI parts
+ *     - `CUBEJS_DB_NAME` — database (also required separately by the driver)
+ *     - `CUBEJS_DB_SSL` — `tls=true|false`
+ *     - `CUBEJS_DB_MAX_POOL` / `_MIN_POOL` — `maxPoolSize` / `minPoolSize`
+ *     - `CUBEJS_DB_QUERY_TIMEOUT` — per-query `maxTimeMS` (duration string or ms)
+ *     - `CUBEJS_DB_IDLE_TIMEOUT` — `maxIdleTimeMS` (duration string or ms)
+ *
+ *   MongoDB-specific (`CUBEJS_MONGOSQL_*`):
+ *     - `_SCHEMA_SOURCE` — `collection` (default), `file`, or `atlas-sql`
+ *     - `_SCHEMA_FILE` — path (required if `_SCHEMA_SOURCE=file`)
+ *     - `_SCHEMA_REFRESH_SEC` — background refresh cadence in seconds
+ *     - `_SCHEMA_FAIL_OPEN` — `true` to soft-fail initial schema load
+ *     - `_QUERY_TIMEOUT_MS` — (legacy) bare-ms timeout; overridden by
+ *       `CUBEJS_DB_QUERY_TIMEOUT` when both set
+ *     - `_MAX_ROWS` — row cap per query
+ *     - `_APP_NAME` — `appName` (shows up in `serverStatus().connections`)
+ *     - `_MAX_CONNECTING` — `maxConnecting`
+ *     - `_WAIT_QUEUE_TIMEOUT_MS` — `waitQueueTimeoutMS`
+ *     - `_CONNECT_TIMEOUT_MS` — `connectTimeoutMS`
+ *     - `_SOCKET_TIMEOUT_MS` — `socketTimeoutMS`
+ *     - `_SERVER_SELECTION_TIMEOUT_MS` — `serverSelectionTimeoutMS`
+ *     - `_HEARTBEAT_FREQUENCY_MS` — `heartbeatFrequencyMS`
+ *     - `_RETRY_WRITES` / `_RETRY_READS` — `retryWrites` / `retryReads`
+ *     - `_COMPRESSORS` — `compressors`
+ *
+ *   User-set URI params (those already encoded in `CUBEJS_DB_URL/URI`) ALWAYS
+ *   win — we only append env-driven params for keys the URI doesn't already
+ *   specify.
  */
 export class MongoSqlDriver extends BaseDriver {
   private readonly resolvedConfig: MongoSqlConfig;
@@ -152,14 +186,30 @@ export class MongoSqlDriver extends BaseDriver {
     // Pass through any caller-supplied AbortSignal so downloadQueryResults
     // is cancellable on the same terms as query().
     const signal = extractAbortSignal(options as Record<string, unknown> | undefined);
-    const rows = await this.query<Record<string, unknown>>(sql, values, { signal } as QueryOptions);
     // Cube's pre-aggregation upload path passes `types` (a `[{name, type},
-    // ...]` list) to Cube Store to drive the LOAD ROWS column list. With
-    // `types: []` Cube Store fails ingest with "empty columns. Most probably,
-    // introspection has failed." We sniff types from row values — sufficient
-    // for the pre-agg load path (which only needs name + a column-shaped
-    // generic type tag, not full SQL-type fidelity).
-    return { rows, types: inferTypesFromRows(rows) };
+    // ...]` list) to Cube Store to drive the LOAD ROWS column list. The
+    // types come from `mongosql::Translation::{select_order, result_set_schema}`
+    // — the authoritative projection order and BSON type mapping. We no
+    // longer sniff from row values: that path was non-deterministic in
+    // multi-partition pre-aggregations because mongosql constructs its
+    // `$project` stage by iterating a HashMap-backed `Schema::Document`,
+    // so two translations of the same SQL produced different field
+    // orders. Divergent column orders across partition rebuilds caused
+    // Cube Store UNIONs to fail with `type_coercion ... Timestamp ... Int64`.
+    const finalSql = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    if (projectionHasNameCollision(finalSql)) {
+      throw translateFailed(
+        'JOIN projection contains two or more qualified columns with the same name ' +
+          '(e.g. `SELECT a.col, b.col` where the column names match). Mongosql ' +
+          'collapses these into an empty-string envelope `{"": {col, col}}` and BSON ' +
+          'document keys silently overwrite — losing data. Use `SELECT *` (returns ' +
+          '`<table>__<column>` prefixes) or alias each column explicitly ' +
+          '(`SELECT a.col AS a_col, b.col AS b_col`).',
+      );
+    }
+    const client = this.ensureClient();
+    const { rows, types } = await client.queryWithTypes<Record<string, unknown>>(finalSql, signal);
+    return { rows: flattenRows(rows), types: types.map(normalizeColumnType) };
   }
 
   public override capabilities(): DriverCapabilities {
@@ -361,9 +411,7 @@ function substituteParameters(sql: string, values: readonly unknown[]): string {
       out += c;
     } else if (c === '?' && !inString) {
       if (idx >= values.length) {
-        throw configInvalid(
-          `SQL has more '?' placeholders than provided values (consumed ${idx} of ${values.length})`,
-        );
+        throw configInvalid(`SQL has more '?' placeholders than provided values (consumed ${idx} of ${values.length})`);
       }
       out += formatSqlLiteral(values[idx]);
       idx++;
@@ -372,9 +420,7 @@ function substituteParameters(sql: string, values: readonly unknown[]): string {
     }
   }
   if (idx < values.length) {
-    throw configInvalid(
-      `parameter list has more values (${values.length}) than '?' placeholders in SQL (${idx})`,
-    );
+    throw configInvalid(`parameter list has more values (${values.length}) than '?' placeholders in SQL (${idx})`);
   }
   return out;
 }
@@ -393,90 +439,16 @@ function formatSqlLiteral(v: unknown): string {
 }
 
 /**
- * Sniff column types from row values, replicating the exact behaviour of
- * @cubejs-backend/base-driver's `DbTypeValueMatcher` inference.
+ * Defensive passthrough for the native-side `(name, type)` entry.
  *
- * For each column, scan ALL rows and pick the most-restrictive type that
- * EVERY present value satisfies. The matcher order is:
- *   timestamp → date → int → bigint → decimal → boolean → string → text
- *
- * Critical case: a column with mixed `0` (int, e.g. for filtered SUMs that
- * evaluate to zero) and `"400.00"` (decimal string) must classify as
- * decimal — int's regex `^-?\d+$` rejects `"400.00"`, so decimal wins and
- * Cube Store's INSERT accepts both rows.
+ * The Rust layer already returns one of Cube's documented generic-type
+ * strings (`timestamp`, `int`, `bigint`, `decimal`, `boolean`, `string`,
+ * `text`). We re-shape into a plain object so consumers depending on
+ * structural typing don't end up with the napi-rs deserialised view.
  */
-function inferTypesFromRows(rows: ReadonlyArray<Record<string, unknown>>): Array<{ name: string; type: string }> {
-  if (rows.length === 0) return [];
-  const colNames = new Set<string>();
-  for (const r of rows) {
-    for (const k of Object.keys(r)) colNames.add(k);
-  }
-  const out: Array<{ name: string; type: string }> = [];
-  for (const name of colNames) {
-    const presentValues = rows
-      .map((r) => r[name])
-      .filter((v): v is unknown => v !== null && v !== undefined);
-    if (presentValues.length === 0) {
-      out.push({ name, type: 'text' });
-      continue;
-    }
-    const type = TYPE_MATCHERS.find((m) => presentValues.every(m.matches))?.type ?? 'text';
-    out.push({ name, type });
-  }
-  return out;
+function normalizeColumnType(c: ColumnType): { name: string; type: string } {
+  return { name: c.name, type: c.type };
 }
-
-const INT32_MAX = BigInt('2147483647');
-const INT32_MIN = BigInt('-2147483648');
-
-const TYPE_MATCHERS: ReadonlyArray<{ type: string; matches: (v: unknown) => boolean }> = [
-  {
-    type: 'timestamp',
-    matches: (v) =>
-      v instanceof Date || (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v)),
-  },
-  {
-    type: 'date',
-    matches: (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v),
-  },
-  {
-    type: 'int',
-    matches: (v) => {
-      if (typeof v === 'number' && Number.isInteger(v)) {
-        return Math.abs(v) <= 0x7fffffff;
-      }
-      if (typeof v === 'string' && /^-?\d+$/.test(v)) {
-        const n = BigInt(v);
-        return n <= INT32_MAX && n >= INT32_MIN;
-      }
-      return false;
-    },
-  },
-  {
-    type: 'bigint',
-    matches: (v) =>
-      (typeof v === 'number' && Number.isInteger(v)) ||
-      typeof v === 'bigint' ||
-      (typeof v === 'string' && /^-?\d+$/.test(v)),
-  },
-  {
-    type: 'decimal',
-    matches: (v) =>
-      typeof v === 'number' || (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v)),
-  },
-  {
-    type: 'boolean',
-    matches: (v) => typeof v === 'boolean' || (typeof v === 'string' && /^(true|false)$/i.test(v)),
-  },
-  {
-    type: 'string',
-    matches: (v) => typeof v === 'string' && v.length < 256,
-  },
-  {
-    type: 'text',
-    matches: () => true,
-  },
-];
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
@@ -504,9 +476,24 @@ function extractAbortSignal(options: Record<string, unknown> | undefined): Abort
 
 type EnvLike = NodeJS.ProcessEnv;
 
+/**
+ * Resolve the runtime `MongoSqlConfig` from constructor overrides + env.
+ *
+ * URI building lives in `./config.ts` — see that module's header for
+ * the env vars honoured, the precedence rules (constructor uri >
+ * `CUBEJS_DB_URL` > `CUBEJS_DB_URI` > composed from `CUBEJS_DB_HOST`
+ * + parts), and the duration-string format accepted by
+ * `CUBEJS_DB_QUERY_TIMEOUT` / `CUBEJS_DB_IDLE_TIMEOUT`.
+ *
+ * Everything else stays here:
+ *   - `database` (required): explicit > `CUBEJS_DB_NAME`.
+ *   - `schemaSource`, `schemaRefreshSec`, `schemaFailOpen`, `maxRows`:
+ *     existing `CUBEJS_MONGOSQL_*` semantics, unchanged.
+ *   - `queryTimeoutMs`: explicit > `CUBEJS_DB_QUERY_TIMEOUT` >
+ *     `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` (resolved in config.ts).
+ */
 function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike): MongoSqlConfig {
-  const uri = override?.uri ?? env.CUBEJS_DB_URI;
-  if (!uri) throw configInvalidMissing('uri (set CUBEJS_DB_URI or pass `uri` to the constructor)');
+  const { uri, queryTimeoutMs: envQueryTimeoutMs } = resolveUriConfig(override?.uri, env);
 
   const database = override?.database ?? env.CUBEJS_DB_NAME;
   if (!database) {
@@ -521,7 +508,7 @@ function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike
     schemaSource,
     schemaRefreshSec: override?.schemaRefreshSec ?? numEnv(env.CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC),
     schemaFailOpen: override?.schemaFailOpen ?? boolEnv(env.CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN),
-    queryTimeoutMs: override?.queryTimeoutMs ?? numEnv(env.CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS),
+    queryTimeoutMs: override?.queryTimeoutMs ?? envQueryTimeoutMs,
     maxRows: override?.maxRows ?? numEnv(env.CUBEJS_MONGOSQL_MAX_ROWS),
   };
 }
@@ -537,7 +524,13 @@ function schemaSourceFromEnv(env: EnvLike): SchemaSource | undefined {
     }
     return { kind: 'file', path };
   }
-  throw configInvalid(`CUBEJS_MONGOSQL_SCHEMA_SOURCE must be 'collection' or 'file' (got '${kind}')`);
+  // Atlas SQL endpoints (`*.a.query.mongodb.net`) do not expose
+  // `__sql_schemas` as a queryable collection — schemas live in an
+  // internal store reachable only via the `sqlGetSchema` admin command.
+  // See https://www.mongodb.com/docs/sql-interface/schema/view/ and
+  // `crates/native/src/schema.rs` module docs.
+  if (kind === 'atlas-sql') return { kind: 'atlas-sql' };
+  throw configInvalid(`CUBEJS_MONGOSQL_SCHEMA_SOURCE must be 'collection', 'file', or 'atlas-sql' (got '${kind}')`);
 }
 
 function numEnv(v: string | undefined): number | undefined {

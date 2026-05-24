@@ -61,6 +61,12 @@ async function waitForHealthy(service: string, maxSeconds: number): Promise<void
 }
 
 async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
+  // Critic v3 — Issue #2: we expect at least four schemas now
+  // (users, accounts, orders, revenue_events). atlas-local runs init
+  // scripts on FIRST volume init only, so on existing volumes the new
+  // `revenue_events` row won't appear via the auto-run path. We poll
+  // for the higher count and then call `reseed()` to upsert the new
+  // schema (and collection) regardless of volume state.
   const deadline = Date.now() + maxSeconds * 1000;
   while (Date.now() < deadline) {
     try {
@@ -76,6 +82,66 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
     await sleep(2000);
   }
   throw new Error(`__sql_schemas was not populated within ${maxSeconds}s`);
+}
+
+/**
+ * Re-run the seed scripts inside atlas-local. atlas-local only auto-
+ * runs `/docker-entrypoint-initdb.d/*.js` on first volume init, so
+ * existing volumes won't pick up seed changes (e.g. the new
+ * `revenue_events` collection added for Critic v3 — Issue #2). Calling
+ * `mongosh ... --file` against the already-mounted scripts re-applies
+ * them. The scripts are written to be idempotent (`countDocuments() ===
+ * 0` guards for inserts; `replaceOne({_id}, ..., {upsert: true})` for
+ * the schema registrations) so re-running is safe and a no-op on
+ * fresh volumes.
+ */
+function reseed(): void {
+  const scripts = ['/docker-entrypoint-initdb.d/01-seed-data.js', '/docker-entrypoint-initdb.d/02-seed-schemas.js'];
+  for (const script of scripts) {
+    const r = spawnSync(
+      'docker',
+      [
+        'compose',
+        '-f',
+        COMPOSE_FILE,
+        'exec',
+        '-T',
+        'atlas-local',
+        'mongosh',
+        '--quiet',
+        '-u',
+        'admin',
+        '-p',
+        'admin',
+        '--authenticationDatabase',
+        'admin',
+        '--file',
+        script,
+      ],
+      { stdio: 'inherit', cwd: REPO_ROOT },
+    );
+    if (r.status !== 0) {
+      throw new Error(`reseed: ${script} exited ${r.status}`);
+    }
+  }
+}
+
+async function waitForSchemaIncludesRevenueEvents(maxSeconds = 30): Promise<void> {
+  const deadline = Date.now() + maxSeconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const out = execSync(
+        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments({_id: "revenue_events"})'`,
+        { encoding: 'utf-8', cwd: REPO_ROOT },
+      ).trim();
+      const n = parseInt(out, 10);
+      if (n >= 1) return;
+    } catch {
+      // ignore
+    }
+    await sleep(1500);
+  }
+  throw new Error('revenue_events row never appeared in __sql_schemas after reseed');
 }
 
 async function waitForCubeReady(maxSeconds = 120): Promise<void> {
@@ -115,6 +181,15 @@ export default async function setup(): Promise<() => Promise<void>> {
 
   await waitForSqlSchemas();
   console.log('cube-e2e setup: __sql_schemas populated');
+
+  // Re-run seed scripts so existing volumes pick up newly-added
+  // collections/schemas. The scripts are idempotent; on fresh volumes
+  // this is a no-op (initdb has already applied them and the inserts
+  // guard on `countDocuments() === 0`).
+  console.log('cube-e2e setup: re-applying seed scripts (idempotent)...');
+  reseed();
+  await waitForSchemaIncludesRevenueEvents();
+  console.log('cube-e2e setup: revenue_events schema row confirmed');
 
   await waitForCubeReady(180);
   console.log('cube-e2e setup: cube /readyz green');

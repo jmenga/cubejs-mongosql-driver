@@ -249,9 +249,28 @@ impl MongoSqlClient {
             .max_rows
             .unwrap_or(crate::config::DEFAULT_MAX_ROWS);
 
-        execute::execute(client.as_ref(), translation, timeout_ms, max_rows)
+        let result = execute::execute(client.as_ref(), translation, timeout_ms, max_rows)
             .await
-            .map_err(napi::Error::from)
+            .map_err(napi::Error::from)?;
+
+        // Compose the napi-rs surface: `{ rows: Array, types: Array<{name, type}> }`.
+        // We keep `rows` and `types` as separate keys (rather than wrapping
+        // every row with its types) because Cube Store's LOAD ROWS API
+        // expects one column list per batch, not per row.
+        let mut top: Map<String, Value> = Map::new();
+        top.insert("rows".to_string(), Value::Array(result.rows));
+        let types: Vec<Value> = result
+            .types
+            .into_iter()
+            .map(|c| {
+                let mut m = Map::new();
+                m.insert("name".to_string(), Value::String(c.name));
+                m.insert("type".to_string(), Value::String(c.ty.to_string()));
+                Value::Object(m)
+            })
+            .collect();
+        top.insert("types".to_string(), Value::Array(types));
+        Ok(Value::Object(top))
     }
 
     /// Returns Cube's expected `tablesSchema` payload built from the cached
@@ -441,6 +460,9 @@ impl MongoSqlClient {
             "collection" => {
                 schema::load_from_collection_with_columns(client, &self.config.database).await
             }
+            "atlas-sql" => {
+                schema::load_from_atlas_sql_with_columns(client, &self.config.database).await
+            }
             "file" => {
                 let path = self
                     .config
@@ -455,7 +477,9 @@ impl MongoSqlClient {
             }
             other => Err(Error::ConfigInvalid {
                 field: "schema_source.kind",
-                reason: format!("must be \"collection\" or \"file\"; got \"{other}\""),
+                reason: format!(
+                    "must be \"collection\", \"file\", or \"atlas-sql\"; got \"{other}\""
+                ),
             }),
         }
     }
@@ -536,9 +560,16 @@ impl<'a> Drop for InFlightGuard<'a> {
 
 /// Refresh-task variant of [`MongoSqlClient::load_schema`] with no `&self`
 /// borrow so the closure can be `'static`.
+///
+/// Atlas SQL endpoints update their schemas on their own schedule
+/// (see Atlas UI "Configure schema update schedule"), so the periodic
+/// refresh task is load-bearing for atlas-sql mode in the same way it
+/// is for collection mode — it picks up schema additions/removals
+/// without restarting the driver.
 async fn load_for_refresh(client: &mongodb::Client, config: &ClientConfig) -> Result<LoadedSchema> {
     match config.schema_source_kind() {
         "collection" => schema::load_from_collection_with_columns(client, &config.database).await,
+        "atlas-sql" => schema::load_from_atlas_sql_with_columns(client, &config.database).await,
         "file" => {
             let path = config
                 .schema_source
@@ -552,7 +583,7 @@ async fn load_for_refresh(client: &mongodb::Client, config: &ClientConfig) -> Re
         }
         other => Err(Error::ConfigInvalid {
             field: "schema_source.kind",
-            reason: format!("must be \"collection\" or \"file\"; got \"{other}\""),
+            reason: format!("must be \"collection\", \"file\", or \"atlas-sql\"; got \"{other}\""),
         }),
     }
 }
@@ -816,5 +847,19 @@ mod tests {
             file_client.default_db_for_translate(),
             FILE_MODE_DB_PLACEHOLDER
         );
+    }
+
+    #[test]
+    fn default_db_for_translate_atlas_sql_uses_config_db() {
+        // atlas-sql mode keys its catalog under config.database (no
+        // placeholder), so the translate default-db must be the real db
+        // name — same as collection mode.
+        let mut cfg = fixture_config();
+        cfg.schema_source = Some(SchemaSource {
+            kind: "atlas-sql".to_string(),
+            path: None,
+        });
+        let client = MongoSqlClient::new(cfg);
+        assert_eq!(client.default_db_for_translate(), "mydb");
     }
 }
