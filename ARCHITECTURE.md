@@ -97,8 +97,12 @@ pub struct SchemaSource {
 
 - Enumerate via `listCollections`, filter out `system.*` and `__sql_schemas`.
 - For each remaining name, issue `runCommand({sqlGetSchema: name})`. Per the canonical spec, the response shape is `{ok: 1, metadata: {description}, schema: {version, jsonSchema}}` when a schema is registered, and `{ok: 1, metadata: {}, schema: {}}` when no schema exists. The empty-`schema` case is SKIPPED (not errored) — `ok: 1` alone does not imply a schema was found.
+- **Per-collection `sqlGetSchema` calls are fanned out with bounded parallelism** via `futures::stream::buffered`. The concurrency cap (constant `ATLAS_SQL_FAN_OUT_CONCURRENCY` in `crates/native/src/schema.rs`, currently 8) is intentionally conservative — it cuts refresh latency on multi-hundred-collection databases from `N × RTT` to roughly `ceil(N / 8) × RTT` while leaving plenty of headroom on the Atlas SQL control plane. Output order is preserved so the per-collection log messages line up with input order. The fan-out helper (`bounded_fan_out`) is extracted as a pure async function so it can be unit-tested without a live mongo client.
 - Same `(catalog, columns)` output as the other two modes, keyed under `db_name`. No file-mode-style placeholder rewriting.
-- If `sqlGetSchema` errors on the wire (e.g. running atlas-sql mode against a regular cluster where the command is not recognised), the loader surfaces `MONGOSQL_SCHEMA_INVALID` with a hint about the endpoint requirement.
+- If `sqlGetSchema` errors on the wire, the loader branches on the MongoDB server-side error code so the hint is actually actionable:
+  - Code 13 (`Unauthorized`) → "user lacks `sqlGetSchema` privileges; grant `atlasAdmin` or `clusterMonitor` + `readAnyDatabase`; see <https://www.mongodb.com/docs/atlas/data-federation/query/sql/getting-started/>."
+  - Code 59 (`CommandNotFound`) → "endpoint does not implement `sqlGetSchema`; atlas-sql mode requires a `*.a.query.mongodb.net` endpoint; use collection mode for regular clusters."
+  - Any other failure → generic `MONGOSQL_SCHEMA_INVALID` with the underlying message routed through `redact_uri_creds` so a future mongodb-crate variant whose Display embeds the URI can't leak credentials.
 
 ### 3.2 Cache lifecycle
 

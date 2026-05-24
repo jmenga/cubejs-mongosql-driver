@@ -164,7 +164,15 @@ impl From<mongodb::error::Error> for Error {
 /// Strip anything that looks like `user:password@` from a string before it
 /// becomes part of a public error message. Defence-in-depth: the upstream
 /// crate already redacts in most paths, but we redact regardless.
-fn redact_uri_creds(s: &str) -> String {
+///
+/// Visible to the rest of the crate so error sites that build their own
+/// `Error::SchemaInvalid`/`ExecuteFailed` messages from upstream mongodb
+/// crate errors (rather than going through `From<mongodb::error::Error>`)
+/// can still apply the same redaction. Today the mongodb-3.x `ErrorKind`
+/// Display templates don't carry URI strings, but future upgrades could
+/// reintroduce a variant whose Display includes user-controlled URIs —
+/// piping through this helper is cheap insurance.
+pub(crate) fn redact_uri_creds(s: &str) -> String {
     // Crude but effective: drop anything between "://" and "@" if both
     // appear in order. Leaves the rest of the message alone.
     if let Some(scheme_end) = s.find("://") {

@@ -285,12 +285,21 @@ In this mode the driver:
 
 1. Calls `listCollections` on `CUBEJS_DB_NAME` to enumerate candidate collections.
 2. Filters out `system.*` collections and `__sql_schemas`.
-3. Runs `sqlGetSchema` per remaining collection. Empty-schema responses (`{ok: 1, metadata: {}, schema: {}}`) — the canonical "no schema set for this name" shape — are SKIPPED, not errored. Populated responses (`{ok: 1, metadata: {description}, schema: {version, jsonSchema}}`) are added to the catalog.
+3. Runs `sqlGetSchema` per remaining collection with **bounded parallelism** (up to 8 in flight at once — see `ATLAS_SQL_FAN_OUT_CONCURRENCY` in `crates/native/src/schema.rs`). Empty-schema responses (`{ok: 1, metadata: {}, schema: {}}`) — the canonical "no schema set for this name" shape — are SKIPPED, not errored. Populated responses (`{ok: 1, metadata: {description}, schema: {version, jsonSchema}}`) are added to the catalog. The parallel fan-out turns an `N × RTT` refresh into roughly `ceil(N / 8) × RTT`, which matters on databases with 100+ collections.
 4. Re-runs the same enumeration on the `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` cadence (default 300 s) so Atlas-driven schema updates surface without a driver restart.
 
 Canonical command spec: <https://www.mongodb.com/docs/sql-interface/schema/view/>. There is no `sqlListSchemas` command — enumeration is `listCollections` + per-collection `sqlGetSchema`, which is what the driver does.
 
-If `sqlGetSchema` fails (e.g. the endpoint is not actually Atlas SQL), the driver raises `MONGOSQL_SCHEMA_INVALID` with a clear hint about the mode requirement. Use collection mode for regular clusters where you seed `__sql_schemas` yourself.
+#### Required Atlas role grants
+
+`sqlGetSchema` is an admin-style command. The connecting user MUST hold either:
+
+- the built-in `atlasAdmin` role, OR
+- a built-in role granting `clusterMonitor` plus `readAnyDatabase`.
+
+A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privileges will surface a MongoDB error with code **13 (`Unauthorized`)**. The driver detects this and raises `MONGOSQL_SCHEMA_INVALID` with a hint citing the canonical role-requirements doc: <https://www.mongodb.com/docs/atlas/data-federation/query/sql/getting-started/>.
+
+If `sqlGetSchema` fails with code **59 (`CommandNotFound`)** the endpoint isn't an Atlas SQL endpoint at all (the typical "I'm pointing atlas-sql mode at a regular cluster" misconfiguration). The driver surfaces a distinct hint suggesting collection mode for that case. Any other failure is reported with the underlying message routed through the credential-redactor so connection strings don't leak.
 
 ## Pre-aggregations
 

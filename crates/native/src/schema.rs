@@ -87,6 +87,23 @@
 //! we call `sqlGetSchema` — they never carry catalog-relevant schemas and
 //! would just generate noise.
 //!
+//! Per-collection `sqlGetSchema` calls are fanned out with bounded parallelism
+//! (see [`ATLAS_SQL_FAN_OUT_CONCURRENCY`]) via `futures::stream::buffered`, so
+//! refresh latency on a database with N collections is roughly
+//! `ceil(N / CONCURRENCY) × RTT` rather than `N × RTT`. The concurrency cap
+//! is deliberately conservative so refreshes don't hammer the Atlas SQL
+//! control plane on databases with hundreds of collections.
+//!
+//! ### Required Atlas role grants
+//!
+//! `sqlGetSchema` requires the connecting user to hold either the built-in
+//! `atlasAdmin` role OR a combination granting `clusterMonitor` plus
+//! `readAnyDatabase`. A user who can `listCollections` but lacks
+//! `sqlGetSchema` privileges will surface a MongoDB error code 13
+//! (`Unauthorized`); the loader detects this and emits a hint pointing at
+//! the Atlas docs rather than the misleading "wrong endpoint" message.
+//! See <https://www.mongodb.com/docs/atlas/data-federation/query/sql/getting-started/>.
+//!
 //! ## Trust boundary
 //!
 //! `load_from_file` uses the caller-supplied path as-is. No path-traversal
@@ -98,7 +115,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use bson::{doc, Document};
-use futures_util::TryStreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use mongosql::{
     build_catalog_from_catalog_schema,
     catalog::Catalog,
@@ -107,7 +124,40 @@ use mongosql::{
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::error::{Error, Result};
+use crate::error::{redact_uri_creds, Error, Result};
+
+/// Maximum number of in-flight `sqlGetSchema` calls per refresh. Picked to
+/// balance two pressures:
+///
+/// * **Refresh latency** — refresh time is `ceil(N / CONCURRENCY) × RTT`. With
+///   typical Atlas RTTs of 50–150 ms and 100+ user collections, raising
+///   concurrency from 1 to 8 cuts refresh time by ~8×.
+/// * **Atlas server load** — each `sqlGetSchema` is an admin-style command on
+///   the Atlas SQL control plane. Atlas does not publish a hard per-connection
+///   rate cap for this command, but staying well below it (single-digit
+///   concurrency) avoids triggering server-side throttling and leaves
+///   headroom for other tenants on the same cluster.
+///
+/// 8 is conservative; tune upward if refresh latency on multi-hundred-
+/// collection databases becomes a problem. We deliberately do NOT make this
+/// configurable from `ClientConfig` yet — no caller has needed to tune it,
+/// and exposing a knob too early just creates a footgun.
+pub(crate) const ATLAS_SQL_FAN_OUT_CONCURRENCY: usize = 8;
+
+/// MongoDB server error code for `Unauthorized` (insufficient role / privilege).
+/// Surface-equivalent of `AuthorizationFailure` for runCommand. The full code
+/// table lives at <https://github.com/mongodb/mongo/blob/master/src/mongo/base/error_codes.yml>.
+pub(crate) const MONGO_ERROR_CODE_UNAUTHORIZED: i32 = 13;
+
+/// MongoDB server error code for `CommandNotFound`. Surfaced when an endpoint
+/// doesn't implement `sqlGetSchema` — the canonical signal that atlas-sql
+/// mode is pointed at a regular MongoDB endpoint instead of an Atlas SQL one.
+pub(crate) const MONGO_ERROR_CODE_COMMAND_NOT_FOUND: i32 = 59;
+
+/// Canonical Atlas SQL role-requirements doc URL, embedded in the hint string
+/// when `sqlGetSchema` fails with `Unauthorized`.
+pub(crate) const ATLAS_SQL_ROLES_DOC_URL: &str =
+    "https://www.mongodb.com/docs/atlas/data-federation/query/sql/getting-started/";
 
 /// Re-export of the upstream catalog so other modules don't import `mongosql`
 /// directly. T07 (translate wrapper) consumes this.
@@ -407,34 +457,37 @@ async fn collect_atlas_sql_docs(
     let names = database
         .list_collection_names()
         .await
-        .map_err(|e| match e.kind.as_ref() {
-            mongodb::error::ErrorKind::Authentication { .. } => Error::AuthFailed {
-                msg: "authentication handshake rejected by server".to_string(),
-            },
-            _ => Error::SchemaInvalid {
-                msg: format!("listCollections failed on database `{db_name}`: {}", e.kind),
-            },
-        })?;
+        .map_err(|e| map_list_collections_error(db_name, e))?;
+
+    // Build one future per user-visible collection name (system + internal
+    // names filtered out) and drive them through a buffered stream so up to
+    // `ATLAS_SQL_FAN_OUT_CONCURRENCY` `sqlGetSchema` calls are in flight at
+    // once. This turns a serial `N × RTT` refresh into roughly
+    // `ceil(N / CONCURRENCY) × RTT` without giving up the per-call error
+    // handling the serial loop had — each future still returns a typed
+    // `Result<Option<(name, schema)>>` keyed by collection name.
+    let filtered: Vec<String> = names
+        .into_iter()
+        .filter(|n| !is_system_or_internal_collection(n))
+        .collect();
+
+    let database = Arc::new(database);
+    let db_name_owned = db_name.to_string();
+    let per_collection_futures = filtered.into_iter().map(|name| {
+        let database = Arc::clone(&database);
+        let db_name = db_name_owned.clone();
+        async move { fetch_one_atlas_sql_schema(&database, &db_name, name).await }
+    });
+
+    let pairs: Vec<(String, Option<(String, JsonSchema)>)> =
+        bounded_fan_out(per_collection_futures, ATLAS_SQL_FAN_OUT_CONCURRENCY)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
 
     let mut by_collection: BTreeMap<String, JsonSchema> = BTreeMap::new();
-    for name in names {
-        if is_system_or_internal_collection(&name) {
-            continue;
-        }
-        let cmd = doc! {"sqlGetSchema": &name};
-        let response = database
-            .run_command(cmd)
-            .await
-            .map_err(|e| Error::SchemaInvalid {
-                msg: format!(
-                    "sqlGetSchema for `{db_name}.{name}` failed: {} \
-                     — atlas-sql mode requires an Atlas SQL endpoint \
-                     (sqlGetSchema is not supported by general-purpose MongoDB endpoints)",
-                    e.kind
-                ),
-            })?;
-
-        match parse_atlas_sql_response(&name, response)? {
+    for (orig_name, outcome) in pairs {
+        match outcome {
             Some((coll_name, schema)) => {
                 by_collection.insert(coll_name, schema);
             }
@@ -443,7 +496,7 @@ async fn collect_atlas_sql_docs(
                 tracing::debug!(
                     target: "mongosql_driver::schema",
                     db = db_name,
-                    collection = name.as_str(),
+                    collection = orig_name.as_str(),
                     "sqlGetSchema returned an empty schema document; skipping collection",
                 );
             }
@@ -453,6 +506,177 @@ async fn collect_atlas_sql_docs(
     let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
     by_db.insert(db_name.to_string(), by_collection);
     Ok(by_db)
+}
+
+/// Issue `sqlGetSchema` for exactly one collection and parse the response.
+/// Returns `(original_name, Option<(parsed_name, schema)>)` so the caller can
+/// log the original name on the `None` (empty-schema-skipped) path without
+/// re-threading the input list. Errors are mapped through
+/// [`map_run_command_error`] so the URI-redaction story stays centralised
+/// and Unauthorized vs CommandNotFound get distinct, actionable hints.
+async fn fetch_one_atlas_sql_schema(
+    database: &mongodb::Database,
+    db_name: &str,
+    name: String,
+) -> Result<(String, Option<(String, JsonSchema)>)> {
+    let cmd = doc! {"sqlGetSchema": &name};
+    let response = database
+        .run_command(cmd)
+        .await
+        .map_err(|e| map_run_command_error(db_name, &name, e))?;
+    let parsed = parse_atlas_sql_response(&name, response)?;
+    Ok((name, parsed))
+}
+
+/// Drive `futures` to completion with at most `concurrency` in-flight at any
+/// moment, preserving each future's result in the iteration order (so caller
+/// log messages line up with caller inputs). Pulled out of
+/// [`collect_atlas_sql_docs`] as a stand-alone async function so unit tests
+/// can exercise the fan-out fairness independently of mongo I/O — see
+/// `tests::bounded_fan_out_runs_in_parallel_up_to_limit`.
+pub(crate) async fn bounded_fan_out<F, T, I>(futures: I, concurrency: usize) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future<Output = T>,
+{
+    // `buffered` preserves input order in its output stream; we collect into a
+    // Vec so all callers see the same iteration order they would have got from
+    // a serial loop. Concurrency-clamping at 1 degenerates to serial execution
+    // which is the same as the previous loop; clamp at 0 is treated as 1 so
+    // callers don't deadlock on a misconfiguration.
+    let concurrency = concurrency.max(1);
+    stream::iter(futures)
+        .buffered(concurrency)
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// Map a `mongodb::error::Error` from the `listCollections` call into the
+/// driver's error taxonomy. Keeps the existing Authentication-→-AuthFailed
+/// special case but routes all other variants through `redact_uri_creds` so
+/// a future mongodb-crate variant whose Display embeds the connection URI
+/// can't leak credentials into our public error message.
+///
+/// Splits classification from message-building so a unit test can exercise
+/// the redaction-on-other-variants path without having to construct a
+/// real `mongodb::error::Error` (whose inner kinds are `#[non_exhaustive]`).
+fn map_list_collections_error(db_name: &str, e: mongodb::error::Error) -> Error {
+    use mongodb::error::ErrorKind;
+    let is_auth = matches!(e.kind.as_ref(), ErrorKind::Authentication { .. });
+    let inner = format!("{}", e.kind);
+    build_list_collections_error_message(db_name, is_auth, &inner)
+}
+
+/// Build the typed `Error` for a failed `listCollections` call. Exposed at
+/// crate scope so tests can hit both the Authentication-branch and the
+/// generic redacted-Other branch with synthetic inputs.
+pub(crate) fn build_list_collections_error_message(
+    db_name: &str,
+    is_authentication_error: bool,
+    inner_message: &str,
+) -> Error {
+    if is_authentication_error {
+        Error::AuthFailed {
+            msg: "authentication handshake rejected by server".to_string(),
+        }
+    } else {
+        let inner = redact_uri_creds(inner_message);
+        Error::SchemaInvalid {
+            msg: format!("listCollections failed on database `{db_name}`: {inner}"),
+        }
+    }
+}
+
+/// Map a `mongodb::error::Error` from a per-collection `sqlGetSchema` call.
+///
+/// Inspects the `mongodb::error::ErrorKind` enough to extract a stable
+/// classification (server-side `Command` errors with their `code`, vs.
+/// non-command errors) and then defers to [`build_run_command_error_message`]
+/// for the actual `Error::SchemaInvalid` construction. The split lets the
+/// unit tests cover every branch by code without needing to construct a
+/// `mongodb::error::Error::Command` from outside the mongodb crate (which
+/// is impossible because `CommandError` is `#[non_exhaustive]`).
+fn map_run_command_error(db_name: &str, name: &str, e: mongodb::error::Error) -> Error {
+    use mongodb::error::ErrorKind;
+    let class = match e.kind.as_ref() {
+        ErrorKind::Command(cmd_err) => RunCommandErrorClass::CommandCode(cmd_err.code),
+        _ => RunCommandErrorClass::Other,
+    };
+    let inner = format!("{}", e.kind);
+    build_run_command_error_message(db_name, name, class, &inner)
+}
+
+/// Stable classification of a `mongodb::error::Error` from
+/// `database.run_command(...)`. Decoupled from the upstream non-exhaustive
+/// types so the message-builder can be driven by tests with synthetic inputs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RunCommandErrorClass {
+    /// A `CommandError` with the given server-side numeric code. The two
+    /// codes the loader specifically branches on are
+    /// [`MONGO_ERROR_CODE_UNAUTHORIZED`] (13) and
+    /// [`MONGO_ERROR_CODE_COMMAND_NOT_FOUND`] (59); any other code is
+    /// reported as a generic command failure.
+    CommandCode(i32),
+    /// Not a command error — IO / DNS / TLS / etc. The full mongodb-crate
+    /// Display string is included in the public message *after* being routed
+    /// through [`redact_uri_creds`].
+    Other,
+}
+
+/// Build the `Error::SchemaInvalid` returned for a failed `sqlGetSchema` call.
+///
+/// Three branches:
+/// 1. `CommandCode(13)` (Unauthorized) — emit a hint pointing at
+///    [`ATLAS_SQL_ROLES_DOC_URL`]. The connecting user can `listCollections`
+///    but cannot `sqlGetSchema`; the canonical fix is to grant `atlasAdmin`
+///    or (`clusterMonitor` + `readAnyDatabase`).
+/// 2. `CommandCode(59)` (CommandNotFound) — emit a hint that the endpoint
+///    doesn't speak `sqlGetSchema` (the user has pointed atlas-sql mode at a
+///    regular MongoDB endpoint instead of the SQL-front).
+/// 3. Anything else (other command codes, IO/DNS/TLS/etc.) — generic hint,
+///    with the underlying message routed through `redact_uri_creds`.
+pub(crate) fn build_run_command_error_message(
+    db_name: &str,
+    name: &str,
+    class: RunCommandErrorClass,
+    inner_message: &str,
+) -> Error {
+    match class {
+        RunCommandErrorClass::CommandCode(code) if code == MONGO_ERROR_CODE_UNAUTHORIZED => {
+            // Don't include the server-side errmsg here: it can include
+            // namespace + user identifiers we'd rather keep out of the
+            // surfaced Cube error. The actionable info is the doc URL.
+            Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{db_name}.{name}` was rejected with code 13 (Unauthorized) \
+                     — the connecting user is not authorized to run sqlGetSchema. \
+                     Atlas SQL requires the `atlasAdmin` role or a combination granting \
+                     `clusterMonitor` + `readAnyDatabase`; see {ATLAS_SQL_ROLES_DOC_URL}",
+                ),
+            }
+        }
+        RunCommandErrorClass::CommandCode(code) if code == MONGO_ERROR_CODE_COMMAND_NOT_FOUND => {
+            Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{db_name}.{name}` was rejected with code 59 \
+                     (CommandNotFound) — this endpoint does not implement sqlGetSchema. \
+                     atlas-sql mode requires an Atlas SQL endpoint \
+                     (host pattern: `*.a.query.mongodb.net`); use collection mode for \
+                     regular MongoDB clusters that seed `__sql_schemas`",
+                ),
+            }
+        }
+        _ => {
+            let inner = redact_uri_creds(inner_message);
+            Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{db_name}.{name}` failed: {inner} \
+                     — atlas-sql mode requires an Atlas SQL endpoint \
+                     (sqlGetSchema is not supported by general-purpose MongoDB endpoints)",
+                ),
+            }
+        }
+    }
 }
 
 /// Returns `true` for collection names that must be excluded from
@@ -541,17 +765,15 @@ pub(crate) fn parse_atlas_sql_response(
     }
 
     // Permissive version handling — matches Collection-mode convention.
-    if let Ok(v) = schema_doc.get_i64("version") {
-        if v != SUPPORTED_SCHEMA_VERSION {
-            tracing::warn!(
-                target: "mongosql_driver::schema",
-                collection = collection_name,
-                version = v,
-                expected = SUPPORTED_SCHEMA_VERSION,
-                "atlas-sql schema version mismatch; attempting to parse jsonSchema anyway",
-            );
-        }
-    }
+    // Atlas SQL writes `version` as a NumberLong (BSON int64), but other
+    // toolchains (EJSON-relaxed JSON imports, future Atlas server versions)
+    // could ship it as Int32, Double, or — in degenerate cases — a String
+    // or NumberDecimal. We *want* the mismatch warning to fire across all
+    // numeric encodings so observability stays symmetric with the i64
+    // happy path; only an unrecognised BSON type is logged at `debug` so
+    // that operators inspecting traces can still see "we tried and gave up"
+    // without it polluting the warn-level stream.
+    check_schema_version(schema_doc, collection_name);
 
     let json_schema_doc =
         schema_doc
@@ -564,6 +786,64 @@ pub(crate) fn parse_atlas_sql_response(
 
     let parsed = parse_collection_schema(collection_name, json_schema_doc)?;
     Ok(Some(parsed))
+}
+
+/// Read `schema.version` permissively and warn if it doesn't match
+/// [`SUPPORTED_SCHEMA_VERSION`].
+///
+/// The Atlas SQL endpoint encodes `version` as an int64 (NumberLong), but
+/// permissive parsing covers Int32 and Double-with-integer-value as well —
+/// some EJSON-relaxed paths can produce either of those. If `version` is
+/// present but parses to none of those numeric forms, we emit a `debug` log
+/// noting the BSON type so operators can spot a wire-format drift without
+/// it polluting the warn-level stream. Missing `version` is also `debug`
+/// (rather than warn), matching the existing permissive-on-missing convention.
+pub(crate) fn check_schema_version(schema_doc: &Document, collection_name: &str) {
+    let parsed_version: Option<i64> = if let Ok(v) = schema_doc.get_i64("version") {
+        Some(v)
+    } else if let Ok(v) = schema_doc.get_i32("version") {
+        Some(v as i64)
+    } else if let Ok(v) = schema_doc.get_f64("version") {
+        // Cast only if the double cleanly represents an integer. A value like
+        // 1.5 would be a wire-format violation, not a version-mismatch — log
+        // as debug below rather than emit a misleading warn with a truncated
+        // integer.
+        if v.is_finite() && v.fract() == 0.0 {
+            Some(v as i64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match parsed_version {
+        Some(v) if v != SUPPORTED_SCHEMA_VERSION => {
+            tracing::warn!(
+                target: "mongosql_driver::schema",
+                collection = collection_name,
+                version = v,
+                expected = SUPPORTED_SCHEMA_VERSION,
+                "atlas-sql schema version mismatch; attempting to parse jsonSchema anyway",
+            );
+        }
+        Some(_) => {
+            // Matches expected version — no log.
+        }
+        None => {
+            // `version` may be entirely absent (permitted; nothing to log) OR
+            // present-but-non-numeric. Distinguish those so a wire-format
+            // drift shows up in traces without surfacing on the warn path.
+            if let Some(actual) = schema_doc.get("version") {
+                tracing::debug!(
+                    target: "mongosql_driver::schema",
+                    collection = collection_name,
+                    bson_type = ?actual.element_type(),
+                    "atlas-sql schema `version` is present but not a recognised numeric type; skipping version check",
+                );
+            }
+        }
+    }
 }
 
 /// Read a YAML/JSON schema file from disk and produce the same
@@ -2210,5 +2490,375 @@ mod tests {
         by_db.insert("mydb".to_string(), by_coll);
         let loaded = build_loaded_schema(by_db).expect("build catalog");
         assert!(loaded.columns.is_empty(), "no columns from empty input");
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #1 — bounded-parallel fan-out
+    // -----------------------------------------------------------------
+
+    /// `bounded_fan_out` must actually run futures concurrently up to the
+    /// configured limit. The check uses a shared atomic counter to record the
+    /// peak in-flight count across all participating futures; with a serial
+    /// loop the peak would be exactly 1, with `buffered(N)` it must be > 1
+    /// (and ≤ N).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_fan_out_runs_in_parallel_up_to_limit() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        // 16 jobs through a `buffered(8)` stream. Each job sleeps long enough
+        // that the buffered scheduler will hold 8 of them open at once.
+        let n_jobs = 16usize;
+        let limit = 8usize;
+        let mut futs = Vec::with_capacity(n_jobs);
+        for _ in 0..n_jobs {
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            futs.push(async move {
+                // bump in-flight, record peak, sleep, then decrement
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                // monotonically increase peak to the highest cur seen
+                peak.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                cur
+            });
+        }
+
+        let outs = bounded_fan_out(futs, limit).await;
+        assert_eq!(outs.len(), n_jobs);
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak > 1,
+            "expected >1 future in flight (peak={observed_peak}); fan-out is serial",
+        );
+        assert!(
+            observed_peak <= limit,
+            "expected peak ≤ {limit} (peak={observed_peak}); fan-out exceeded the cap",
+        );
+        // Tighter assertion: under a multi-thread runtime with a healthy
+        // scheduler the peak should *reach* the cap (i.e. 8 in flight). Use
+        // `>= 2` as the floor in case CI runs are starved, but the typical
+        // case is exactly `limit`.
+        assert!(
+            observed_peak >= 2,
+            "expected peak ≥ 2 with `buffered({limit})`; got {observed_peak}",
+        );
+    }
+
+    /// Concurrency clamped to 0 must NOT deadlock; we coerce it to 1 (serial).
+    #[tokio::test]
+    async fn bounded_fan_out_zero_concurrency_falls_back_to_serial() {
+        let futs = (0..4u32).map(|i| async move { i });
+        let outs = bounded_fan_out(futs, 0).await;
+        assert_eq!(outs, vec![0, 1, 2, 3]);
+    }
+
+    /// Output preserves input order so caller log messages line up with input
+    /// names — important because the surrounding loop pairs the original
+    /// collection name with the parse result for the "empty schema; skipped"
+    /// debug log.
+    #[tokio::test]
+    async fn bounded_fan_out_preserves_input_order() {
+        // Each future sleeps for a different amount so the *completion* order
+        // (d, c, b, a — shortest sleep first) differs from input order
+        // (a, b, c, d). A serial loop would also preserve order, but our
+        // assertion catches the failure mode where buffered ordering would
+        // surface completion order instead.
+        let delays_and_labels = [(80u64, "a"), (40, "b"), (20, "c"), (10, "d")];
+        let futs = delays_and_labels
+            .into_iter()
+            .map(|(delay, label)| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                label
+            });
+        let outs = bounded_fan_out(futs, 4).await;
+        assert_eq!(outs, vec!["a", "b", "c", "d"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #2 — error-code branching (Unauthorized vs CommandNotFound)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn run_command_error_code_13_yields_unauthorized_hint() {
+        // CommandError code 13 = Unauthorized → emit the role-requirements
+        // hint with the canonical docs URL. The server-side `errmsg` is NOT
+        // included in the user-facing message (it can carry identifiers).
+        let e = build_run_command_error_message(
+            "dev-convo-hub",
+            "calllogs",
+            RunCommandErrorClass::CommandCode(MONGO_ERROR_CODE_UNAUTHORIZED),
+            "Error code 13 (Unauthorized): not authorized on db",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(msg.contains("dev-convo-hub.calllogs"));
+                assert!(msg.contains("code 13"));
+                assert!(msg.contains("Unauthorized"));
+                assert!(msg.contains("atlasAdmin"));
+                assert!(msg.contains("clusterMonitor"));
+                assert!(msg.contains("readAnyDatabase"));
+                assert!(
+                    msg.contains(ATLAS_SQL_ROLES_DOC_URL),
+                    "msg should cite docs URL: {msg}",
+                );
+                // The wrong-endpoint hint must NOT appear on the Unauthorized
+                // branch — that would be the misleading message we're fixing.
+                assert!(
+                    !msg.contains("CommandNotFound"),
+                    "Unauthorized hint must not mention CommandNotFound: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_error_code_59_yields_command_not_found_hint() {
+        // CommandError code 59 = CommandNotFound → emit the "wrong endpoint"
+        // hint. The Atlas SQL host pattern must appear so operators can
+        // self-diagnose without digging into the docs.
+        let e = build_run_command_error_message(
+            "dev-convo-hub",
+            "users",
+            RunCommandErrorClass::CommandCode(MONGO_ERROR_CODE_COMMAND_NOT_FOUND),
+            "Error code 59 (CommandNotFound): no such command: 'sqlGetSchema'",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(msg.contains("dev-convo-hub.users"));
+                assert!(msg.contains("code 59"));
+                assert!(msg.contains("CommandNotFound"));
+                assert!(msg.contains("*.a.query.mongodb.net"));
+                // The role-grants hint must NOT appear on the CommandNotFound
+                // branch — it would mislead the operator into editing IAM.
+                assert!(
+                    !msg.contains("atlasAdmin"),
+                    "CommandNotFound hint must not suggest role grants: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_error_other_code_yields_generic_hint() {
+        // A CommandError with a code that isn't 13 or 59 falls through to the
+        // generic "endpoint may not support sqlGetSchema" hint, with the
+        // inner Display string redacted.
+        let e = build_run_command_error_message(
+            "dev-convo-hub",
+            "x",
+            RunCommandErrorClass::CommandCode(11_000), // DuplicateKey, just for variety
+            "Error code 11000 (DuplicateKey): something",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(msg.contains("dev-convo-hub.x"));
+                assert!(msg.contains("DuplicateKey"));
+                assert!(msg.contains("atlas-sql mode requires"));
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_error_non_command_kind_redacts_inner() {
+        // Defence-in-depth: simulate a future mongodb-crate variant whose
+        // Display embeds a URI string. The redactor must strip the creds
+        // before they reach the public error message.
+        let e = build_run_command_error_message(
+            "dev-convo-hub",
+            "calllogs",
+            RunCommandErrorClass::Other,
+            "I/O error talking to mongodb://alice:s3cret@host:27017/db",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(
+                    !msg.contains("alice"),
+                    "must redact username from inner: {msg}",
+                );
+                assert!(
+                    !msg.contains("s3cret"),
+                    "must redact password from inner: {msg}",
+                );
+                assert!(
+                    msg.contains("[REDACTED]"),
+                    "redaction marker must appear: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #3 — permissive version parsing
+    // -----------------------------------------------------------------
+
+    /// Atlas SQL ships `version` as a NumberLong (i64) in production today,
+    /// but our parser must accept Int32 too for byte-format drift.
+    #[test]
+    fn parse_atlas_sql_response_accepts_version_int32() {
+        // The version field is encoded as i32 (mismatched value) → parse
+        // should still succeed (permissive) and the warn-level mismatch
+        // log should fire (we don't capture it here, but a serial run
+        // through `cargo test -- --nocapture` makes it visible).
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": 99_i32, // mismatched, encoded as Int32
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "email": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("users", response).expect("i32 version still parses");
+        let (name, schema) = parsed.expect("populated");
+        assert_eq!(name, "users");
+        assert!(schema.properties.is_some());
+    }
+
+    /// `version` encoded as a Double (e.g. EJSON-relaxed JSON pipelines) with
+    /// an integer-valued fractional component must parse cleanly.
+    #[test]
+    fn parse_atlas_sql_response_accepts_version_double() {
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": 1.0_f64,
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "x": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("c", response).expect("f64 version parses");
+        assert!(parsed.is_some(), "populated body produces Some");
+    }
+
+    /// `version` encoded as a non-integer Double is treated as "unrecognised"
+    /// — the parser does not silently truncate to an integer. The body still
+    /// parses; the version check just doesn't emit a warn-level mismatch.
+    #[test]
+    fn parse_atlas_sql_response_non_integer_double_version_still_parses() {
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": 1.5_f64, // not a clean integer
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "x": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("c", response).expect("permissive on bad numerics");
+        assert!(parsed.is_some());
+    }
+
+    /// A `version` of an entirely unrecognised BSON type (string here, but
+    /// could be Decimal128/Null/etc.) must NOT cause the parser to error and
+    /// the body must still parse. Observability falls back to `debug!`.
+    #[test]
+    fn parse_atlas_sql_response_string_version_still_parses() {
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": "v1",
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "x": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("c", response).expect("permissive on string version");
+        assert!(parsed.is_some());
+    }
+
+    /// Direct drive of `check_schema_version`. Coverage: i64, i32, f64-int,
+    /// f64-fractional, string. The function returns no value — we exercise
+    /// it to ensure none of the paths panic and the cargo build remains warn-clean.
+    #[test]
+    fn check_schema_version_handles_all_numeric_encodings() {
+        check_schema_version(&doc! { "version": 1_i64 }, "x");
+        check_schema_version(&doc! { "version": 99_i64 }, "x"); // mismatch warn path
+        check_schema_version(&doc! { "version": 1_i32 }, "x");
+        check_schema_version(&doc! { "version": 99_i32 }, "x"); // mismatch warn path
+        check_schema_version(&doc! { "version": 1.0_f64 }, "x");
+        check_schema_version(&doc! { "version": 1.5_f64 }, "x"); // unparseable
+        check_schema_version(&doc! { "version": "v1" }, "x"); // unparseable
+        check_schema_version(&doc! {}, "x"); // missing
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #4 — central URI-redaction routing
+    // -----------------------------------------------------------------
+
+    /// The listCollections error-message builder must route the inner
+    /// upstream Display string through `redact_uri_creds` before it lands in
+    /// the public `Error::SchemaInvalid { msg }`.
+    #[test]
+    fn list_collections_error_message_redacts_uri_creds() {
+        let e = build_list_collections_error_message(
+            "dev-convo-hub",
+            false,
+            "I/O error connecting to mongodb://alice:s3cret@host:27017/db",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(
+                    !msg.contains("alice"),
+                    "must redact username from inner: {msg}",
+                );
+                assert!(
+                    !msg.contains("s3cret"),
+                    "must redact password from inner: {msg}",
+                );
+                assert!(
+                    msg.contains("[REDACTED]"),
+                    "redaction marker must appear: {msg}",
+                );
+                assert!(msg.contains("dev-convo-hub"), "db name must survive: {msg}",);
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    /// Authentication branch on listCollections must NOT pull in any inner
+    /// message — that's the original cred-leak risk it was built to dodge.
+    #[test]
+    fn list_collections_error_authentication_message_is_constant() {
+        let e = build_list_collections_error_message(
+            "dev-convo-hub",
+            true,
+            "anything goes here including mongodb://alice:s3cret@host",
+        );
+        match e {
+            Error::AuthFailed { msg } => {
+                assert!(!msg.contains("alice"));
+                assert!(!msg.contains("s3cret"));
+                assert!(!msg.contains("mongodb://"));
+                assert_eq!(msg, "authentication handshake rejected by server");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    /// Defence-in-depth: even a non-13/non-59 command code routes its inner
+    /// Display string through the redactor.
+    #[test]
+    fn run_command_error_command_code_other_redacts_inner() {
+        let e = build_run_command_error_message(
+            "dev-convo-hub",
+            "calllogs",
+            RunCommandErrorClass::CommandCode(99_999),
+            "Command failed talking to mongodb://alice:s3cret@host:27017/db",
+        );
+        match e {
+            Error::SchemaInvalid { msg } => {
+                assert!(!msg.contains("alice"));
+                assert!(!msg.contains("s3cret"));
+                assert!(msg.contains("[REDACTED]"));
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
     }
 }
