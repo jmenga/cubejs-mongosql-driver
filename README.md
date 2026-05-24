@@ -423,6 +423,23 @@ The driver buffers query results into a JSON array before crossing the napi boun
 
 Streaming via `ThreadsafeFunction` is a planned post-MVP enhancement — see [SPEC §8](./SPEC.md#8-open-questions).
 
+### Large `IN (...)` lists — driver workaround for upstream mongosql BSON-depth bug
+
+`mongosql` v1.8.5 translates SQL `IN (v1, …, vN)` (and the equivalent `field = v1 OR field = v2 OR …`) into an aggregation pipeline that wraps the disjunction in a right-leaning chain of binary `$or`s at the Atlas SQL endpoint:
+
+```text
+{ $or: [LEAF, { $or: [LEAF, { $or: [LEAF, … ] }] }] }
+```
+
+For N ≥ ~100 values that chain exceeds MongoDB's maximum BSON nested-object depth (100), and the server rejects the aggregate with `Error code 15 (Overflow): BSONObj exceeds maximum nested object depth`. This bites real-world Cube queries with `equals` filters carrying hundreds of identifiers (e.g. `agent_id IN (160 ids)`).
+
+The driver applies a pure pipeline rewrite immediately after translation:
+
+1. **Flatten** any right-leaning `$or` chain into a single flat `$or` array (so the depth grows by 1, not N).
+2. **Collapse** the flat array to `$in` when every element is a `$eq` against the same field with literal scalars.
+
+Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. Upstream tracking: when `mongosql` ships its own fix this rewrite becomes a no-op (the walker is shape-agnostic and runs in linear time per pipeline node).
+
 ### `MONGOSQL_SCHEMA_NOT_FOUND`
 
 Usually one of:

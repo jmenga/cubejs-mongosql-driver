@@ -420,3 +420,148 @@ async fn atlas_sql_query_count_returns_row() {
     assert_eq!(ty, "bigint", "COUNT(*) classifies as bigint, got {ty}");
     client.close().await.expect("close");
 }
+
+// ---------------------------------------------------------------------------
+// Large IN-list — verifies pipeline_rewrite::flatten_or_chains_and_collapse_to_in
+// defeats MongoDB's max-BSON-nested-object-depth (100) limit for SQL `IN (v1,
+// ..., vN)` with N ≥ 100. Pre-fix the server rejected the query with
+// "Error code 15 (Overflow): BSONObj exceeds maximum nested object depth"
+// because mongosql translated IN to a right-leaning `$or` chain.
+//
+// Two harnesses:
+//  * atlas-local (always-on via docker-compose) — exercises the local
+//    fixture catalog with 200 string values. The local mongosql build
+//    happens to emit a flat `$or` already, so this test pins the
+//    end-to-end correctness path: the rewriter must NOT corrupt a valid
+//    query, and the server must accept the (now `$in`-collapsed) form.
+//  * atlas-sql (real Atlas SQL endpoint) — exercises the production
+//    failure mode where mongosql emits a right-leaning chain. Ignored by
+//    default; runs only when ATLAS_SQL_URI + ATLAS_SQL_DB are set.
+// ---------------------------------------------------------------------------
+
+/// Build a SQL string that selects rows by `account_id IN (v0..vN-1, "acct_a")`
+/// — the last value matches one of the seeded `acct_a`/`acct_b` accounts so
+/// the query has BOTH a non-trivial IN size AND a non-empty result set. The
+/// matched value is `acct_a` (per `tests/integration/fixtures/seed-data.js`).
+fn large_in_list_sql(coll: &str, n: usize) -> String {
+    let mut sql = format!("SELECT account_id FROM `{coll}` WHERE account_id IN (");
+    for i in 0..n {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("'v{i}'"));
+    }
+    // Last value matches a seeded account_id, so we get a non-empty result.
+    sql.push_str(", 'acct_a'");
+    sql.push(')');
+    sql
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn query_with_large_in_list_succeeds() {
+    // Pre-fix: 200 values would either bust BSON depth (on atlas-sql) or
+    // at minimum exercise an O(N)-deep pipeline. Post-fix: the rewriter
+    // produces a single `$in: ["$account_id", [v0..v199, 'acct_a']]`.
+    //
+    // The seed-data has 3 orders with `account_id = acct_a`, so the
+    // post-fix query must return exactly 3 rows. Pre-fix on Atlas SQL
+    // this would have failed with BSON depth overflow.
+    let client = MongoSqlClient::new(collection_mode_config());
+    client.test_connection(None).await.expect("test_connection");
+
+    let sql = large_in_list_sql("orders", 200);
+    let v = client.query(sql, None).await.expect("large IN query");
+    let obj = v.as_object().expect("object");
+    let rows = obj
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("rows array");
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected exactly 3 acct_a orders to match; got rows={:?}",
+        rows
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn query_with_large_in_list_against_atlas_sql() {
+    // Real failure mode: 200 values against an Atlas SQL endpoint.
+    // Pre-fix this would return MONGOSQL_QUERY_FAILED with a
+    // server-side BSON depth overflow (Error code 15) because mongosql
+    // emits the IN as a right-leaning binary-`$or` chain at the Atlas
+    // SQL endpoint. Post-fix the rewriter flattens the chain (and
+    // collapses to `$in` when safe), so the server accepts the query.
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri, db.clone()));
+    client.test_connection(None).await.expect("test_connection");
+
+    // Pick a collection dynamically (don't assume `orders` exists on
+    // the target Atlas SQL endpoint), and pick a string field from its
+    // schema dynamically so we don't depend on a particular field
+    // naming convention (`account_id` vs `accountId`).
+    let schema_v = client.tables_schema(None).await.expect("tables_schema");
+    let inner = schema_v
+        .as_object()
+        .and_then(|m| m.get(&db))
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("no collections in catalog under `{db}`"));
+    // Find the first (collection, string-typed field) pair we encounter.
+    let (coll, field) = inner
+        .iter()
+        .find_map(|(coll_name, cols_value)| {
+            let cols = cols_value.as_array()?;
+            let f = cols.iter().find_map(|c| {
+                let obj = c.as_object()?;
+                let name = obj.get("name").and_then(|v| v.as_str())?;
+                let ty = obj.get("type").and_then(|v| v.as_str())?;
+                // Skip `_id` so we don't get coerced into an
+                // ObjectId-vs-string type mismatch. Any other string
+                // column is fine — the rewriter is field-agnostic.
+                if name == "_id" {
+                    return None;
+                }
+                if ty == "string" || ty == "text" {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            })?;
+            Some((coll_name.clone(), f))
+        })
+        .unwrap_or_else(|| {
+            panic!("could not find a string-typed column in any collection under `{db}`");
+        });
+    eprintln!("[atlas-sql large-IN test] using collection=`{coll}`, field=`{field}`");
+
+    // Build SQL with 200 synthetic values. The query targets a real
+    // (collection, field) so the server's actual query path runs
+    // (i.e. translation + execution against real data). The synthetic
+    // values almost certainly don't match any rows; that's fine — the
+    // test asserts the query SUCCEEDS, not what it returns.
+    let mut sql = format!("SELECT COUNT(*) AS n FROM `{coll}` WHERE `{field}` IN (");
+    for i in 0..200 {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("'large_in_list_test_v{i}'"));
+    }
+    sql.push(')');
+    // The core assertion is that the query SUCCEEDS — pre-fix this
+    // would panic on the server-side BSON depth overflow. The row
+    // count is incidental (mongosql collapses an empty COUNT(*) to
+    // zero rows when there's no group key and no matches), and we
+    // explicitly do NOT assert on it.
+    let v = client
+        .query(sql, None)
+        .await
+        .expect("large IN query against atlas-sql must not overflow BSON depth");
+    let obj = v.as_object().expect("object");
+    // We just check the response is well-formed.
+    assert!(obj.contains_key("rows"));
+    assert!(obj.contains_key("types"));
+    client.close().await.expect("close");
+}

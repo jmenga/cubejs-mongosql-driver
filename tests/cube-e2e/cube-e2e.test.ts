@@ -359,6 +359,55 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(byCategory.usage.total).toBeCloseTo(225.49, 2);
   });
 
+  // ---------------------------------------------------------------------------
+  // Large-IN-list workaround — Cube /load with 200 `equals` values.
+  //
+  // Pre-fix: a Cube query whose `filter: { equals: [v1..vN] }` translates
+  // to SQL `IN (v1..vN)` would bust MongoDB's max BSON nested-object
+  // depth (100) for N ≥ ~100 — the Atlas SQL endpoint emitted a
+  // right-leaning binary-`$or` chain, and the server rejected the
+  // aggregate with `Error code 15 (Overflow)`. Post-fix the driver's
+  // pipeline_rewrite pass flattens the chain and collapses to `$in`, so
+  // the server accepts the query.
+  //
+  // The atlas-local image happens to emit a flat `$or` already at
+  // v1.8.5, so the cube-e2e (which runs against atlas-local) pins the
+  // end-to-end correctness path: the rewrite must NOT corrupt a valid
+  // query, and the server must accept the (now `$in`-collapsed) form.
+  // ---------------------------------------------------------------------------
+  it('large IN list — Cube /load with 200 equals values returns rows, not BSON depth overflow', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 200; i++) values.push(`synthetic_v${i}`);
+    // Append a real seeded `acct_a` value so the query has both
+    // a non-trivial IN size AND a non-empty result set.
+    values.push('acct_a');
+
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.accountId'],
+        filters: [
+          {
+            member: 'orders.accountId',
+            operator: 'equals',
+            values,
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    // The seed has 3 acct_a orders, so the count must be 3 when grouped
+    // by accountId. Synthetic values match nothing. The important
+    // assertion is that the query SUCCEEDED — pre-fix it would have
+    // failed with the server-side BSON depth overflow.
+    expect(body.data.length).toBe(1);
+    expect(body.data[0]?.['orders.accountId']).toBe('acct_a');
+    expect(Number(body.data[0]?.['orders.count'])).toBe(3);
+  });
+
   it('dimension query — count grouped by status (T19a regression test)', async () => {
     // Pre-T19a fix: this query failed with mongosql Error 3008 because
     // BaseQuery emitted `\`orders\`.status` in the SELECT projection.

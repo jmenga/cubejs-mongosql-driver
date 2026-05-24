@@ -69,6 +69,7 @@ Two arrows from Rust to the cluster: data queries (MQL) and schema reads — bot
 | `client.rs` | `MongoSqlClient` impl — orchestrates schema, translation, execution | no (internal) |
 | `schema.rs` | `SchemaSource` enum, `SchemaCache`, refresh task | no |
 | `translate.rs` | Wraps `mongosql` crate; converts errors | no |
+| `pipeline_rewrite.rs` | Post-translation BSON rewriter — flattens right-leaning `$or` chains and collapses same-field `$eq` disjunctions to `$in` (defeats MongoDB's max-BSON-nested-object-depth limit on large `IN` lists) | no |
 | `execute.rs` | Wraps `mongodb` crate; cursor draining; BSON → JSON marshaling | no |
 | `error.rs` | `Error` type, `From` impls, error-code mapping | no |
 | `config.rs` | `ClientConfig` struct + validation | yes (as napi object) |
@@ -298,6 +299,17 @@ Rust MongoSqlClient::query(sql)
   │        &catalog,
   │        SqlOptions::default(),
   │      )?
+  │
+  ├─ // Post-translation pipeline rewrite (pure, CPU-only). Walks every
+  │   // BSON node in the pipeline and:
+  │   //   1. flattens right-leaning `$or` chains to a flat $or array,
+  │   //   2. collapses same-field `$eq` disjunctions to `$in`.
+  │   // Defends against mongosql v1.8.5's right-leaning `$or` chain for
+  │   // SQL `IN (v1..vN)` at the Atlas SQL endpoint, which busts
+  │   // MongoDB's max BSON nested-object depth (100) for N ≥ ~100.
+  │   // See `crates/native/src/pipeline_rewrite.rs` and the README
+  │   // "Large `IN (...)` lists" troubleshooting section.
+  │   pipeline_rewrite::flatten_or_chains_and_collapse_to_in(&mut pipeline);
   │
   ├─ db = self.mongo_client.database(&target_db)
   ├─ // pipeline is bson::Bson — convert to Vec<Document> for mongodb crate

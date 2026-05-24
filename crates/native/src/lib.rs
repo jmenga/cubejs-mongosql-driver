@@ -24,6 +24,7 @@ pub mod cancel;
 pub mod config;
 pub mod error;
 pub mod execute;
+pub mod pipeline_rewrite;
 pub mod schema;
 pub mod translate;
 

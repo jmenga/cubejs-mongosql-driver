@@ -128,7 +128,13 @@ pub fn translate(sql: &str, schema: &MongoSqlCatalog, default_db: &str) -> Resul
     )
     .map_err(|err| translate_error(sql, &err))?;
 
-    let pipeline = unwrap_pipeline(upstream.pipeline)?;
+    let mut pipeline = unwrap_pipeline(upstream.pipeline)?;
+    // Post-translation rewrite: flatten right-leaning `$or` chains and
+    // collapse same-field `$eq` disjunctions to `$in`. Defends against
+    // mongosql v1.8.5's `IN (v1, ..., vN)` → right-leaning binary-`$or`
+    // chain that overflows MongoDB's max BSON nesting depth (100) when
+    // N is large. See `pipeline_rewrite` module docs.
+    crate::pipeline_rewrite::flatten_or_chains_and_collapse_to_in(&mut pipeline);
 
     Ok(Translation {
         target_db: upstream.target_db,
