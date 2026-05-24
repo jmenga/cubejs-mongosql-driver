@@ -166,7 +166,7 @@ These are not URI params — they control the driver layer itself.
 | ------------------------------------ | -------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
 | `CUBEJS_DB_QUERY_TIMEOUT`            | no                   | `10m`        | Per-query timeout (drives the aggregation pipeline's `maxTimeMS`). Accepts duration strings or bare ms; wins over the legacy var below |
 | `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS`   | no                   | `60000`      | Legacy bare-ms timeout; still honoured when `CUBEJS_DB_QUERY_TIMEOUT` is unset                                                |
-| `CUBEJS_MONGOSQL_SCHEMA_SOURCE`      | no                   | `collection` | `collection` or `file`                                                                                                        |
+| `CUBEJS_MONGOSQL_SCHEMA_SOURCE`      | no                   | `collection` | `collection`, `file`, or `atlas-sql` (required for Atlas SQL endpoints — see [Schema management](#schema-management))         |
 | `CUBEJS_MONGOSQL_SCHEMA_FILE`        | yes if `SOURCE=file` | —            | Path to YAML/JSON schema file                                                                                                 |
 | `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no                   | `300`        | Background schema-refresh interval in seconds                                                                                 |
 | `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN`   | no                   | `false`      | If `true`, `testConnection()` does not fail on initial schema-load failure (cache stays empty until next refresh)             |
@@ -218,12 +218,13 @@ CUBEJS_MONGOSQL_SCHEMA_FILE=/path/to/mongo-schema.yaml
 
 ## Schema management
 
-`mongosql` translates SQL by consulting a JSON-Schema-shaped catalog of your collections. The driver loads that catalog from one of two sources, selected by `CUBEJS_MONGOSQL_SCHEMA_SOURCE`:
+`mongosql` translates SQL by consulting a JSON-Schema-shaped catalog of your collections. The driver loads that catalog from one of three sources, selected by `CUBEJS_MONGOSQL_SCHEMA_SOURCE`:
 
-| Mode                   | Source                                             | Use case                                                          |
-| ---------------------- | -------------------------------------------------- | ----------------------------------------------------------------- |
-| `collection` (default) | `__sql_schemas` collection in `CUBEJS_DB_NAME`     | Production (Atlas SQL Interface or EA Schema Builder maintain it) |
-| `file`                 | YAML or JSON file at `CUBEJS_MONGOSQL_SCHEMA_FILE` | Local dev, schema-as-code, EA without Schema Builder, edge cases  |
+| Mode                   | Source                                                      | Use case                                                                                                |
+| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `collection` (default) | `__sql_schemas` collection in `CUBEJS_DB_NAME`              | Production (Atlas SQL Interface or EA Schema Builder maintain it)                                       |
+| `file`                 | YAML or JSON file at `CUBEJS_MONGOSQL_SCHEMA_FILE`          | Local dev, schema-as-code, EA without Schema Builder, edge cases                                        |
+| `atlas-sql`            | `sqlGetSchema` admin command per collection in the database | Atlas SQL endpoints (`*.a.query.mongodb.net`) — schemas live in an internal store, not as a collection  |
 
 The driver loads schema once on `testConnection()` (fail-closed by default; toggle with `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN=true`), caches it under an `Arc<RwLock<Catalog>>`, refreshes it every `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` seconds, and atomically swaps cache contents on each successful refresh. Refresh failures log a warning and keep serving cached schema; queries never block on schema I/O.
 
@@ -266,6 +267,30 @@ schema:
 ```
 
 > **Limitation (T05/T09 discovery):** file-mode envelopes carry no database name. Internally the loader keys collections under an empty-string placeholder; the napi surface re-keys translation results to `CUBEJS_DB_NAME` so the executor targets the right database. The user-visible behaviour is identical to collection mode — but if you're authoring tooling that introspects the catalog, be aware of the asymmetry. See [`examples/local-dev/`](./examples/local-dev/) for a working file-mode setup.
+
+### Atlas SQL mode (required for `*.a.query.mongodb.net` endpoints)
+
+Atlas SQL endpoints — the dedicated SQL fronts Atlas provisions for the SQL Interface, with hostnames of the form `<cluster>-<id>.a.query.mongodb.net` — do NOT expose `__sql_schemas` as a queryable collection. Schemas live in an internal store and are reachable only via the `sqlGetSchema` admin-style command. Collection-mode discovery fails on these endpoints because the document `db.<dbname>.__sql_schemas.find()` returns nothing even though the schemas exist.
+
+Set `CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql` for these endpoints:
+
+```bash
+CUBEJS_DB_TYPE=mongosql
+CUBEJS_DB_URI='mongodb://USER:PASS@atlas-sql-685d57005fe09d047b8f2d31-zlj67.a.query.mongodb.net/?ssl=true&authSource=admin&appName=cube'
+CUBEJS_DB_NAME=dev-convo-hub
+CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql
+```
+
+In this mode the driver:
+
+1. Calls `listCollections` on `CUBEJS_DB_NAME` to enumerate candidate collections.
+2. Filters out `system.*` collections and `__sql_schemas`.
+3. Runs `sqlGetSchema` per remaining collection. Empty-schema responses (`{ok: 1, metadata: {}, schema: {}}`) — the canonical "no schema set for this name" shape — are SKIPPED, not errored. Populated responses (`{ok: 1, metadata: {description}, schema: {version, jsonSchema}}`) are added to the catalog.
+4. Re-runs the same enumeration on the `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` cadence (default 300 s) so Atlas-driven schema updates surface without a driver restart.
+
+Canonical command spec: <https://www.mongodb.com/docs/sql-interface/schema/view/>. There is no `sqlListSchemas` command — enumeration is `listCollections` + per-collection `sqlGetSchema`, which is what the driver does.
+
+If `sqlGetSchema` fails (e.g. the endpoint is not actually Atlas SQL), the driver raises `MONGOSQL_SCHEMA_INVALID` with a clear hint about the mode requirement. Use collection mode for regular clusters where you seed `__sql_schemas` yourself.
 
 ## Pre-aggregations
 

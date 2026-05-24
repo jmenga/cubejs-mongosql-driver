@@ -102,6 +102,22 @@ describe('MongoSqlClient — constructor', () => {
     installMockNative();
     expect(() => new MongoSqlClient({ uri: 'mongodb://h/db', database: 'db' })).not.toThrow();
   });
+
+  it('passes the atlas-sql schemaSource through to the native module verbatim', () => {
+    // atlas-sql is a tag-only discriminator (no `path`). The wrapper must
+    // marshal it across the napi-rs boundary unchanged; the Rust side then
+    // routes the load through `load_from_atlas_sql_with_columns` instead
+    // of the collection path. A regression that drops the discriminator
+    // here would silently fall back to collection mode.
+    installMockNative();
+    new MongoSqlClient({
+      uri: 'mongodb+srv://atlas-sql-xxx.a.query.mongodb.net/?ssl=true',
+      database: 'dev-convo-hub',
+      schemaSource: { kind: 'atlas-sql' },
+    });
+    expect(lastClient).toBeDefined();
+    expect((lastClient!.config as { schemaSource: unknown }).schemaSource).toEqual({ kind: 'atlas-sql' });
+  });
 });
 
 describe('MongoSqlClient — error normalization', () => {

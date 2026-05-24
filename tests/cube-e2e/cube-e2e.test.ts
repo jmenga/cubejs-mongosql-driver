@@ -380,3 +380,121 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(byStatus.refunded).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Atlas SQL endpoint — separate cube container, overlay compose.
+//
+// Gated on `ATLAS_SQL_URI` + `ATLAS_SQL_DB`. The overlay compose file
+// (`examples/docker/docker-compose.atlas-sql.yaml`) starts a SECOND
+// cube container on port 4001 pointed at the real Atlas SQL endpoint
+// (`*.a.query.mongodb.net`) with `CUBEJS_MONGOSQL_SCHEMA_SOURCE=atlas-sql`.
+//
+// The test brings the overlay up and tears it down itself (the global
+// setup already built the cube docker image we reuse here). Cube model:
+// `examples/docker/cube/model-atlas-sql/calllogs.js` over the real
+// `calllogs` collection on `dev-convo-hub` — chosen because its schema
+// is verified-populated on the Atlas SQL endpoint (see
+// `crates/native/src/schema.rs` module docs for the canonical
+// `sqlGetSchema` spec).
+//
+// Without `ATLAS_SQL_URI` the whole block skips — useful for local CI
+// runs that don't have network egress to the Atlas cloud.
+// ---------------------------------------------------------------------------
+const ATLAS_SQL_URI = process.env.ATLAS_SQL_URI;
+const ATLAS_SQL_DB = process.env.ATLAS_SQL_DB ?? 'dev-convo-hub';
+const ATLAS_SQL_CUBE_URL = 'http://localhost:4001';
+const ATLAS_SQL_META_ENDPOINT = `${ATLAS_SQL_CUBE_URL}/cubejs-api/v1/meta`;
+const ATLAS_SQL_LOAD_ENDPOINT = `${ATLAS_SQL_CUBE_URL}/cubejs-api/v1/load`;
+const ATLAS_SQL_COMPOSE_FILE = 'examples/docker/docker-compose.atlas-sql.yaml';
+
+async function waitForOverlayReadyz(maxSeconds = 180): Promise<void> {
+  const deadline = Date.now() + maxSeconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${ATLAS_SQL_CUBE_URL}/readyz`);
+      if (res.ok) return;
+    } catch {
+      // not yet listening
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`atlas-sql cube /readyz did not return 200 within ${maxSeconds}s`);
+}
+
+async function atlasSqlLoadQuery(body: object, attempt = 1): Promise<CubeLoadResponse> {
+  const res = await fetch(ATLAS_SQL_LOAD_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: AUTH_HEADER,
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.ok) {
+    const json = (await res.json()) as CubeLoadResponse | { error: string };
+    if ('error' in json && typeof json.error === 'string' && /continue wait/i.test(json.error)) {
+      if (attempt > 30) {
+        throw new Error(`atlas-sql cube returned "Continue wait" 30 times — aborting`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      return atlasSqlLoadQuery(body, attempt + 1);
+    }
+    return json as CubeLoadResponse;
+  }
+  const text = await res.text();
+  throw new Error(`atlas-sql cube load failed: HTTP ${res.status} — ${text}`);
+}
+
+describe.runIf(!!ATLAS_SQL_URI)('Cube E2E — atlas-sql schema source against real endpoint', () => {
+  beforeAll(async () => {
+    // Bring up the overlay cube container. Image already built by the
+    // outer global setup (the overlay reuses
+    // `mongosql-cubejs-driver-e2e:latest`).
+    execSync(`docker compose -f ${ATLAS_SQL_COMPOSE_FILE} up -d`, {
+      stdio: 'inherit',
+      env: { ...process.env, ATLAS_SQL_URI: ATLAS_SQL_URI!, ATLAS_SQL_DB },
+    });
+    await waitForOverlayReadyz();
+  }, 240_000);
+
+  afterAll(() => {
+    try {
+      execSync(`docker compose -f ${ATLAS_SQL_COMPOSE_FILE} down`, {
+        stdio: 'inherit',
+        env: { ...process.env, ATLAS_SQL_URI: ATLAS_SQL_URI!, ATLAS_SQL_DB },
+      });
+    } catch (err) {
+      console.error('atlas-sql cube teardown error (ignored):', err);
+    }
+  });
+
+  it('/meta lists the calllogs cube discovered via atlas-sql schema source', async () => {
+    const res = await fetch(ATLAS_SQL_META_ENDPOINT, {
+      headers: { Authorization: AUTH_HEADER },
+    });
+    expect(res.ok, `cube /meta returned ${res.status}`).toBe(true);
+    const meta = (await res.json()) as CubeMetaResponse;
+    const names = meta.cubes.map((c) => c.name);
+    // The cube model (model-atlas-sql/calllogs.js) defines a single
+    // `calllogs` cube. Cube can only compile it if `tablesSchema()`
+    // produces an entry for `calllogs` — which exclusively happens via
+    // the atlas-sql code path on this endpoint (no `__sql_schemas`
+    // collection exists).
+    expect(names).toContain('calllogs');
+  });
+
+  it('count query — calllogs.count runs end-to-end through Cube + atlas-sql', async () => {
+    const body = await atlasSqlLoadQuery({
+      query: { measures: ['calllogs.count'] },
+    });
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    expect(body.data.length).toBe(1);
+    const count = Number(body.data[0]?.['calllogs.count']);
+    // Endpoint has live data; we don't pin the exact count, only that
+    // a real bigint > 0 surfaced through the atlas-sql column-type path.
+    expect(Number.isFinite(count)).toBe(true);
+    expect(count).toBeGreaterThan(0);
+  });
+});

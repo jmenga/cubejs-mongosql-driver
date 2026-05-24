@@ -16,14 +16,16 @@ pub const DEFAULT_QUERY_TIMEOUT_MS: u32 = 60_000;
 /// Default row cap for buffered results (SPEC NFR-1, FR-7).
 pub const DEFAULT_MAX_ROWS: u32 = 100_000;
 
-/// Schema source — Collection mode or File mode.
+/// Schema source — Collection mode, File mode, or Atlas SQL mode.
 ///
 /// Wire shape across napi-rs is a tagged object. `kind` is one of
-/// `"collection"` or `"file"`; `path` is required for `"file"`.
+/// `"collection"`, `"file"`, or `"atlas-sql"`; `path` is required for
+/// `"file"`. See `schema.rs` module docs for the per-mode loading
+/// strategy.
 #[napi(object)]
 #[derive(Clone)]
 pub struct SchemaSource {
-    /// Discriminant: `"collection"` or `"file"`.
+    /// Discriminant: `"collection"`, `"file"`, or `"atlas-sql"`.
     pub kind: String,
     /// Path to schema file (file mode only).
     pub path: Option<String>,
@@ -109,7 +111,7 @@ impl ClientConfig {
 
         if let Some(src) = &self.schema_source {
             match src.kind.as_str() {
-                "collection" => {}
+                "collection" | "atlas-sql" => {}
                 "file" => match &src.path {
                     Some(p) if !p.trim().is_empty() => {}
                     _ => {
@@ -122,7 +124,9 @@ impl ClientConfig {
                 other => {
                     return Err(Error::ConfigInvalid {
                         field: "schema_source.kind",
-                        reason: format!("must be \"collection\" or \"file\"; got \"{other}\""),
+                        reason: format!(
+                            "must be \"collection\", \"file\", or \"atlas-sql\"; got \"{other}\""
+                        ),
                     });
                 }
             }
@@ -310,11 +314,56 @@ mod tests {
             path: None,
         });
         match c.validate() {
-            Err(Error::ConfigInvalid { field, .. }) => {
-                assert_eq!(field, "schema_source.kind")
+            Err(Error::ConfigInvalid { field, reason }) => {
+                assert_eq!(field, "schema_source.kind");
+                // Error message must enumerate all three valid modes so
+                // operators can self-correct without consulting docs.
+                assert!(reason.contains("collection"), "reason: {reason}");
+                assert!(reason.contains("file"), "reason: {reason}");
+                assert!(reason.contains("atlas-sql"), "reason: {reason}");
             }
             other => panic!("expected ConfigInvalid(schema_source.kind), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_accepts_atlas_sql_schema_source() {
+        let mut c = valid_config();
+        c.schema_source = Some(SchemaSource {
+            kind: "atlas-sql".to_string(),
+            path: None,
+        });
+        c.validate().expect("atlas-sql is a valid kind");
+    }
+
+    #[test]
+    fn validate_accepts_atlas_sql_with_ignored_path() {
+        // atlas-sql does NOT require `path`; defensive policy is to ignore
+        // a stray path rather than reject it (mirrors collection mode).
+        let mut c = valid_config();
+        c.schema_source = Some(SchemaSource {
+            kind: "atlas-sql".to_string(),
+            path: Some("/tmp/ignored.yaml".to_string()),
+        });
+        c.validate().expect("atlas-sql + spurious path still valid");
+    }
+
+    #[test]
+    fn with_defaults_applied_preserves_atlas_sql_kind() {
+        let c = ClientConfig {
+            uri: "mongodb://host/db".to_string(),
+            database: "db".to_string(),
+            schema_source: Some(SchemaSource {
+                kind: "atlas-sql".to_string(),
+                path: None,
+            }),
+            schema_refresh_sec: None,
+            schema_fail_open: None,
+            query_timeout_ms: None,
+            max_rows: None,
+        }
+        .with_defaults_applied();
+        assert_eq!(c.schema_source_kind(), "atlas-sql");
     }
 
     #[test]

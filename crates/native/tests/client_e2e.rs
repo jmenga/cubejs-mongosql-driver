@@ -283,3 +283,140 @@ async fn query_respects_max_rows_cap() {
     );
     client.close().await.expect("close");
 }
+
+// ---------------------------------------------------------------------------
+// Atlas SQL — real endpoint integration tests.
+//
+// Atlas SQL endpoints (`*.a.query.mongodb.net`) do NOT expose `__sql_schemas`
+// as a queryable collection. The driver's `atlas-sql` mode discovers schemas
+// via the `sqlGetSchema` admin-style command per Atlas documentation:
+// https://www.mongodb.com/docs/sql-interface/schema/view/
+//
+// These tests run only when explicitly enabled. To run:
+//
+// ```
+// ATLAS_SQL_URI="mongodb://USER:PASS@<endpoint>.a.query.mongodb.net/?ssl=true&authSource=admin" \
+// ATLAS_SQL_DB="dev-convo-hub" \
+// cargo test --release --test client_e2e -- --ignored atlas_sql
+// ```
+//
+// Without the env vars the tests skip via `expect_atlas_sql_env()` (panics
+// with a clear message under `--ignored`), so they never run accidentally
+// during ordinary local development.
+// ---------------------------------------------------------------------------
+
+fn expect_atlas_sql_env() -> (String, String) {
+    let uri = env::var("ATLAS_SQL_URI").unwrap_or_else(|_| {
+        panic!(
+            "atlas-sql integration tests require ATLAS_SQL_URI \
+             (e.g. mongodb://USER:PASS@<endpoint>.a.query.mongodb.net/\
+             ?ssl=true&authSource=admin)"
+        )
+    });
+    let db = env::var("ATLAS_SQL_DB")
+        .unwrap_or_else(|_| panic!("atlas-sql integration tests require ATLAS_SQL_DB"));
+    (uri, db)
+}
+
+fn atlas_sql_mode_config(uri: String, db: String) -> ClientConfig {
+    ClientConfig {
+        uri,
+        database: db,
+        schema_source: Some(SchemaSource {
+            kind: "atlas-sql".to_string(),
+            path: None,
+        }),
+        schema_refresh_sec: Some(3600),
+        schema_fail_open: Some(false),
+        // Atlas SQL endpoints can be slower than atlas-local on cold paths
+        // (TLS handshake + cloud round-trips); give the test a higher
+        // budget than the collection-mode default.
+        query_timeout_ms: Some(30_000),
+        max_rows: Some(10_000),
+    }
+}
+
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn atlas_sql_test_connection_succeeds_against_real_endpoint() {
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri, db));
+    client
+        .test_connection(None)
+        .await
+        .expect("atlas-sql test_connection should succeed");
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn atlas_sql_tables_schema_returns_collections_with_schemas() {
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri, db.clone()));
+    client.test_connection(None).await.expect("test_connection");
+
+    let v = client.tables_schema(None).await.expect("tables_schema");
+    let top = v.as_object().expect("top object");
+    let inner = top
+        .get(&db)
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("missing db key `{db}` in tables_schema output: {top:?}"));
+    assert!(
+        !inner.is_empty(),
+        "expected at least one collection with a schema under `{db}`; got empty",
+    );
+
+    // Every entry must carry the standard `{name, type, attributes}` shape.
+    for (coll_name, cols_value) in inner {
+        let cols = cols_value
+            .as_array()
+            .unwrap_or_else(|| panic!("`{coll_name}` cols must be an array"));
+        for c in cols {
+            let obj = c.as_object().expect("column object");
+            assert!(obj.get("name").and_then(|v| v.as_str()).is_some());
+            assert!(obj.get("type").and_then(|v| v.as_str()).is_some());
+        }
+    }
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn atlas_sql_query_count_returns_row() {
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri, db.clone()));
+    client.test_connection(None).await.expect("test_connection");
+
+    // Pick the first collection in the catalog dynamically so the test
+    // is portable across endpoints (don't hard-code `calllogs`).
+    let schema_v = client.tables_schema(None).await.expect("tables_schema");
+    let coll = schema_v
+        .as_object()
+        .and_then(|m| m.get(&db))
+        .and_then(|v| v.as_object())
+        .and_then(|inner| inner.keys().next())
+        .unwrap_or_else(|| panic!("no collections in catalog under `{db}`"))
+        .clone();
+
+    let sql = format!("SELECT COUNT(*) AS n FROM `{coll}`");
+    let v = client.query(sql, None).await.expect("count query");
+
+    let obj = v.as_object().expect("query result is JSON object");
+    let rows = obj
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("rows array");
+    assert!(!rows.is_empty(), "COUNT(*) should return one aggregate row");
+
+    let types = obj
+        .get("types")
+        .and_then(|t| t.as_array())
+        .expect("types array");
+    assert_eq!(types.len(), 1, "single aggregate projection");
+    let ty = types[0]
+        .get("type")
+        .and_then(|v| v.as_str())
+        .expect("type string");
+    assert_eq!(ty, "bigint", "COUNT(*) classifies as bigint, got {ty}");
+    client.close().await.expect("close");
+}

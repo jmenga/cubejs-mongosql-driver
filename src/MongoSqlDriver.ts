@@ -92,7 +92,7 @@ import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
  *     - `CUBEJS_DB_IDLE_TIMEOUT` — `maxIdleTimeMS` (duration string or ms)
  *
  *   MongoDB-specific (`CUBEJS_MONGOSQL_*`):
- *     - `_SCHEMA_SOURCE` — `collection` (default) or `file`
+ *     - `_SCHEMA_SOURCE` — `collection` (default), `file`, or `atlas-sql`
  *     - `_SCHEMA_FILE` — path (required if `_SCHEMA_SOURCE=file`)
  *     - `_SCHEMA_REFRESH_SEC` — background refresh cadence in seconds
  *     - `_SCHEMA_FAIL_OPEN` — `true` to soft-fail initial schema load
@@ -524,7 +524,13 @@ function schemaSourceFromEnv(env: EnvLike): SchemaSource | undefined {
     }
     return { kind: 'file', path };
   }
-  throw configInvalid(`CUBEJS_MONGOSQL_SCHEMA_SOURCE must be 'collection' or 'file' (got '${kind}')`);
+  // Atlas SQL endpoints (`*.a.query.mongodb.net`) do not expose
+  // `__sql_schemas` as a queryable collection — schemas live in an
+  // internal store reachable only via the `sqlGetSchema` admin command.
+  // See https://www.mongodb.com/docs/sql-interface/schema/view/ and
+  // `crates/native/src/schema.rs` module docs.
+  if (kind === 'atlas-sql') return { kind: 'atlas-sql' };
+  throw configInvalid(`CUBEJS_MONGOSQL_SCHEMA_SOURCE must be 'collection', 'file', or 'atlas-sql' (got '${kind}')`);
 }
 
 function numEnv(v: string | undefined): number | undefined {

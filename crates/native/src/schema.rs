@@ -1,10 +1,12 @@
 //! Schema loader and cache. See ARCHITECTURE.md §3 and SPEC.md §5.3.
 //!
-//! T04 implements Collection-mode loading. T05 adds File-mode loading. T06
-//! will wire the refresh task. The cache type lives here so T06 can land
-//! additively without a redesign.
+//! Three schema-source modes are supported. Each produces the same
+//! [`LoadedSchema`] shape (a [`MongoSqlCatalog`] plus a parallel [`TableColumns`]
+//! map keyed by `(db, collection)`), and all three are routed through the
+//! same `build_loaded_schema` helper so the catalog and column descriptors
+//! are derived from a single source map and cannot drift.
 //!
-//! ## Collection-mode envelope
+//! ## Collection mode — `__sql_schemas`
 //!
 //! The `__sql_schemas` collection holds one document per collection in the
 //! database, shaped like:
@@ -23,7 +25,7 @@
 //! with the field-level `properties`). The version field is currently always
 //! 1; we accept it permissively but warn on mismatch (see `SUPPORTED_SCHEMA_VERSION`).
 //!
-//! ## File-mode envelope
+//! ## File mode — YAML / JSON on disk
 //!
 //! YAML or JSON, single document, top-level `schema.jsonSchema.properties` map
 //! whose keys are *collection names* and values are per-collection JSON
@@ -46,6 +48,44 @@
 //! placeholder as `current_db` to `mongosql::translate_sql` for file-mode
 //! callers, or rebuild the catalog under the configured database name before
 //! caching. See Discoveries 2026-05-09 — T05.
+//!
+//! ## Atlas SQL mode — `sqlGetSchema` command
+//!
+//! Atlas SQL endpoints (`<cluster>-<id>.a.query.mongodb.net`) do NOT expose
+//! `__sql_schemas` as a queryable collection. Schemas live in an internal
+//! store fronted by the `sqlGetSchema` admin-style command. Per the canonical
+//! spec at <https://www.mongodb.com/docs/sql-interface/schema/view/>:
+//!
+//! Request (run against the *target* database, not `admin`):
+//!
+//! ```json
+//! { "sqlGetSchema": "<collection-or-view-name>" }
+//! ```
+//!
+//! Response shape when a schema exists:
+//!
+//! ```json
+//! {
+//!   "ok": 1,
+//!   "metadata": { "description": "<text>" },
+//!   "schema":   { "version": 1, "jsonSchema": { ... } }
+//! }
+//! ```
+//!
+//! Response shape when no schema exists:
+//!
+//! ```json
+//! { "ok": 1, "metadata": {}, "schema": {} }
+//! ```
+//!
+//! `ok: 1` does NOT imply a schema was found — an empty `schema` object means
+//! "no schema for this name" and that collection is skipped (not errored).
+//!
+//! There is NO `sqlListSchemas` command. Enumeration is `listCollections`
+//! plus a per-collection `sqlGetSchema`. System collections (anything matching
+//! the `system.*` prefix) and `__sql_schemas` itself are filtered out before
+//! we call `sqlGetSchema` — they never carry catalog-relevant schemas and
+//! would just generate noise.
 //!
 //! ## Trust boundary
 //!
@@ -274,6 +314,32 @@ pub fn load_from_file_with_columns(path: &std::path::Path) -> Result<LoadedSchem
     build_loaded_schema(by_db)
 }
 
+/// Atlas-SQL-mode loader. Enumerates collections in `db_name`, filters out
+/// system collections + `__sql_schemas`, then issues `sqlGetSchema` per
+/// remaining name. Collections whose response has an empty `schema` object
+/// are SKIPPED (not errored) — per the canonical Atlas SQL docs an empty
+/// schema body means "no schema set for this name", which is a normal state.
+///
+/// The catalog is keyed under `db_name` (same as Collection mode); no
+/// placeholder rewriting is needed downstream.
+///
+/// Errors surface as [`Error::SchemaInvalid`] when:
+/// - `listCollections` succeeds but `sqlGetSchema` returns an explicit
+///   error document (the canonical "command not recognised" case for a
+///   non-Atlas-SQL endpoint mistakenly configured in this mode);
+/// - any non-empty schema fails to parse.
+///
+/// An empty database (`listCollections` returns nothing) is NOT an error —
+/// it yields an empty catalog and the periodic refresh task will pick up
+/// any later additions.
+pub async fn load_from_atlas_sql_with_columns(
+    client: &mongodb::Client,
+    db_name: &str,
+) -> Result<LoadedSchema> {
+    let by_db = collect_atlas_sql_docs(client, db_name).await?;
+    build_loaded_schema(by_db)
+}
+
 /// Read `__sql_schemas` from `db_name` and produce the same
 /// `BTreeMap<db, BTreeMap<coll, Schema>>` shape `load_from_collection`
 /// builds internally. Factored out so `load_from_collection_with_columns`
@@ -311,6 +377,193 @@ async fn collect_collection_docs(
     let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
     by_db.insert(db_name.to_string(), by_collection);
     Ok(by_db)
+}
+
+/// Atlas-SQL-mode I/O: enumerate user collections in `db_name` and call
+/// `sqlGetSchema` per name. Returns the same `BTreeMap<db, BTreeMap<coll, Schema>>`
+/// shape `collect_collection_docs` builds so the rest of the pipeline is
+/// identical.
+///
+/// Filters applied BEFORE calling `sqlGetSchema`:
+/// - any name starting with `system.` (e.g. `system.views`, `system.profile`);
+/// - `__sql_schemas` itself (it never has its own `sqlGetSchema` entry).
+///
+/// `sqlGetSchema` is then called per remaining collection. Responses are
+/// fed into [`parse_atlas_sql_response`], a pure function over `bson::Document`
+/// that returns `Option<(name, schema)>` — `None` means "skip this collection
+/// (no schema available)", which is the canonical empty-`schema`-object case.
+async fn collect_atlas_sql_docs(
+    client: &mongodb::Client,
+    db_name: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, JsonSchema>>> {
+    if db_name.trim().is_empty() {
+        return Err(Error::ConfigInvalid {
+            field: "database",
+            reason: "empty".to_string(),
+        });
+    }
+
+    let database = client.database(db_name);
+    let names = database
+        .list_collection_names()
+        .await
+        .map_err(|e| match e.kind.as_ref() {
+            mongodb::error::ErrorKind::Authentication { .. } => Error::AuthFailed {
+                msg: "authentication handshake rejected by server".to_string(),
+            },
+            _ => Error::SchemaInvalid {
+                msg: format!("listCollections failed on database `{db_name}`: {}", e.kind),
+            },
+        })?;
+
+    let mut by_collection: BTreeMap<String, JsonSchema> = BTreeMap::new();
+    for name in names {
+        if is_system_or_internal_collection(&name) {
+            continue;
+        }
+        let cmd = doc! {"sqlGetSchema": &name};
+        let response = database
+            .run_command(cmd)
+            .await
+            .map_err(|e| Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{db_name}.{name}` failed: {} \
+                     — atlas-sql mode requires an Atlas SQL endpoint \
+                     (sqlGetSchema is not supported by general-purpose MongoDB endpoints)",
+                    e.kind
+                ),
+            })?;
+
+        match parse_atlas_sql_response(&name, response)? {
+            Some((coll_name, schema)) => {
+                by_collection.insert(coll_name, schema);
+            }
+            None => {
+                // Empty-schema response — collection has no Atlas SQL schema set.
+                tracing::debug!(
+                    target: "mongosql_driver::schema",
+                    db = db_name,
+                    collection = name.as_str(),
+                    "sqlGetSchema returned an empty schema document; skipping collection",
+                );
+            }
+        }
+    }
+
+    let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+    by_db.insert(db_name.to_string(), by_collection);
+    Ok(by_db)
+}
+
+/// Returns `true` for collection names that must be excluded from
+/// `sqlGetSchema` enumeration: anything matching the MongoDB `system.*`
+/// reserved prefix, and the `__sql_schemas` collection itself (Atlas SQL
+/// stores its catalog out-of-band so this name is meaningless here, but
+/// some clusters carry a stale copy).
+fn is_system_or_internal_collection(name: &str) -> bool {
+    name.starts_with("system.") || name == SQL_SCHEMAS_COLLECTION
+}
+
+/// Parse a `sqlGetSchema` response document.
+///
+/// Pure helper extracted from [`collect_atlas_sql_docs`] so that unit tests
+/// can drive every code path with mock `bson::Document` values without a
+/// live MongoDB connection. Mirrors the response shape documented at
+/// <https://www.mongodb.com/docs/sql-interface/schema/view/>:
+///
+/// - `{ok: 1, metadata: {}, schema: {}}` → `Ok(None)` (no schema set; skip).
+/// - `{ok: 1, metadata: {...}, schema: {version, jsonSchema}}` →
+///   `Ok(Some((collection, parsed_schema)))`.
+/// - `{ok: 0, ...}` (error reply) → `Err(SchemaInvalid)` with the upstream
+///   `errmsg` if present, suggesting that the endpoint may not support
+///   `sqlGetSchema` (i.e. mis-configured atlas-sql mode against a regular
+///   cluster).
+/// - Anything else (missing `schema`, non-document `schema`, missing
+///   `jsonSchema` inside, schema fails to parse) → `Err(SchemaInvalid)` with
+///   the offending collection name embedded for diagnostics.
+pub(crate) fn parse_atlas_sql_response(
+    collection_name: &str,
+    response: Document,
+) -> Result<Option<(String, JsonSchema)>> {
+    // An explicit `ok: 0` reply gets surfaced as SchemaInvalid. In practice
+    // the mongodb crate raises this as an error and we never reach here,
+    // but the doc-driven contract is "any non-1 ok means failure" — so be
+    // explicit, since a future server version could return `ok: 0` without
+    // tripping the crate's command-error path.
+    if let Ok(ok) = response.get_f64("ok") {
+        if ok != 1.0 {
+            let errmsg = response
+                .get_str("errmsg")
+                .unwrap_or("server returned ok != 1");
+            return Err(Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{collection_name}` failed: {errmsg} \
+                     — atlas-sql mode requires an Atlas SQL endpoint"
+                ),
+            });
+        }
+    } else if let Ok(ok_i) = response.get_i32("ok") {
+        if ok_i != 1 {
+            let errmsg = response
+                .get_str("errmsg")
+                .unwrap_or("server returned ok != 1");
+            return Err(Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{collection_name}` failed: {errmsg} \
+                     — atlas-sql mode requires an Atlas SQL endpoint"
+                ),
+            });
+        }
+    }
+
+    // Per spec the `schema` field is always present; an empty document
+    // means "no schema set". Treat missing-`schema` the same as empty —
+    // both result in "skip this collection".
+    let schema_value = match response.get("schema") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let schema_doc = match schema_value {
+        bson::Bson::Document(d) => d,
+        bson::Bson::Null => return Ok(None),
+        other => {
+            return Err(Error::SchemaInvalid {
+                msg: format!(
+                    "sqlGetSchema for `{collection_name}`: `schema` must be a document, got `{:?}`",
+                    other.element_type(),
+                ),
+            });
+        }
+    };
+
+    if schema_doc.is_empty() {
+        return Ok(None);
+    }
+
+    // Permissive version handling — matches Collection-mode convention.
+    if let Ok(v) = schema_doc.get_i64("version") {
+        if v != SUPPORTED_SCHEMA_VERSION {
+            tracing::warn!(
+                target: "mongosql_driver::schema",
+                collection = collection_name,
+                version = v,
+                expected = SUPPORTED_SCHEMA_VERSION,
+                "atlas-sql schema version mismatch; attempting to parse jsonSchema anyway",
+            );
+        }
+    }
+
+    let json_schema_doc =
+        schema_doc
+            .get_document("jsonSchema")
+            .map_err(|_| Error::SchemaInvalid {
+                msg: format!(
+                "sqlGetSchema for `{collection_name}`: missing or non-document `schema.jsonSchema`"
+            ),
+            })?;
+
+    let parsed = parse_collection_schema(collection_name, json_schema_doc)?;
+    Ok(Some(parsed))
 }
 
 /// Read a YAML/JSON schema file from disk and produce the same
@@ -1647,5 +1900,315 @@ mod tests {
             collection: "users".to_string(),
         };
         assert!(initial.get_schema_for_namespace(&old_ns).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Atlas SQL — sqlGetSchema response parsing + system-collection filter
+    // -----------------------------------------------------------------
+
+    /// Build a well-formed `sqlGetSchema` response with a populated schema.
+    fn atlas_sql_response_with_schema(properties: Document) -> Document {
+        doc! {
+            "ok": 1.0,
+            "metadata": { "description": "set using sqlSetSchema" },
+            "schema": {
+                "version": 1_i64,
+                "jsonSchema": {
+                    "bsonType": "object",
+                    "properties": properties,
+                },
+            },
+        }
+    }
+
+    /// Canonical "no schema set" response shape per the Atlas SQL docs.
+    fn atlas_sql_empty_response() -> Document {
+        doc! {
+            "ok": 1.0,
+            "metadata": {},
+            "schema": {},
+        }
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_with_schema_yields_parsed_pair() {
+        let response = atlas_sql_response_with_schema(doc! {
+            "_id":   { "bsonType": "objectId" },
+            "email": { "bsonType": "string" },
+        });
+        let parsed =
+            parse_atlas_sql_response("calllogs", response).expect("populated schema parses");
+        let (name, schema) = parsed.expect("populated response is Some");
+        assert_eq!(name, "calllogs");
+        let props = schema.properties.expect("properties present");
+        assert!(props.contains_key("email"));
+        assert!(props.contains_key("_id"));
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_empty_schema_is_none_not_error() {
+        // Per the canonical Atlas SQL docs, `{ok: 1, metadata: {}, schema: {}}`
+        // means "no schema set for this name" — the collection MUST be
+        // skipped, never errored.
+        let response = atlas_sql_empty_response();
+        let parsed = parse_atlas_sql_response("system.views", response)
+            .expect("empty response parses cleanly");
+        assert!(
+            parsed.is_none(),
+            "empty schema response must yield None (skip)",
+        );
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_missing_schema_is_none() {
+        // Defensive: a response that elides `schema` entirely is treated the
+        // same as an empty schema (skip).
+        let response = doc! { "ok": 1.0, "metadata": {} };
+        let parsed = parse_atlas_sql_response("x", response).expect("parses");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_null_schema_is_none() {
+        let response = doc! { "ok": 1.0, "schema": bson::Bson::Null };
+        let parsed = parse_atlas_sql_response("x", response).expect("parses");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_ok_zero_yields_schema_invalid() {
+        // Defence-in-depth: explicit `ok: 0` (server-side failure) maps to
+        // SchemaInvalid with a hint about atlas-sql mode requirements. In
+        // practice the mongodb crate raises this before we reach the parser,
+        // but the doc-driven contract is to fail closed if a future server
+        // version slips through.
+        let response = doc! {
+            "ok": 0.0,
+            "errmsg": "no such command: 'sqlGetSchema'",
+        };
+        match parse_atlas_sql_response("calllogs", response) {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(
+                    msg.contains("calllogs"),
+                    "msg should mention collection: {msg}",
+                );
+                assert!(
+                    msg.contains("atlas-sql"),
+                    "msg should hint at atlas-sql mode requirement: {msg}",
+                );
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_non_document_schema_yields_schema_invalid() {
+        let response = doc! { "ok": 1.0, "schema": "not a document" };
+        match parse_atlas_sql_response("x", response) {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(msg.contains("schema"));
+                assert!(msg.contains("document"));
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_missing_jsonschema_yields_schema_invalid() {
+        // Populated `schema` but no `jsonSchema` inside — malformed envelope.
+        let response = doc! {
+            "ok": 1.0,
+            "schema": { "version": 1_i64 },
+        };
+        match parse_atlas_sql_response("x", response) {
+            Err(Error::SchemaInvalid { msg }) => {
+                assert!(msg.contains("jsonSchema"));
+                assert!(msg.contains('x'));
+            }
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_accepts_version_long() {
+        // The Atlas SQL endpoint returns `version` as a NumberLong (i64). The
+        // parser must accept that natively without complaint.
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": 1_i64,
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "email": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("users", response).expect("parses");
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_accepts_ok_as_i32() {
+        // Some BSON serialisers encode the boolean `ok` as int32. Mongo's own
+        // server returns f64 in practice but defence-in-depth covers both.
+        let response = doc! {
+            "ok": 1_i32,
+            "schema": {
+                "version": 1_i64,
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "x": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("c", response).expect("parses");
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_atlas_sql_response_permissive_on_version_mismatch() {
+        // Version mismatch is informational — parse continues with a warning.
+        let response = doc! {
+            "ok": 1.0,
+            "schema": {
+                "version": 99_i64,
+                "jsonSchema": { "bsonType": "object", "properties": {
+                    "email": { "bsonType": "string" },
+                }},
+            },
+        };
+        let parsed = parse_atlas_sql_response("users", response).expect("permissive");
+        let (name, schema) = parsed.expect("populated");
+        assert_eq!(name, "users");
+        assert!(schema.properties.is_some());
+    }
+
+    #[test]
+    fn is_system_or_internal_collection_matches_expected_names() {
+        assert!(is_system_or_internal_collection("system.views"));
+        assert!(is_system_or_internal_collection("system.profile"));
+        assert!(is_system_or_internal_collection("system.indexes"));
+        assert!(is_system_or_internal_collection("__sql_schemas"));
+        // Not system / not internal:
+        assert!(!is_system_or_internal_collection("calllogs"));
+        assert!(!is_system_or_internal_collection("users"));
+        // Leading underscore on a user collection: not filtered (Atlas SQL
+        // does not reserve the `_*` prefix; only `__sql_schemas` is special).
+        assert!(!is_system_or_internal_collection("_users"));
+        assert!(!is_system_or_internal_collection("__custom"));
+        // `systemic` / `systems` are NOT system.* — only the exact prefix
+        // `system.` (with the dot) is reserved.
+        assert!(!is_system_or_internal_collection("systemic"));
+        assert!(!is_system_or_internal_collection("systems"));
+    }
+
+    /// Drive the full atlas-sql pipeline at the parse layer: given a vector
+    /// of `(name, response)` pairs (mirroring what `collect_atlas_sql_docs`
+    /// would feed in), assert the resulting `BTreeMap<coll, Schema>` matches
+    /// expectations. This is the strongest pure-function unit test we can
+    /// build without a mongo client.
+    fn collect_via_parser(
+        responses: Vec<(&str, Document)>,
+    ) -> Result<BTreeMap<String, JsonSchema>> {
+        let mut by_collection: BTreeMap<String, JsonSchema> = BTreeMap::new();
+        for (name, response) in responses {
+            if is_system_or_internal_collection(name) {
+                continue;
+            }
+            if let Some((coll, schema)) = parse_atlas_sql_response(name, response)? {
+                by_collection.insert(coll, schema);
+            }
+        }
+        Ok(by_collection)
+    }
+
+    #[test]
+    fn atlas_sql_pipeline_filters_systems_and_skips_empty_schemas() {
+        // Mixed inputs: populated, empty, and system collections all in one
+        // pass. Only the populated user collections must appear in the map.
+        let responses = vec![
+            (
+                "calllogs",
+                atlas_sql_response_with_schema(doc! { "ts": { "bsonType": "date" } }),
+            ),
+            (
+                "configversions",
+                atlas_sql_response_with_schema(doc! { "v": { "bsonType": "int" } }),
+            ),
+            // Empty schema — skip.
+            ("system.views", atlas_sql_empty_response()),
+            // Populated but filtered out by system. prefix even though Atlas
+            // SQL would return empty for it.
+            (
+                "system.profile",
+                atlas_sql_response_with_schema(doc! { "x": { "bsonType": "string" } }),
+            ),
+            // __sql_schemas — defence-in-depth filter.
+            (
+                "__sql_schemas",
+                atlas_sql_response_with_schema(doc! { "_id": { "bsonType": "string" } }),
+            ),
+            // Another user collection with no schema configured.
+            ("orphans", atlas_sql_empty_response()),
+        ];
+        let by_coll = collect_via_parser(responses).expect("pipeline succeeds");
+        let names: Vec<&str> = by_coll.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec!["calllogs", "configversions"],
+            "only user collections with populated schemas survive",
+        );
+    }
+
+    #[test]
+    fn atlas_sql_pipeline_builds_catalog_with_multiple_collections() {
+        // End-to-end-from-parser: feed a few populated responses into the
+        // same pipeline `load_from_atlas_sql_with_columns` uses and assert
+        // the resulting catalog exposes every namespace.
+        let responses = vec![
+            (
+                "users",
+                atlas_sql_response_with_schema(doc! { "email": { "bsonType": "string" } }),
+            ),
+            (
+                "orders",
+                atlas_sql_response_with_schema(doc! { "amount": { "bsonType": "decimal" } }),
+            ),
+            (
+                "accounts",
+                atlas_sql_response_with_schema(doc! { "tier": { "bsonType": "string" } }),
+            ),
+        ];
+        let by_coll = collect_via_parser(responses).expect("pipeline");
+        let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+        by_db.insert("mydb".to_string(), by_coll);
+        let loaded = build_loaded_schema(by_db).expect("build catalog");
+        for coll in &["users", "orders", "accounts"] {
+            let ns = Namespace {
+                database: "mydb".to_string(),
+                collection: (*coll).to_string(),
+            };
+            assert!(
+                loaded.catalog.get_schema_for_namespace(&ns).is_some(),
+                "catalog must contain `mydb.{coll}`",
+            );
+            assert!(
+                loaded
+                    .columns
+                    .contains_key(&("mydb".to_string(), (*coll).to_string())),
+                "TableColumns must contain `(mydb, {coll})`",
+            );
+        }
+    }
+
+    #[test]
+    fn atlas_sql_pipeline_empty_input_yields_empty_catalog() {
+        // listCollections returning an empty list is NOT an error — the
+        // catalog is just empty until a future refresh picks up new
+        // collections.
+        let by_coll = collect_via_parser(vec![]).expect("empty pipeline");
+        assert!(by_coll.is_empty());
+        let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+        by_db.insert("mydb".to_string(), by_coll);
+        let loaded = build_loaded_schema(by_db).expect("build catalog");
+        assert!(loaded.columns.is_empty(), "no columns from empty input");
     }
 }

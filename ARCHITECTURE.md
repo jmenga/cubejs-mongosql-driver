@@ -77,14 +77,28 @@ Two arrows from Rust to the cluster: data queries (MQL) and schema reads — bot
 
 ### 3.1 Schema source modes
 
+The driver supports three modes. All three converge on the same `LoadedSchema` shape (a `MongoSqlCatalog` plus a parallel `TableColumns` map keyed by `(db, collection)`); the only difference is the I/O strategy. On the napi-rs wire the discriminant is a string in `ClientConfig.schema_source.kind`:
+
 ```rust
-pub enum SchemaSource {
-    /// Read from __sql_schemas collection in the configured database.
-    Collection,
-    /// Read from a YAML or JSON file on disk.
-    File { path: PathBuf },
+// Wire shape across the napi-rs boundary.
+pub struct SchemaSource {
+    pub kind: String,             // "collection" | "file" | "atlas-sql"
+    pub path: Option<String>,     // required for "file"; ignored otherwise
 }
 ```
+
+| Mode (`kind`) | I/O | When to use |
+|---|---|---|
+| `collection` (default) | `db.<dbname>.__sql_schemas.find()` | Regular MongoDB clusters where the Atlas SQL Interface (or EA Schema Builder) writes the per-collection schema documents directly into the `__sql_schemas` collection. |
+| `file` | Read YAML/JSON at `path` | Local dev, schema-as-code, EA without Schema Builder, edge cases. |
+| `atlas-sql` | `listCollections` + per-collection `runCommand({sqlGetSchema: name})` | Atlas SQL endpoints (`<cluster>-<id>.a.query.mongodb.net`), which do NOT expose `__sql_schemas` as a queryable collection — schemas live in an internal store and are reachable only via the `sqlGetSchema` admin-style command. Reference: <https://www.mongodb.com/docs/sql-interface/schema/view/>. |
+
+`atlas-sql` semantics:
+
+- Enumerate via `listCollections`, filter out `system.*` and `__sql_schemas`.
+- For each remaining name, issue `runCommand({sqlGetSchema: name})`. Per the canonical spec, the response shape is `{ok: 1, metadata: {description}, schema: {version, jsonSchema}}` when a schema is registered, and `{ok: 1, metadata: {}, schema: {}}` when no schema exists. The empty-`schema` case is SKIPPED (not errored) — `ok: 1` alone does not imply a schema was found.
+- Same `(catalog, columns)` output as the other two modes, keyed under `db_name`. No file-mode-style placeholder rewriting.
+- If `sqlGetSchema` errors on the wire (e.g. running atlas-sql mode against a regular cluster where the command is not recognised), the loader surfaces `MONGOSQL_SCHEMA_INVALID` with a hint about the endpoint requirement.
 
 ### 3.2 Cache lifecycle
 
@@ -98,10 +112,14 @@ pub enum SchemaSource {
 
 ┌─ test_connection() ───────────────────────────────────────────────┐
 │   Run mongo `ping` admin command                                  │
-│   Load schema (Collection or File path)                           │
+│   Load schema (Collection, File, or Atlas SQL path)               │
 │     - Collection: query __sql_schemas; build mongosql::Catalog    │
 │       via build_catalog_from_catalog_schema(...)                  │
-│     - File: read+parse YAML/JSON; build same Catalog              │
+│     - File:       read+parse YAML/JSON; build same Catalog        │
+│     - Atlas SQL:  listCollections → filter system.* + __sql_schemas│
+│                   → runCommand({sqlGetSchema: name}) per remaining │
+│                   → skip empty-`schema` responses; parse populated │
+│                   ones; build same Catalog                        │
 │   Acquire cache write lock; replace cache contents                │
 │   Spawn refresh task (Tokio interval, schema_refresh_sec)         │
 │   Return Ok(())                                                   │
@@ -111,6 +129,10 @@ pub enum SchemaSource {
 │   Try load schema (same as testConnection load step)              │
 │   On success: write-lock cache, swap                              │
 │   On failure: log warning, retry next interval                    │
+│   Atlas SQL note: Atlas updates schemas on its own cadence        │
+│   ("Configure schema update schedule" in the Atlas UI), so        │
+│   periodic refresh is load-bearing for atlas-sql just like        │
+│   collection mode.                                                │
 └───────────────────────────────────────────────────────────────────┘
 
 ┌─ query(sql) (per-query, hot path) ────────────────────────────────┐

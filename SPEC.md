@@ -46,12 +46,20 @@ Reference: https://www.mongodb.com/docs/sql-interface/language-reference/
 
 ### FR-3 — Schema management
 
-The driver MUST support two schema source modes, selected by env var:
+The driver MUST support three schema source modes, selected by env var:
 
 | Mode | Source | Use case |
 |---|---|---|
 | `collection` (default) | `__sql_schemas` collection in the connected database | Production (Atlas-managed or EA Schema Builder) |
 | `file` | YAML or JSON file at a configured path | Local dev, schema-as-code, edge cases |
+| `atlas-sql` | `sqlGetSchema` admin command per collection enumerated via `listCollections` | Atlas SQL endpoints (`*.a.query.mongodb.net`), which store schemas in an internal store rather than as a queryable collection |
+
+`atlas-sql` mode follows the canonical Atlas SQL command spec at <https://www.mongodb.com/docs/sql-interface/schema/view/>:
+
+- Request: `db.getSiblingDB("<dbname>").runCommand({sqlGetSchema: "<collection>"})`.
+- Schema-present response: `{ok: 1, metadata: {description}, schema: {version, jsonSchema}}`.
+- Schema-absent response: `{ok: 1, metadata: {}, schema: {}}` — distinguished by the empty `schema` object. The driver MUST treat this as "no schema for that collection" and skip it, NOT as an error.
+- No `sqlListSchemas` command exists; enumeration is `listCollections` + per-collection `sqlGetSchema`. System collections (`system.*`) and `__sql_schemas` are filtered out before issuing `sqlGetSchema`.
 
 The driver MUST:
 
@@ -120,7 +128,7 @@ All configuration via standard Cube env vars where they exist; new `CUBEJS_MONGO
 | `CUBEJS_DB_MAX_POOL` / `CUBEJS_DB_MIN_POOL` | no | mongo default | Pool size (`maxPoolSize` / `minPoolSize`) |
 | `CUBEJS_DB_QUERY_TIMEOUT` | no | `10m` | Per-query timeout (duration string OR bare ms). Wins over `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` |
 | `CUBEJS_DB_IDLE_TIMEOUT` | no | mongo default | `maxIdleTimeMS` (duration string OR bare ms) |
-| `CUBEJS_MONGOSQL_SCHEMA_SOURCE` | no | `collection` | `collection` or `file` |
+| `CUBEJS_MONGOSQL_SCHEMA_SOURCE` | no | `collection` | `collection`, `file`, or `atlas-sql` |
 | `CUBEJS_MONGOSQL_SCHEMA_FILE` | (file mode) | — | Path to YAML/JSON schema file |
 | `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no | `300` | Refresh interval in seconds |
 | `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN` | no | `false` | If `true`, don't fail testConnection on initial schema-load failure |
@@ -179,7 +187,8 @@ export type { MongoSqlConfig, SchemaSource } from './types';
 // src/types.ts
 export type SchemaSource =
   | { kind: 'collection' }
-  | { kind: 'file'; path: string };
+  | { kind: 'file'; path: string }
+  | { kind: 'atlas-sql' };
 
 export interface MongoSqlConfig {
   uri: string;

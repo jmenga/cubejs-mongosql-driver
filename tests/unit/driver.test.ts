@@ -133,6 +133,49 @@ describe('MongoSqlDriver — constructor / config', () => {
     expect(cfg.schemaSource).toEqual({ kind: 'file', path: '/tmp/schema.yaml' });
   });
 
+  it('parses atlas-sql schema source from env (Atlas SQL endpoint mode)', async () => {
+    // Atlas SQL endpoints (`*.a.query.mongodb.net`) discover schemas via
+    // the `sqlGetSchema` admin command rather than `__sql_schemas`. The
+    // env-var value mirrors the docs nomenclature ("Atlas SQL").
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'atlas-sql';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    const cfg = lastClient!.config as Record<string, unknown>;
+    expect(cfg.schemaSource).toEqual({ kind: 'atlas-sql' });
+  });
+
+  it('atlas-sql schema source does NOT require CUBEJS_MONGOSQL_SCHEMA_FILE', async () => {
+    // Defence-in-depth: the file-only env-var must not leak its
+    // "required" check into atlas-sql mode.
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'atlas-sql';
+    installMockNative();
+    expect(() => new MongoSqlDriver()).not.toThrow();
+  });
+
+  it('rejects unknown CUBEJS_MONGOSQL_SCHEMA_SOURCE values; error enumerates all three valid kinds', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_MONGOSQL_SCHEMA_SOURCE = 'mystery-mode';
+    installMockNative();
+    let thrown: unknown;
+    try {
+      new MongoSqlDriver();
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as MongoSqlError).code).toBe('MONGOSQL_CONFIG_INVALID');
+    const msg = (thrown as Error).message;
+    expect(msg).toMatch(/collection/);
+    expect(msg).toMatch(/file/);
+    expect(msg).toMatch(/atlas-sql/);
+    expect(msg).toMatch(/mystery-mode/);
+  });
+
   it('throws MONGOSQL_CONFIG_INVALID when uri is missing', () => {
     process.env.CUBEJS_DB_NAME = 'analytics';
     installMockNative();
