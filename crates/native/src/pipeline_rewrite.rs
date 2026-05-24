@@ -168,11 +168,29 @@ fn walk_document(doc: &mut Document) {
         rewrite_bool_in_place(doc, BoolOp::And);
     }
 
-    // MINOR-4: skip descent into `$in` / `$nin` value arrays. Those are
-    // pure value lists (after our own collapse, or whatever mongosql
-    // emits directly), and they cannot contain `$or` / `$and` operator
+    // Skip descent into `$in` / `$nin` value arrays. Those are pure
+    // value lists (after our own collapse, or whatever mongosql emits
+    // directly), and they cannot contain `$or` / `$and` operator
     // expressions — descending into them is wasted work for large IN
     // lists. We keep the recursion for every other key.
+    //
+    // Why ONLY `$in` / `$nin` and not other array-taking aggregation
+    // operators? Per the MongoDB Aggregation Pipeline Operators
+    // reference (https://www.mongodb.com/docs/manual/reference/operator/aggregation/),
+    // every other array-taking operator's elements are EXPRESSIONS, not
+    // value-only lists: `$concat` / `$concatArrays` take expression
+    // arguments; `$arrayElemAt` takes an `<array expression>` that can
+    // nest further; `$range` takes `<start>, <end>, <step>` expression
+    // ints; `$setUnion` / `$setIntersection` / `$setDifference` /
+    // `$setEquals` / `$setIsSubset` take set-expression arguments; etc.
+    // In each of those cases a `$or` / `$and` CAN legally appear in the
+    // sub-expression (e.g. `{$concatArrays: [["a"], {$cond: [{$or:
+    // [...]}, [...], [...]]}}]}`), so descending is required. The
+    // `$in` / `$nin` aggregation-expression operators are special: the
+    // second positional argument is documented as a value array whose
+    // elements are evaluated as values, not as operator expressions, so
+    // it cannot contain a `$or` / `$and` we'd want to rewrite. The
+    // `walker_does_not_descend_into_{in,nin}_value_array` tests pin this.
     for (k, v) in doc.iter_mut() {
         if k == "$in" || k == "$nin" {
             continue;
@@ -271,6 +289,23 @@ fn rewrite_bool_in_place(doc: &mut Document, op: BoolOp) {
         match op {
             BoolOp::Or => {
                 // `$or` of same-field `$eq` → `{$in: ["$field", [...]]}`.
+                //
+                // MINOR-6: defensive collision check. mongosql v1.8.5
+                // never emits a sibling `$in` alongside a `$or` in the
+                // same doc (the Atlas SQL proxy re-expansion goes the
+                // other direction: `$in` is split, not added next to a
+                // `$or`), so this collision is impossible in practice —
+                // see the comment block above `rewrite_bool_in_place`
+                // and the `or_with_sibling_in_does_not_overwrite` test
+                // that pins the post-conservative behaviour. The
+                // assertion documents the invariant and traps any future
+                // mongosql release that breaks it during development /
+                // test builds.
+                debug_assert!(
+                    !doc.contains_key("$in"),
+                    "BUG: $or-collapse would overwrite sibling $in in same document; \
+                     mongosql never emits this shape — see MINOR-6 in pipeline_rewrite.rs",
+                );
                 doc.insert("$in", in_expr);
             }
             BoolOp::And => {
@@ -287,6 +322,15 @@ fn rewrite_bool_in_place(doc: &mut Document, op: BoolOp) {
                 // verified empirically against atlas-local with a
                 // `db.orders.aggregate([{$match: {$expr: {$not: {$in:
                 // ["$account_id", ["acct_a"]]}}}}])` probe.
+                //
+                // MINOR-6: defensive collision check, same rationale as
+                // the `$or` branch above. mongosql does not co-emit
+                // `$not` with `$and` at the same level.
+                debug_assert!(
+                    !doc.contains_key("$not"),
+                    "BUG: $and-collapse would overwrite sibling $not in same document; \
+                     mongosql never emits this shape — see MINOR-6 in pipeline_rewrite.rs",
+                );
                 let mut inner = Document::new();
                 inner.insert("$in", in_expr);
                 doc.insert("$not", Bson::Document(inner));
@@ -1348,6 +1392,66 @@ mod tests {
             pipeline, snapshot,
             "walker must not descend into $in value arrays",
         );
+    }
+
+    // ----- MINOR-6: sibling $in / $not preserved when collapse doesn't fire -----
+
+    #[test]
+    fn or_with_sibling_in_does_not_overwrite() {
+        // MINOR-6 defensive paranoia: if mongosql ever emitted a shape
+        // like `{$or: [non-collapsible-leaves...], $in: [...]}` at the
+        // same level, the existing `$in` key must survive the rewrite
+        // (the `$or` collapse precondition is not met, so the
+        // `doc.insert("$in", ...)` branch in `rewrite_bool_in_place` is
+        // never taken). In practice mongosql never co-emits these two
+        // operators at the same level, so this test pins the
+        // conservative behaviour for a synthetic input.
+        let mut input = doc! {
+            // `$or` over different-field leaves — collapse precondition
+            // FAILS (different fields), so `$in` insert path is NOT
+            // taken.
+            "$or": [
+                doc! {"$eq": ["$x", 1_i64]},
+                doc! {"$eq": ["$y", 2_i64]},
+            ],
+            // Sibling `$in` that pre-existed. Must survive.
+            "$in": Bson::Array(vec![Bson::String("$z".to_string()), Bson::Array(vec![Bson::Int64(99)])]),
+        };
+        rewrite_bool_in_place(&mut input, BoolOp::Or);
+        // `$or` stays (flat, since collapse rejected); the original `$in`
+        // is preserved byte-identically.
+        assert!(input.contains_key("$or"));
+        let in_args = input.get_array("$in").expect("original $in preserved");
+        assert_eq!(in_args.len(), 2);
+        assert_eq!(in_args[0], Bson::String("$z".to_string()));
+        let vals = in_args[1].as_array().expect("values");
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].as_i64(), Some(99));
+    }
+
+    #[test]
+    fn and_with_sibling_not_does_not_overwrite() {
+        // Symmetric to `or_with_sibling_in_does_not_overwrite` for
+        // `$and` + `$not`. mongosql doesn't co-emit these at the same
+        // level either; this pins the conservative behaviour.
+        let mut input = doc! {
+            "$and": [
+                doc! {"$ne": ["$x", 1_i64]},
+                doc! {"$gt": ["$x", 2_i64]}, // non-`$ne` leaf, collapse rejected
+            ],
+            "$not": doc! {"$in": [Bson::String("$z".to_string()), [99_i64]]},
+        };
+        rewrite_bool_in_place(&mut input, BoolOp::And);
+        assert!(input.contains_key("$and"));
+        let not_doc = input.get_document("$not").expect("original $not preserved");
+        let in_args = not_doc
+            .get_array("$in")
+            .expect("original $not.$in preserved");
+        assert_eq!(in_args.len(), 2);
+        assert_eq!(in_args[0], Bson::String("$z".to_string()));
+        let vals = in_args[1].as_array().expect("values");
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].as_i64(), Some(99));
     }
 
     #[test]
