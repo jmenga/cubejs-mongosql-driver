@@ -294,10 +294,12 @@ Canonical command spec: <https://www.mongodb.com/docs/sql-interface/schema/view/
 
 `sqlGetSchema` is an admin-style command. The connecting user MUST hold either:
 
-- the built-in `atlasAdmin` role, OR
-- a built-in role granting `clusterMonitor` plus `readAnyDatabase`.
+- the built-in `atlasAdmin` role on the Atlas project, OR
+- a database-user role combination granting `clusterMonitor` (on `admin`) plus `readAnyDatabase` (on `admin`).
 
-A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privileges will surface a MongoDB error with code **13 (`Unauthorized`)**. The driver detects this and raises `MONGOSQL_SCHEMA_INVALID` with a hint citing the canonical role-requirements doc: <https://www.mongodb.com/docs/atlas/data-federation/query/sql/getting-started/>.
+A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privileges will surface a MongoDB error with code **13 (`Unauthorized`)**. The driver detects this and raises `MONGOSQL_SCHEMA_INVALID` with a hint that embeds the required role names directly (no documentation-traversal needed) and points at the Atlas "Configure Database Users" page where the operator actually performs the fix: <https://www.mongodb.com/docs/atlas/security-add-mongodb-users/> (Atlas UI: Project → Security → Database Access → Edit user).
+
+> **Why this URL?** MongoDB's docs do not publish a single deep-linkable page that says "these are the roles `sqlGetSchema` requires" — the privilege table lives in the dynamically-rendered built-in-roles reference which is unstable to deep-link. The role names are therefore embedded directly in the error message; the URL is the operator-facing landing page for the actual fix.
 
 If `sqlGetSchema` fails with code **59 (`CommandNotFound`)** the endpoint isn't an Atlas SQL endpoint at all (the typical "I'm pointing atlas-sql mode at a regular cluster" misconfiguration). The driver surfaces a distinct hint suggesting collection mode for that case. Any other failure is reported with the underlying message routed through the credential-redactor so connection strings don't leak.
 
