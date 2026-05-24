@@ -362,18 +362,24 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
   // ---------------------------------------------------------------------------
   // Large-IN-list workaround — Cube /load with 200 `equals` values.
   //
-  // Pre-fix: a Cube query whose `filter: { equals: [v1..vN] }` translates
-  // to SQL `IN (v1..vN)` would bust MongoDB's max BSON nested-object
-  // depth (100) for N ≥ ~100 — the Atlas SQL endpoint emitted a
-  // right-leaning binary-`$or` chain, and the server rejected the
-  // aggregate with `Error code 15 (Overflow)`. Post-fix the driver's
-  // pipeline_rewrite pass flattens the chain and collapses to `$in`, so
-  // the server accepts the query.
+  // Real failure mode: `mongosql::translate_sql` v1.8.5 outputs a FLAT
+  // `$or` (depth 1) for `IN (v1..vN)` both locally and against the
+  // Atlas SQL endpoint. The Atlas SQL **proxy / server-side query
+  // layer re-expands** the flat array into a right-leaning binary-`$or`
+  // chain before passing the aggregate to MongoDB. For N ≥ ~100 the
+  // chain busts MongoDB's max BSON nested-object depth (100) and the
+  // server rejects with `Error code 15 (Overflow)`. The driver's
+  // pipeline_rewrite pass collapses the same-field `$eq` disjunction
+  // to `$in` (no n-ary boolean array left to chain-ify), defeating the
+  // re-expansion.
   //
-  // The atlas-local image happens to emit a flat `$or` already at
-  // v1.8.5, so the cube-e2e (which runs against atlas-local) pins the
-  // end-to-end correctness path: the rewrite must NOT corrupt a valid
-  // query, and the server must accept the (now `$in`-collapsed) form.
+  // The atlas-local container is plain MongoDB without the proxy, so
+  // this cube-e2e test pins the end-to-end correctness path: the
+  // rewriter must NOT corrupt a valid query, and the server must
+  // accept the result. The dedicated Atlas-SQL test
+  // (`query_with_large_in_list_against_atlas_sql` in
+  // `crates/native/tests/client_e2e.rs`) exercises the actual
+  // re-expansion failure mode.
   // ---------------------------------------------------------------------------
   it('large IN list — Cube /load with 200 equals values returns rows, not BSON depth overflow', async () => {
     const values: string[] = [];
@@ -406,6 +412,49 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(body.data.length).toBe(1);
     expect(body.data[0]?.['orders.accountId']).toBe('acct_a');
     expect(Number(body.data[0]?.['orders.count'])).toBe(3);
+  });
+
+  // ---------------------------------------------------------------------------
+  // NOT IN coverage gap — Cube /load with 200 `notEquals` values.
+  //
+  // The Atlas SQL proxy re-expands flat `$and`s the same way it
+  // re-expands `$or`s (verified empirically against the real endpoint
+  // with `cargo test ... probe_atlas_sql_not_in_execute_200`: a
+  // 200-value `NOT IN` overflows BSON depth at the proxy with the
+  // chain visible in `pipeline.0.$match.$expr.$and.0.$and.0…`).
+  // The driver's pipeline_rewrite pass now extends to `$and → $nin`
+  // for the symmetric collapse.
+  // ---------------------------------------------------------------------------
+  it('large NOT IN list — Cube /load with 200 notEquals values returns rows, not BSON depth overflow', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 200; i++) values.push(`synthetic_v${i}`);
+    // Append a real seeded value to be EXCLUDED — `acct_a` matches 3
+    // orders. With it in the NOT-IN list, the remaining rows are
+    // `acct_b` (2 orders).
+    values.push('acct_a');
+
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.accountId'],
+        filters: [
+          {
+            member: 'orders.accountId',
+            operator: 'notEquals',
+            values,
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    // Seed: 3 `acct_a` excluded + 2 `acct_b` remain. The remaining 2
+    // group under `acct_b` with count=2.
+    expect(body.data.length).toBe(1);
+    expect(body.data[0]?.['orders.accountId']).toBe('acct_b');
+    expect(Number(body.data[0]?.['orders.count'])).toBe(2);
   });
 
   it('dimension query — count grouped by status (T19a regression test)', async () => {

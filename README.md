@@ -423,22 +423,37 @@ The driver buffers query results into a JSON array before crossing the napi boun
 
 Streaming via `ThreadsafeFunction` is a planned post-MVP enhancement — see [SPEC §8](./SPEC.md#8-open-questions).
 
-### Large `IN (...)` lists — driver workaround for upstream mongosql BSON-depth bug
+### Large `IN (...)` / `NOT IN (...)` lists — Atlas SQL endpoint re-expands large boolean arrays
 
-`mongosql` v1.8.5 translates SQL `IN (v1, …, vN)` (and the equivalent `field = v1 OR field = v2 OR …`) into an aggregation pipeline that wraps the disjunction in a right-leaning chain of binary `$or`s at the Atlas SQL endpoint:
+Real-world Cube queries with `equals` (`IN`) or `notEquals` (`NOT IN`) filters carrying hundreds of identifiers (e.g. `agent_id IN (160 ids)`) hit MongoDB's max BSON nested-object depth (100) on the Atlas SQL endpoint. The failure mode is subtle:
 
-```text
-{ $or: [LEAF, { $or: [LEAF, { $or: [LEAF, … ] }] }] }
-```
+1. **`mongosql` v1.8.5 outputs a *flat* boolean array.** Both `IN (v1..vN)` (and the equivalent `field = v1 OR field = v2 OR …`) and `NOT IN (v1..vN)` translate to a *flat* `$or` / `$and` array (depth 1) — verified empirically against both the local YAML fixture catalog AND a real Atlas SQL endpoint's `sqlGetSchema`-derived catalog (see `crates/native/tests/critic_probe.rs`).
+2. **The Atlas SQL proxy re-expands the flat array.** When the driver sends that flat pipeline over the wire to an Atlas SQL endpoint (`*.a.query.mongodb.net`), the proxy / server-side query layer re-expands the array into a right-leaning chain of binary `$or` / `$and`s before passing the aggregate to the underlying MongoDB query engine:
 
-For N ≥ ~100 values that chain exceeds MongoDB's maximum BSON nested-object depth (100), and the server rejects the aggregate with `Error code 15 (Overflow): BSONObj exceeds maximum nested object depth`. This bites real-world Cube queries with `equals` filters carrying hundreds of identifiers (e.g. `agent_id IN (160 ids)`).
+   ```text
+   { $or: [LEAF, { $or: [LEAF, { $or: [LEAF, … ] }] }] }
+   ```
 
-The driver applies a pure pipeline rewrite immediately after translation:
+3. **MongoDB rejects the chain.** For N ≥ ~100 the materialised BSON exceeds the maximum nested-object depth (100), and the server rejects the aggregate with:
 
-1. **Flatten** any right-leaning `$or` chain into a single flat `$or` array (so the depth grows by 1, not N).
-2. **Collapse** the flat array to `$in` when every element is a `$eq` against the same field with literal scalars.
+   ```text
+   Error code 15 (Overflow): BSONObj exceeds maximum nested object depth
+   ```
 
-Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. Upstream tracking: when `mongosql` ships its own fix this rewrite becomes a no-op (the walker is shape-agnostic and runs in linear time per pipeline node).
+   The error path on a Cube query with 161 `agent_id` values:
+
+   ```text
+   pipeline.0.$match.$expr.$let.vars.desugared_sqlAnd_input2.$let.in.$cond.if.$or.0.$or.0.$or.0…
+   ```
+
+   (Note: this path is from the *server's* error message — the path the driver SENDS over the wire is flat.)
+
+4. **Collapsing to `$in` / `{$not: {$in: …}}` defeats the re-expansion.** There is no n-ary boolean array left for the proxy to chain-ify. The driver applies a pure pipeline rewrite immediately after translation:
+   - **Flatten** any nested `$or` / `$and` chain into a single flat array (defensive; defends against any client-side chain shape from future translators).
+   - **Collapse to `$in`** when every `$or` element is a `$eq` against the same field with literal scalars.
+   - **Collapse to `{$not: {$in: …}}`** when every `$and` element is a `$ne` against the same field with literal scalars (the `NOT IN` symmetric path). NOTE: this emits `{$not: {$in: …}}` and NOT `{$nin: …}`. MongoDB's `$nin` is a *query* operator (valid only inside `$match.<field>: {$nin: …}`), not an aggregation expression operator. mongosql lands its NOT IN translation inside `$expr`, where `$nin` is rejected with `code 168: Unrecognized expression '$nin'`. Verified empirically against atlas-local.
+
+Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. If a future Atlas SQL release stops re-expanding flat boolean arrays, this rewrite becomes a no-op (the walker is shape-agnostic and runs in linear time per pipeline node).
 
 ### `MONGOSQL_SCHEMA_NOT_FOUND`
 

@@ -13,6 +13,30 @@
 //! the unreachable internal hostname.
 //!
 //! Override the URI by exporting `MONGO_URI` before running the test.
+//!
+//! ## SEED PREREQUISITE (MAJOR-5)
+//!
+//! Every test in this file (collection-mode + atlas-sql) requires the
+//! seed scripts under `examples/docker/mongo-init/` (mounted by docker-
+//! compose at `/docker-entrypoint-initdb.d/`) to have run against the
+//! atlas-local container. The seed scripts populate
+//! `mongosql_test.{users,accounts,orders,revenue_events}` AND the
+//! companion `__sql_schemas` collection.
+//!
+//! If you spin atlas-local up via `make e2e:up` against a *fresh* volume
+//! it runs automatically. If you previously ran the compose without
+//! `revenue_events` (or with an older seed), the initdb hook may have
+//! been skipped — atlas-local's initdb scripts only fire on a virgin
+//! data directory. Re-seed manually:
+//!
+//! ```
+//! docker exec mongosql-cubejs-driver-atlas mongosh \
+//!   "mongodb://admin:admin@localhost:27017/?authSource=admin&directConnection=true" \
+//!   /docker-entrypoint-initdb.d/01-seed-data.js
+//! ```
+//!
+//! Tests that fail with `MONGOSQL_SCHEMA_NOT_FOUND` or "no rows" on
+//! known-seeded collections almost always indicate a missed seed step.
 
 #![allow(clippy::unwrap_used)]
 
@@ -423,20 +447,39 @@ async fn atlas_sql_query_count_returns_row() {
 
 // ---------------------------------------------------------------------------
 // Large IN-list — verifies pipeline_rewrite::flatten_or_chains_and_collapse_to_in
-// defeats MongoDB's max-BSON-nested-object-depth (100) limit for SQL `IN (v1,
-// ..., vN)` with N ≥ 100. Pre-fix the server rejected the query with
-// "Error code 15 (Overflow): BSONObj exceeds maximum nested object depth"
-// because mongosql translated IN to a right-leaning `$or` chain.
+// defeats MongoDB's max-BSON-nested-object-depth (100) limit.
 //
-// Two harnesses:
-//  * atlas-local (always-on via docker-compose) — exercises the local
-//    fixture catalog with 200 string values. The local mongosql build
-//    happens to emit a flat `$or` already, so this test pins the
-//    end-to-end correctness path: the rewriter must NOT corrupt a valid
-//    query, and the server must accept the (now `$in`-collapsed) form.
-//  * atlas-sql (real Atlas SQL endpoint) — exercises the production
-//    failure mode where mongosql emits a right-leaning chain. Ignored by
-//    default; runs only when ATLAS_SQL_URI + ATLAS_SQL_DB are set.
+// The verified failure mode is: `mongosql::translate_sql` v1.8.5 outputs
+// a FLAT `$or` (depth 1) both against the local YAML fixture AND against
+// the real Atlas SQL endpoint's `sqlGetSchema`-derived catalog. When that
+// flat array is sent to an Atlas SQL endpoint, the **proxy/server-side
+// query layer re-expands** the array into a right-leaning chain of
+// binary `$or`s before passing the aggregate to the underlying MongoDB
+// query engine. For N ≥ ~100 that chain busts MongoDB's max BSON
+// nested-object depth (100) and the server rejects the aggregate with
+// `Error code 15 (Overflow): BSONObj exceeds maximum nested object
+// depth`. Collapsing to `$in` defeats the re-expansion (no n-ary
+// boolean array left to chain-ify).
+//
+// Three harnesses:
+//  * `query_with_large_in_list_succeeds` — atlas-local with 201 string
+//    values, SQL `WHERE account_id IN (…)`. The atlas-local fixture
+//    catalog gives every `$eq` operand a `$$desugared_sqlOr_inputN`
+//    variable LHS (mongosql's let-bound name), so the COLLAPSE precondition
+//    is NOT met against this fixture — the rewriter only exercises the
+//    flatten pass. Asserts end-to-end correctness of the flatten path.
+//  * `query_with_large_in_list_collapse_against_atlas_local` — atlas-
+//    local with a **manually-constructed pipeline** whose `$or` leaves
+//    have bare-`$field` LHS (matching the Atlas SQL shape).
+//    Bypasses the public `query()` path so the COLLAPSE precondition is
+//    met and the rewriter produces a `$in`. Asserts (a) the post-
+//    rewrite pipeline contains exactly one `$in`, (b) the server
+//    accepts the query, (c) results match a control query expressed as
+//    `IN (...)` via the public `query()` path.
+//  * `query_with_large_in_list_against_atlas_sql` — atlas-sql; gated
+//    on `ATLAS_SQL_URI` + `ATLAS_SQL_DB`. Exercises the real failure
+//    mode where the proxy re-expands the flat $or — pre-fix this
+//    overflows BSON depth, post-fix it succeeds.
 // ---------------------------------------------------------------------------
 
 /// Build a SQL string that selects rows by `account_id IN (v0..vN-1, "acct_a")`
@@ -458,11 +501,17 @@ fn large_in_list_sql(coll: &str, n: usize) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+#[ignore = "requires docker-compose + seeded atlas-local; run after `make e2e:up`. \
+            Verifies the FLATTEN path end-to-end (the local fixture's \
+            `$$desugared_sqlOr_inputN` variable-LHS shape blocks the \
+            collapse precondition); for the COLLAPSE path see \
+            `query_with_large_in_list_collapse_against_atlas_local`."]
 async fn query_with_large_in_list_succeeds() {
     // Pre-fix: 200 values would either bust BSON depth (on atlas-sql) or
     // at minimum exercise an O(N)-deep pipeline. Post-fix: the rewriter
-    // produces a single `$in: ["$account_id", [v0..v199, 'acct_a']]`.
+    // produces a flat `$or` array (the COLLAPSE precondition is
+    // blocked here by the `$$desugared_sqlOr_inputN` variable LHS that
+    // the local fixture catalog produces).
     //
     // The seed-data has 3 orders with `account_id = acct_a`, so the
     // post-fix query must return exactly 3 rows. Pre-fix on Atlas SQL
@@ -483,6 +532,313 @@ async fn query_with_large_in_list_succeeds() {
         "expected exactly 3 acct_a orders to match; got rows={:?}",
         rows
     );
+    client.close().await.expect("close");
+}
+
+/// MAJOR-3: drive the rewriter against a manually-constructed pipeline
+/// matching the Atlas SQL shape (bare-`$field` LHS, literal RHS) so the
+/// COLLAPSE precondition fires. Runs end-to-end against atlas-local,
+/// asserts:
+///   1. The rewriter produces a `$in` (count `$in` occurrences == 1 in
+///      the final pipeline).
+///   2. The server accepts and returns rows.
+///   3. Results match a control query expressed via SQL `IN (...)`
+///      through the public `query()` path.
+#[tokio::test]
+#[ignore = "requires docker-compose + seeded atlas-local; run after `make e2e:up`. \
+            Exercises the COLLAPSE path by injecting a bare-`$field` LHS \
+            pipeline (the local fixture's translator can't produce this \
+            shape, so we synthesize it directly)."]
+async fn query_with_large_in_list_collapse_against_atlas_local() {
+    use bson::{doc, Bson};
+    use cubejs_mongosql_driver_native::pipeline_rewrite::flatten_or_chains_and_collapse_to_in;
+    use futures_util::TryStreamExt;
+    use mongodb::Client as MongoClient;
+
+    // 200 synthetic values + the real seed value `acct_a` (matches 3
+    // orders). Build a right-leaning chain so we exercise both PASSES
+    // (flatten + collapse) of the rewriter — same as what the Atlas
+    // SQL proxy would re-expand server-side.
+    let mut values: Vec<&str> = Vec::with_capacity(201);
+    let synthetic: Vec<String> = (0..200).map(|i| format!("v{i}")).collect();
+    for s in &synthetic {
+        values.push(s.as_str());
+    }
+    values.push("acct_a");
+
+    // Build a right-leaning chain `[L0, [L1, [L2, ..., [Ln-2, Ln-1]]]]`.
+    let last_two = values.len() - 2;
+    let mut current = doc! {
+        "$or": [
+            doc! {"$eq": ["$account_id", { "$literal": values[last_two] }]},
+            doc! {"$eq": ["$account_id", { "$literal": values[last_two + 1] }]},
+        ],
+    };
+    for i in (0..last_two).rev() {
+        let leaf = doc! {"$eq": ["$account_id", { "$literal": values[i] }]};
+        current = doc! {
+            "$or": [Bson::Document(leaf), Bson::Document(current)],
+        };
+    }
+
+    // Wrap in a `$match` stage so the executor accepts it.
+    let mut pipeline: Vec<bson::Document> = vec![doc! {
+        "$match": { "$expr": Bson::Document(current) },
+    }];
+
+    // Run the rewriter directly.
+    flatten_or_chains_and_collapse_to_in(&mut pipeline);
+
+    // ASSERTION 1: exactly one `$in` in the final pipeline; zero `$or`s.
+    fn count_keys(b: &Bson, key: &str) -> usize {
+        match b {
+            Bson::Document(d) => {
+                let here = d.iter().filter(|(k, _)| k.as_str() == key).count();
+                let child: usize = d.iter().map(|(_, v)| count_keys(v, key)).sum();
+                here + child
+            }
+            Bson::Array(a) => a.iter().map(|v| count_keys(v, key)).sum(),
+            _ => 0,
+        }
+    }
+    let in_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$in"))
+        .sum();
+    let or_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$or"))
+        .sum();
+    assert_eq!(
+        in_count, 1,
+        "rewriter must collapse the bare-`$field` chain to exactly one $in; got in_count={in_count}, or_count={or_count}",
+    );
+    assert_eq!(or_count, 0, "no $or remaining after collapse");
+
+    // ASSERTION 2: server accepts the query and returns rows. Bypass
+    // the `MongoSqlClient::query` path (which translates SQL via
+    // mongosql); use the raw mongodb client.
+    let mongo = MongoClient::with_uri_str(&uri())
+        .await
+        .expect("mongo client");
+    let coll = mongo
+        .database(TEST_DB)
+        .collection::<bson::Document>("orders");
+    let mut cursor = coll.aggregate(pipeline).await.expect("aggregate accepted");
+    let mut rows: Vec<bson::Document> = Vec::new();
+    while let Some(doc) = cursor.try_next().await.expect("cursor.next") {
+        rows.push(doc);
+    }
+    assert_eq!(
+        rows.len(),
+        3,
+        "manual-pipeline collapse path must return 3 acct_a orders; got {} rows",
+        rows.len(),
+    );
+    for r in &rows {
+        let acct = r.get_str("account_id").expect("account_id string");
+        assert_eq!(
+            acct, "acct_a",
+            "matched row must have account_id == 'acct_a'; got {:?}",
+            r,
+        );
+    }
+
+    // ASSERTION 3: control query — same logical filter through the SQL
+    // path. Must agree on the same row count.
+    let client = MongoSqlClient::new(collection_mode_config());
+    client.test_connection(None).await.expect("test_connection");
+    let sql = large_in_list_sql("orders", 200);
+    let control = client.query(sql, None).await.expect("control SQL query");
+    let control_rows = control
+        .as_object()
+        .and_then(|o| o.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("control rows");
+    assert_eq!(
+        control_rows.len(),
+        rows.len(),
+        "control SQL path must match manual-pipeline path on row count",
+    );
+    client.close().await.expect("close");
+}
+
+/// MAJOR-3 / NOT-IN: drive the rewriter against a manually-constructed
+/// `$and`-of-`$ne` pipeline matching the Atlas SQL NOT-IN shape, so the
+/// COLLAPSE precondition fires for `$and → {$not: {$in: [...]}}`. Runs
+/// end-to-end against atlas-local; asserts:
+///   1. Exactly one `$not` (wrapping a `$in`) in the final pipeline;
+///      zero `$and`s and zero `$nin`s (the latter is invalid in `$expr`).
+///   2. The server accepts and returns rows.
+///   3. Returned rows are the complement of the IN-list seed match
+///      (3 `acct_a` orders are EXCLUDED; the remaining `acct_b` orders
+///      are returned).
+#[tokio::test]
+#[ignore = "requires docker-compose + seeded atlas-local; run after `make e2e:up`. \
+            Exercises the $and→$nin COLLAPSE path for the NOT IN failure mode."]
+async fn query_with_large_not_in_list_collapse_against_atlas_local() {
+    use bson::{doc, Bson};
+    use cubejs_mongosql_driver_native::pipeline_rewrite::flatten_or_chains_and_collapse_to_in;
+    use futures_util::TryStreamExt;
+    use mongodb::Client as MongoClient;
+
+    // 200 synthetic non-matching values + the real seed value `acct_a`
+    // (which should be EXCLUDED by NOT IN). Build a right-leaning `$and`
+    // chain matching the server-side re-expanded shape.
+    let mut values: Vec<&str> = Vec::with_capacity(201);
+    let synthetic: Vec<String> = (0..200).map(|i| format!("v{i}")).collect();
+    for s in &synthetic {
+        values.push(s.as_str());
+    }
+    values.push("acct_a");
+
+    let last_two = values.len() - 2;
+    let mut current = doc! {
+        "$and": [
+            doc! {"$ne": ["$account_id", { "$literal": values[last_two] }]},
+            doc! {"$ne": ["$account_id", { "$literal": values[last_two + 1] }]},
+        ],
+    };
+    for i in (0..last_two).rev() {
+        let leaf = doc! {"$ne": ["$account_id", { "$literal": values[i] }]};
+        current = doc! {
+            "$and": [Bson::Document(leaf), Bson::Document(current)],
+        };
+    }
+
+    let mut pipeline: Vec<bson::Document> = vec![doc! {
+        "$match": { "$expr": Bson::Document(current) },
+    }];
+    flatten_or_chains_and_collapse_to_in(&mut pipeline);
+
+    fn count_keys(b: &Bson, key: &str) -> usize {
+        match b {
+            Bson::Document(d) => {
+                let here = d.iter().filter(|(k, _)| k.as_str() == key).count();
+                let child: usize = d.iter().map(|(_, v)| count_keys(v, key)).sum();
+                here + child
+            }
+            Bson::Array(a) => a.iter().map(|v| count_keys(v, key)).sum(),
+            _ => 0,
+        }
+    }
+    let not_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$not"))
+        .sum();
+    let nin_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$nin"))
+        .sum();
+    let in_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$in"))
+        .sum();
+    let and_count: usize = pipeline
+        .iter()
+        .map(|s| count_keys(&Bson::Document(s.clone()), "$and"))
+        .sum();
+    assert_eq!(
+        not_count, 1,
+        "rewriter must collapse the bare-`$field` $and chain to exactly one $not; got not_count={not_count}, and_count={and_count}, in_count={in_count}",
+    );
+    assert_eq!(
+        in_count, 1,
+        "the $not wraps a single $in (the only $in in the pipeline); got in_count={in_count}",
+    );
+    assert_eq!(
+        nin_count, 0,
+        "$nin must NEVER appear in $expr (rejected by server with code 168); got nin_count={nin_count}",
+    );
+    assert_eq!(and_count, 0, "no $and remaining after collapse");
+
+    // Server accepts the query.
+    let mongo = MongoClient::with_uri_str(&uri())
+        .await
+        .expect("mongo client");
+    let coll = mongo
+        .database(TEST_DB)
+        .collection::<bson::Document>("orders");
+    let mut cursor = coll.aggregate(pipeline).await.expect("aggregate accepted");
+    let mut rows: Vec<bson::Document> = Vec::new();
+    while let Some(doc) = cursor.try_next().await.expect("cursor.next") {
+        rows.push(doc);
+    }
+    // Seed orders: 3 `acct_a` + 2 `acct_b` = 5 total. NOT IN excludes
+    // `acct_a`, so 2 rows return (`acct_b`).
+    assert_eq!(
+        rows.len(),
+        2,
+        "NOT IN must return 2 `acct_b` orders; got {} rows: {:?}",
+        rows.len(),
+        rows,
+    );
+    for r in &rows {
+        let acct = r.get_str("account_id").expect("account_id string");
+        assert_eq!(acct, "acct_b", "NOT IN row must NOT be acct_a; got {:?}", r,);
+    }
+}
+
+/// NOT IN coverage gap (per the critique): the Atlas SQL proxy
+/// re-expands flat `$and`s just like it re-expands flat `$or`s. A
+/// `NOT IN (200 values)` against a real Atlas SQL endpoint fails with
+/// Error 15 (Overflow) — verified empirically. This test pins the
+/// end-to-end fix against the real endpoint.
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn query_with_large_not_in_list_against_atlas_sql() {
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri, db.clone()));
+    client.test_connection(None).await.expect("test_connection");
+
+    // Same collection/field discovery dance as the IN test.
+    let schema_v = client.tables_schema(None).await.expect("tables_schema");
+    let inner = schema_v
+        .as_object()
+        .and_then(|m| m.get(&db))
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("no collections in catalog under `{db}`"));
+    let (coll, field) = inner
+        .iter()
+        .find_map(|(coll_name, cols_value)| {
+            let cols = cols_value.as_array()?;
+            let f = cols.iter().find_map(|c| {
+                let obj = c.as_object()?;
+                let name = obj.get("name").and_then(|v| v.as_str())?;
+                let ty = obj.get("type").and_then(|v| v.as_str())?;
+                if name == "_id" {
+                    return None;
+                }
+                if ty == "string" || ty == "text" {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            })?;
+            Some((coll_name.clone(), f))
+        })
+        .unwrap_or_else(|| {
+            panic!("could not find a string-typed column in any collection under `{db}`");
+        });
+    eprintln!("[atlas-sql large-NOT-IN test] using collection=`{coll}`, field=`{field}`");
+
+    let mut sql = format!("SELECT COUNT(*) AS n FROM `{coll}` WHERE `{field}` NOT IN (");
+    for i in 0..200 {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("'large_not_in_list_test_v{i}'"));
+    }
+    sql.push(')');
+
+    // Pre-fix: BSON depth overflow (Error 15). Post-fix: succeeds.
+    let v = client
+        .query(sql, None)
+        .await
+        .expect("large NOT IN query against atlas-sql must not overflow BSON depth");
+    let obj = v.as_object().expect("object");
+    assert!(obj.contains_key("rows"));
+    assert!(obj.contains_key("types"));
     client.close().await.expect("close");
 }
 

@@ -301,14 +301,22 @@ Rust MongoSqlClient::query(sql)
   │      )?
   │
   ├─ // Post-translation pipeline rewrite (pure, CPU-only). Walks every
-  │   // BSON node in the pipeline and:
-  │   //   1. flattens right-leaning `$or` chains to a flat $or array,
-  │   //   2. collapses same-field `$eq` disjunctions to `$in`.
-  │   // Defends against mongosql v1.8.5's right-leaning `$or` chain for
-  │   // SQL `IN (v1..vN)` at the Atlas SQL endpoint, which busts
-  │   // MongoDB's max BSON nested-object depth (100) for N ≥ ~100.
-  │   // See `crates/native/src/pipeline_rewrite.rs` and the README
-  │   // "Large `IN (...)` lists" troubleshooting section.
+  │   // BSON node in the pipeline and at every `$or` / `$and` location:
+  │   //   1. Flattens any nested chain into a flat array (defensive).
+  │   //   2. Collapses same-field `$eq` disjunctions to `$in` and
+  │   //      same-field `$ne` conjunctions to `{$not: {$in: ...}}`
+  │   //      (NOT `$nin` — invalid in `$expr` context, see
+  │   //      `pipeline_rewrite.rs` module docstring).
+  │   //
+  │   // Why: `mongosql::translate_sql` v1.8.5 outputs a FLAT `$or` /
+  │   // `$and` (depth 1) — but the Atlas SQL endpoint's proxy
+  │   // re-expands flat boolean arrays into a right-leaning chain of
+  │   // binary `$or` / `$and`s server-side. For N ≥ ~100 the chain
+  │   // busts MongoDB's max BSON nested-object depth (100). Collapsing
+  │   // to `$in` / `$nin` defeats the re-expansion (no n-ary boolean
+  │   // array left to chain-ify). See `crates/native/src/pipeline_rewrite.rs`
+  │   // and the README "Large `IN (...)` / `NOT IN (...)` lists"
+  │   // troubleshooting section.
   │   pipeline_rewrite::flatten_or_chains_and_collapse_to_in(&mut pipeline);
   │
   ├─ db = self.mongo_client.database(&target_db)
