@@ -68,6 +68,7 @@ import type {
 
 import { MongoSqlClient, type ColumnType, type TablesSchema } from './native.js';
 import { MongoSqlQuery } from './MongoSqlQuery.js';
+import { resolveUriConfig } from './config.js';
 import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
 
 /**
@@ -78,6 +79,39 @@ import type { MongoSqlConfig, MongoSqlError, SchemaSource } from './types.js';
  * `testConnection()` / `query()` / `tablesSchema()` call so that throwing in
  * the constructor reports config errors crisply (Cube wraps construction
  * exceptions less helpfully than runtime ones).
+ *
+ * **Configuration env vars (see `./config.ts` and README "Configuration"):**
+ *
+ *   Cube-standard (`CUBEJS_DB_*`):
+ *     - `CUBEJS_DB_URL` / `CUBEJS_DB_URI` — full MongoDB connection string
+ *     - `CUBEJS_DB_HOST` / `_PORT` / `_USER` / `_PASS` / `_NAME` — composed URI parts
+ *     - `CUBEJS_DB_NAME` — database (also required separately by the driver)
+ *     - `CUBEJS_DB_SSL` — `tls=true|false`
+ *     - `CUBEJS_DB_MAX_POOL` / `_MIN_POOL` — `maxPoolSize` / `minPoolSize`
+ *     - `CUBEJS_DB_QUERY_TIMEOUT` — per-query `maxTimeMS` (duration string or ms)
+ *     - `CUBEJS_DB_IDLE_TIMEOUT` — `maxIdleTimeMS` (duration string or ms)
+ *
+ *   MongoDB-specific (`CUBEJS_MONGOSQL_*`):
+ *     - `_SCHEMA_SOURCE` — `collection` (default) or `file`
+ *     - `_SCHEMA_FILE` — path (required if `_SCHEMA_SOURCE=file`)
+ *     - `_SCHEMA_REFRESH_SEC` — background refresh cadence in seconds
+ *     - `_SCHEMA_FAIL_OPEN` — `true` to soft-fail initial schema load
+ *     - `_QUERY_TIMEOUT_MS` — (legacy) bare-ms timeout; overridden by
+ *       `CUBEJS_DB_QUERY_TIMEOUT` when both set
+ *     - `_MAX_ROWS` — row cap per query
+ *     - `_APP_NAME` — `appName` (shows up in `serverStatus().connections`)
+ *     - `_MAX_CONNECTING` — `maxConnecting`
+ *     - `_WAIT_QUEUE_TIMEOUT_MS` — `waitQueueTimeoutMS`
+ *     - `_CONNECT_TIMEOUT_MS` — `connectTimeoutMS`
+ *     - `_SOCKET_TIMEOUT_MS` — `socketTimeoutMS`
+ *     - `_SERVER_SELECTION_TIMEOUT_MS` — `serverSelectionTimeoutMS`
+ *     - `_HEARTBEAT_FREQUENCY_MS` — `heartbeatFrequencyMS`
+ *     - `_RETRY_WRITES` / `_RETRY_READS` — `retryWrites` / `retryReads`
+ *     - `_COMPRESSORS` — `compressors`
+ *
+ *   User-set URI params (those already encoded in `CUBEJS_DB_URL/URI`) ALWAYS
+ *   win — we only append env-driven params for keys the URI doesn't already
+ *   specify.
  */
 export class MongoSqlDriver extends BaseDriver {
   private readonly resolvedConfig: MongoSqlConfig;
@@ -442,9 +476,24 @@ function extractAbortSignal(options: Record<string, unknown> | undefined): Abort
 
 type EnvLike = NodeJS.ProcessEnv;
 
+/**
+ * Resolve the runtime `MongoSqlConfig` from constructor overrides + env.
+ *
+ * URI building lives in `./config.ts` — see that module's header for
+ * the env vars honoured, the precedence rules (constructor uri >
+ * `CUBEJS_DB_URL` > `CUBEJS_DB_URI` > composed from `CUBEJS_DB_HOST`
+ * + parts), and the duration-string format accepted by
+ * `CUBEJS_DB_QUERY_TIMEOUT` / `CUBEJS_DB_IDLE_TIMEOUT`.
+ *
+ * Everything else stays here:
+ *   - `database` (required): explicit > `CUBEJS_DB_NAME`.
+ *   - `schemaSource`, `schemaRefreshSec`, `schemaFailOpen`, `maxRows`:
+ *     existing `CUBEJS_MONGOSQL_*` semantics, unchanged.
+ *   - `queryTimeoutMs`: explicit > `CUBEJS_DB_QUERY_TIMEOUT` >
+ *     `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` (resolved in config.ts).
+ */
 function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike): MongoSqlConfig {
-  const uri = override?.uri ?? env.CUBEJS_DB_URI;
-  if (!uri) throw configInvalidMissing('uri (set CUBEJS_DB_URI or pass `uri` to the constructor)');
+  const { uri, queryTimeoutMs: envQueryTimeoutMs } = resolveUriConfig(override?.uri, env);
 
   const database = override?.database ?? env.CUBEJS_DB_NAME;
   if (!database) {
@@ -459,7 +508,7 @@ function buildConfig(override: Partial<MongoSqlConfig> | undefined, env: EnvLike
     schemaSource,
     schemaRefreshSec: override?.schemaRefreshSec ?? numEnv(env.CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC),
     schemaFailOpen: override?.schemaFailOpen ?? boolEnv(env.CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN),
-    queryTimeoutMs: override?.queryTimeoutMs ?? numEnv(env.CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS),
+    queryTimeoutMs: override?.queryTimeoutMs ?? envQueryTimeoutMs,
     maxRows: override?.maxRows ?? numEnv(env.CUBEJS_MONGOSQL_MAX_ROWS),
   };
 }

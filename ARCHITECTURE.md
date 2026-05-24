@@ -56,7 +56,8 @@ Two arrows from Rust to the cluster: data queries (MQL) and schema reads — bot
 |---|---|---|
 | `index.ts` | Public exports | All others |
 | `types.ts` | Public types | (none) |
-| `MongoSqlDriver.ts` | `BaseDriver` impl; delegates to native | `native.ts`, `MongoSqlQuery.ts` |
+| `config.ts` | Env → URI mapping (Cube-standard `CUBEJS_DB_*` + Mongo-specific `CUBEJS_MONGOSQL_*`); duration parser; precedence rules | `types.ts` |
+| `MongoSqlDriver.ts` | `BaseDriver` impl; delegates to native | `native.ts`, `MongoSqlQuery.ts`, `config.ts` |
 | `MongoSqlQuery.ts` | `BaseQuery` impl; SQL dialect overrides | `@cubejs-backend/schema-compiler` |
 | `native.ts` | Type-safe wrapper around the `.node` module | (loads native binary) |
 
@@ -179,6 +180,80 @@ schema:
 File is parsed once; same internal representation as Collection-mode.
 
 ## 4. Query path — detailed
+
+### 4.0 Config / connection lifecycle
+
+The driver's TypeScript layer is the single place that translates env vars into a MongoDB connection URI. The Rust client accepts the URI verbatim and hands it to `mongodb::Client::with_uri_str`; the mongodb crate parses every option it supports (see `~/.cargo/registry/.../mongodb-3.7.0/src/client/options.rs:2262-2790` for the canonical match list).
+
+```
+process.env
+  │
+  ▼
+src/config.ts :: resolveUriConfig(overrideUri?, env)
+  │
+  ├─ pick base URI by precedence:
+  │     constructor `uri`  >  CUBEJS_DB_URL  >  CUBEJS_DB_URI
+  │     >  compose mongodb://[user:pass@]host[:port]/[db] from
+  │        CUBEJS_DB_HOST + _PORT + _USER + _PASS + _NAME
+  │     (HOST required when no URL/URI; user/pass URL-encoded)
+  │
+  ├─ for each (env var → URI param) mapping in URI_PARAM_SPECS:
+  │     - parse + validate value (bool / int / duration / non-empty)
+  │     - SKIP if the URI's existing query string already has the key
+  │       (user-set URI params ALWAYS win — case-insensitive match)
+  │     - otherwise append `key=encodeURIComponent(value)`
+  │
+  ├─ resolve `queryTimeoutMs`:
+  │     CUBEJS_DB_QUERY_TIMEOUT (duration-aware; throws on garbage)
+  │     >  CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS (legacy; lenient)
+  │
+  └─ return { uri, queryTimeoutMs }
+        │
+        ▼
+MongoSqlDriver.buildConfig — also reads CUBEJS_DB_NAME (required),
+CUBEJS_MONGOSQL_SCHEMA_* (mode / file / refresh / fail-open), and
+CUBEJS_MONGOSQL_MAX_ROWS. Hands the final MongoSqlConfig to the native
+client constructor.
+        │
+        ▼
+crates/native/src/client.rs :: MongoSqlClient::new(config)
+  │   stores config; defers any I/O.
+  ▼
+…on first testConnection() / query():
+mongodb::Client::with_uri_str(config.uri)
+  │   parses every URI param into ClientOptions (pool, TLS, timeouts,
+  │   appName, compressors, …). Errors here surface as
+  │   MONGOSQL_CONNECT_FAILED.
+```
+
+URI params honoured (env var ↔ URI param):
+
+| Env var | URI param |
+|---|---|
+| `CUBEJS_DB_SSL` | `tls` |
+| `CUBEJS_DB_MAX_POOL` / `CUBEJS_DB_MIN_POOL` | `maxPoolSize` / `minPoolSize` |
+| `CUBEJS_DB_IDLE_TIMEOUT` | `maxIdleTimeMS` (duration string or ms) |
+| `CUBEJS_MONGOSQL_MAX_CONNECTING` | `maxConnecting` |
+| `CUBEJS_MONGOSQL_WAIT_QUEUE_TIMEOUT_MS` | `waitQueueTimeoutMS` |
+| `CUBEJS_MONGOSQL_CONNECT_TIMEOUT_MS` | `connectTimeoutMS` |
+| `CUBEJS_MONGOSQL_SOCKET_TIMEOUT_MS` | `socketTimeoutMS` |
+| `CUBEJS_MONGOSQL_SERVER_SELECTION_TIMEOUT_MS` | `serverSelectionTimeoutMS` |
+| `CUBEJS_MONGOSQL_HEARTBEAT_FREQUENCY_MS` | `heartbeatFrequencyMS` |
+| `CUBEJS_MONGOSQL_APP_NAME` | `appName` |
+| `CUBEJS_MONGOSQL_RETRY_WRITES` / `_RETRY_READS` | `retryWrites` / `retryReads` |
+| `CUBEJS_MONGOSQL_COMPRESSORS` | `compressors` |
+
+`CUBEJS_DB_QUERY_TIMEOUT` is the only Cube-standard knob that does NOT map to a URI param — it controls the aggregation pipeline's `maxTimeMS`, applied by the Rust client on each query. The `mongodb` crate's `maxTimeMS` is per-operation and not part of the connection string.
+
+Duration parser (used by `CUBEJS_DB_QUERY_TIMEOUT` and `CUBEJS_DB_IDLE_TIMEOUT`):
+
+  - bare number → milliseconds (`"60000"` → 60_000)
+  - `<N>ms` → milliseconds
+  - `<N>s` → seconds → milliseconds
+  - `<N>m` → minutes → milliseconds
+  - `<N>h` → hours → milliseconds
+
+Anything else throws `MONGOSQL_CONFIG_INVALID` naming the env var.
 
 ### 4.1 Per-query sequence
 

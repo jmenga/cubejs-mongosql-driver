@@ -100,22 +100,35 @@ The driver MUST work with Cube pre-aggregations:
 
 ### FR-7 — Configuration
 
-All configuration via standard Cube env vars where they exist; new `CUBEJS_MONGOSQL_*` vars where they don't.
+All configuration via standard Cube env vars where they exist; new `CUBEJS_MONGOSQL_*` vars where they don't. Where both exist for the same setting, the Cube-standard `CUBEJS_DB_*` var wins. See README "Configure" for the full table with defaults; the SPEC table below is the minimal contract.
+
+**Connection identity** — driver requires one of (precedence top → bottom):
+
+1. Constructor `uri` argument
+2. `CUBEJS_DB_URL`
+3. `CUBEJS_DB_URI` (legacy alias)
+4. Composed from `CUBEJS_DB_HOST` + optional `CUBEJS_DB_PORT` / `CUBEJS_DB_USER` / `CUBEJS_DB_PASS` / `CUBEJS_DB_NAME` (URL-encoded into the composed URI)
 
 | Env var | Required? | Default | Purpose |
 |---|---|---|---|
 | `CUBEJS_DB_TYPE` | yes | — | Must be `mongosql` for Cube to route to this driver |
-| `CUBEJS_DB_URI` | yes (or HOST/USER/PASS/NAME) | — | Full MongoDB connection string |
-| `CUBEJS_DB_HOST` | (legacy alt) | — | Cluster hostname |
+| `CUBEJS_DB_URL` / `CUBEJS_DB_URI` | yes (or HOST) | — | Full MongoDB connection string |
+| `CUBEJS_DB_HOST` / `CUBEJS_DB_PORT` | (compose alt) | — | Host (single or seed list) + optional port |
+| `CUBEJS_DB_USER` / `CUBEJS_DB_PASS` | (SCRAM only) | — | SCRAM credentials (URL-encoded) |
 | `CUBEJS_DB_NAME` | yes | — | Database name (where `__sql_schemas` lives if Collection mode) |
-| `CUBEJS_DB_USER` / `CUBEJS_DB_PASS` | (SCRAM only) | — | SCRAM credentials |
-| `CUBEJS_DB_SSL` | no | `true` | TLS (Atlas requires it) |
+| `CUBEJS_DB_SSL` | no | (URI / mongo default) | TLS (`tls=true` on the URI) |
+| `CUBEJS_DB_MAX_POOL` / `CUBEJS_DB_MIN_POOL` | no | mongo default | Pool size (`maxPoolSize` / `minPoolSize`) |
+| `CUBEJS_DB_QUERY_TIMEOUT` | no | `10m` | Per-query timeout (duration string OR bare ms). Wins over `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` |
+| `CUBEJS_DB_IDLE_TIMEOUT` | no | mongo default | `maxIdleTimeMS` (duration string OR bare ms) |
 | `CUBEJS_MONGOSQL_SCHEMA_SOURCE` | no | `collection` | `collection` or `file` |
 | `CUBEJS_MONGOSQL_SCHEMA_FILE` | (file mode) | — | Path to YAML/JSON schema file |
 | `CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC` | no | `300` | Refresh interval in seconds |
 | `CUBEJS_MONGOSQL_SCHEMA_FAIL_OPEN` | no | `false` | If `true`, don't fail testConnection on initial schema-load failure |
-| `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | no | `60000` | Per-query timeout |
+| `CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS` | no | `60000` | Legacy bare-ms timeout; honoured when `CUBEJS_DB_QUERY_TIMEOUT` is unset |
 | `CUBEJS_MONGOSQL_MAX_ROWS` | no | `100000` | Max rows returned per query (driver buffers; see NFR-1). Exceeding throws `MONGOSQL_RESULT_TOO_LARGE` |
+| `CUBEJS_MONGOSQL_{APP_NAME, MAX_CONNECTING, WAIT_QUEUE_TIMEOUT_MS, CONNECT_TIMEOUT_MS, SOCKET_TIMEOUT_MS, SERVER_SELECTION_TIMEOUT_MS, HEARTBEAT_FREQUENCY_MS, RETRY_WRITES, RETRY_READS, COMPRESSORS}` | no | mongo default | Mongo URI tunables not in Cube's standard set; see README for one-to-one mapping to `appName` / `maxConnecting` / etc. |
+
+User-set params inside `CUBEJS_DB_URL` / `CUBEJS_DB_URI` always win — env-driven values only fill in keys the URI hasn't specified.
 
 ## 4. Non-functional requirements
 

@@ -181,6 +181,53 @@ describe('MongoSqlDriver — constructor / config', () => {
     new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
     expect(createdClients).toBe(0);
   });
+
+  // ---------- Cube-standard env var integration (see src/config.ts) ----------
+
+  it('reads CUBEJS_DB_URL when CUBEJS_DB_URI is not set', async () => {
+    process.env.CUBEJS_DB_URL = 'mongodb://from-url/x';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { uri: string }).uri).toBe('mongodb://from-url/x');
+  });
+
+  it('appends env-driven Mongo URI params to the configured URI', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_MAX_POOL = '50';
+    process.env.CUBEJS_DB_IDLE_TIMEOUT = '60s';
+    process.env.CUBEJS_MONGOSQL_APP_NAME = 'cube-test';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    const uri = (lastClient!.config as { uri: string }).uri;
+    expect(uri).toMatch(/maxPoolSize=50/);
+    expect(uri).toMatch(/maxIdleTimeMS=60000/);
+    expect(uri).toMatch(/appName=cube-test/);
+  });
+
+  it('CUBEJS_DB_QUERY_TIMEOUT (duration) maps to queryTimeoutMs', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_QUERY_TIMEOUT = '5s';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { queryTimeoutMs: number }).queryTimeoutMs).toBe(5_000);
+  });
+
+  it('CUBEJS_DB_QUERY_TIMEOUT takes precedence over CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS', async () => {
+    process.env.CUBEJS_DB_URI = 'mongodb://h/db';
+    process.env.CUBEJS_DB_NAME = 'analytics';
+    process.env.CUBEJS_DB_QUERY_TIMEOUT = '5s';
+    process.env.CUBEJS_MONGOSQL_QUERY_TIMEOUT_MS = '99999';
+    installMockNative();
+    const d = new MongoSqlDriver();
+    await d.testConnection();
+    expect((lastClient!.config as { queryTimeoutMs: number }).queryTimeoutMs).toBe(5_000);
+  });
 });
 
 describe('MongoSqlDriver — query() row flattening', () => {

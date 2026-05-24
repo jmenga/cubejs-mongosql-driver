@@ -37,6 +37,7 @@
  * "dimension query" test, which would have failed pre-fix.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { execSync } from 'node:child_process';
 
 const CUBE_URL = process.env.CUBE_E2E_URL ?? 'http://localhost:4000';
 const LOAD_ENDPOINT = `${CUBE_URL}/cubejs-api/v1/load`;
@@ -117,6 +118,43 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     // consistent shape and any test-specific resources can be released
     // here in future without restructuring.
   });
+
+  it('CUBEJS_MONGOSQL_APP_NAME reaches MongoDB (env → URI → server)', async () => {
+    // The docker-compose under examples/docker sets
+    // `CUBEJS_MONGOSQL_APP_NAME=cube-e2e-driver`. The driver's
+    // src/config.ts maps that to `appName=cube-e2e-driver` on the URI,
+    // and the mongodb crate forwards it as the client `appName` on every
+    // connection. MongoDB surfaces it via `$currentOp.appName` and
+    // `db.serverStatus().connections`-adjacent reflections.
+    //
+    // We trigger an active op (a real query through Cube), then poll
+    // `$currentOp` from atlas-local for an op whose `appName` matches.
+    // Polling rather than a single check, because Mongo retires the op
+    // entry as soon as the query completes.
+    const appName = 'cube-e2e-driver';
+
+    // Issue a query so a client connection is live.
+    await loadQuery({ query: { measures: ['orders.count'] } });
+
+    // execSync wraps the command in `/bin/sh -c '<cmd>'`. Feed the
+    // script to mongosh on stdin so the outer shell never sees the
+    // `$` characters used by mongo aggregation operators (`$currentOp`,
+    // `$match`, ...). Wrap with `print(...)` so the REPL emits a
+    // single-line marker we can match against. `--norc` skips
+    // ~/.mongoshrc on the container.
+    const compose = (script: string): string =>
+      execSync(
+        `docker compose -f examples/docker/docker-compose.yaml exec -T atlas-local mongosh --quiet --norc -u admin -p admin --authenticationDatabase admin`,
+        { encoding: 'utf-8', input: `print(${script})\n` },
+      ).trim();
+
+    // idleConnections:true so the appName tag on a recently-served-then-
+    // pooled connection is still visible after the query returned.
+    const out = compose(
+      `JSON.stringify(db.getSiblingDB('admin').aggregate([{$currentOp:{allUsers:true,idleConnections:true}},{$match:{appName:${JSON.stringify(appName)}}},{$limit:1},{$project:{appName:1,_id:0}}]).toArray())`,
+    );
+    expect(out).toContain(appName);
+  }, 30_000);
 
   it('count measure — basic load returns the documented Cube load shape', async () => {
     const body = await loadQuery({
