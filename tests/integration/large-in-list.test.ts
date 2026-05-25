@@ -156,6 +156,35 @@ describe('MongoSqlDriver — large IN-list workaround', () => {
     const rows = await driver.query<{ n: number }>(sql);
     expect(Array.isArray(rows)).toBe(true);
   });
+
+  // The user-reported failure shape: GROUP BY + IN list (161 values).
+  // Mongosql v1.8.5 emits the `$let`-wrapped IN-list shape when GROUP BY
+  // is in the SQL (the per-operand-`$let` diagram is documented in
+  // `crates/native/src/pipeline_rewrite.rs` under the "$let-wrapped
+  // IN-list shape" section; shape detection is also exercised by the
+  // `probe_atlas_sql_in_list_shape` probe). The Rust-side
+  // `pipeline_rewrite::collapse_mongosql_in_list_let` rewrite replaces
+  // the entire `$let` with a `$cond`-wrapped `$in`, defeating the Atlas
+  // SQL proxy's re-expansion. This atlas-local test verifies the
+  // rewrite at the wire level: the query must SUCCEED and return
+  // well-formed grouped results (atlas-local is plain MongoDB without
+  // the SQL proxy, so the pre-fix BSON-depth overflow doesn't reproduce
+  // here — but the rewrite must remain semantics-preserving against an
+  // unmodified server).
+  it('GROUP BY + IN list with 161 values succeeds (user-reported shape)', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 161; i++) values.push(`groupby_in_test_v${i}`);
+    // Include the real seed value so we get a non-empty grouped result.
+    values.push('acct_a');
+    const inList = values.map((v) => `'${v}'`).join(', ');
+    const sql = `SELECT account_id, COUNT(*) AS n FROM orders WHERE account_id IN (${inList}) GROUP BY account_id`;
+    const rows = await driver.query<{ account_id: string; n: number | string }>(sql);
+    expect(Array.isArray(rows)).toBe(true);
+    // The 3 `acct_a` orders all group into a single row with n=3.
+    const acct_a = rows.find((r) => r.account_id === 'acct_a');
+    expect(acct_a, `rows=${JSON.stringify(rows)}`).toBeDefined();
+    expect(Number(acct_a?.n)).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------

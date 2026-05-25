@@ -5,17 +5,21 @@
  * to be healthy AND for `__sql_schemas` to be populated, and exports a default
  * `TEST_MONGO_URI` for tests that don't set one.
  *
- * Tear-down: by default we only stop containers (`down`, no `-v`) so the next
- * `pnpm test:integration` run can reuse the seeded volume and skip the ~30 s
- * mongod-replicaset bootstrap. Set `INTEGRATION_TEARDOWN=destroy` to force
- * `down -v` (used by `make e2e`).
+ * Tear-down: by default we destroy volumes (`down -v`) so the next run
+ * starts from a fresh replica-set state. The atlas-local image embeds the
+ * randomly-generated container hostname into the persisted replSet config —
+ * preserving `/data/db` across container recreates results in
+ * "replica set config is invalid or we are not a member of it" on the next
+ * start, followed by mongod shutdown. Skipping the ~30 s replicaset bootstrap
+ * on subsequent runs is not safe.
  *
  * Set `INTEGRATION_TEARDOWN=keep` to leave containers running between runs
  * (useful for iterative test development — pair with `make e2e:up`).
+ * Set `INTEGRATION_TEARDOWN=stop` to keep volumes (not recommended; see above).
  *
  * Required env (with sensible defaults):
  *   - TEST_MONGO_URI       default: admin/admin@localhost:27017 directConnection
- *   - INTEGRATION_TEARDOWN default: 'stop' ('keep' | 'stop' | 'destroy')
+ *   - INTEGRATION_TEARDOWN default: 'destroy' ('keep' | 'stop' | 'destroy')
  */
 import { execSync, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -74,7 +78,16 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
  * change.
  */
 function reseed(): void {
-  const scripts = ['/docker-entrypoint-initdb.d/01-seed-data.js', '/docker-entrypoint-initdb.d/02-seed-schemas.js'];
+  // All four initdb scripts. atlas-local runs these on first volume
+  // init; we re-run each setup so pre-existing volumes pick up newly
+  // added collections (e.g. the `mongosql_test_secondary` Gap 8
+  // tenant).
+  const scripts = [
+    '/docker-entrypoint-initdb.d/01-seed-data.js',
+    '/docker-entrypoint-initdb.d/02-seed-schemas.js',
+    '/docker-entrypoint-initdb.d/03-seed-secondary-data.js',
+    '/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js',
+  ];
   for (const script of scripts) {
     execSync(
       `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --file ${script}`,
@@ -86,7 +99,7 @@ function reseed(): void {
 export default async function setup() {
   if (!process.env.TEST_MONGO_URI) process.env.TEST_MONGO_URI = DEFAULT_URI;
 
-  const teardownMode = process.env.INTEGRATION_TEARDOWN ?? 'stop';
+  const teardownMode = process.env.INTEGRATION_TEARDOWN ?? 'destroy';
 
   console.log('integration setup: starting docker compose...');
   spawn('docker', ['compose', '-f', COMPOSE_FILE, 'up', '-d'], { stdio: 'inherit' });

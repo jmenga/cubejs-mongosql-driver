@@ -319,7 +319,10 @@ fn bson_type_name_to_sql(name: BsonTypeName) -> &'static str {
         BsonTypeName::DbPointer => "string",
         BsonTypeName::BinData => "string",
         BsonTypeName::Int => "int",
-        BsonTypeName::Long => "int",
+        // Long is BSON NumberLong (Int64). Mapping to "bigint" preserves the
+        // full i64 range — collapsing to "int" silently truncates / mis-tags
+        // values past i32::MAX downstream in Cube Store column-type tracking.
+        BsonTypeName::Long => "bigint",
         BsonTypeName::Double => "double",
         BsonTypeName::Decimal => "decimal",
         BsonTypeName::Bool => "boolean",
@@ -3091,5 +3094,61 @@ mod tests {
             }
             other => panic!("expected SchemaInvalid, got {other:?}"),
         }
+    }
+
+    /// `BsonTypeName::Long` (BSON NumberLong / Int64) maps to SQL `"bigint"`,
+    /// preserving the full i64 range. Mapping to `"int"` would silently
+    /// truncate values past `i32::MAX` downstream in Cube Store's column-type
+    /// tracker. Matches the query-result column-type derivation in
+    /// `execute::cube_type_for_schema` (which also emits `"bigint"`).
+    #[test]
+    fn bson_long_maps_to_bigint_not_int() {
+        let docs = vec![make_doc(
+            "events",
+            doc! {
+                // i64 well above i32::MAX — `Long` is the BSON type for these.
+                "row_count": { "bsonType": "long" },
+                "compare_int": { "bsonType": "int" },
+            },
+        )];
+        let loaded = {
+            let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
+            for d in docs {
+                let coll = d.get_str("_id").unwrap().to_string();
+                let raw = d
+                    .get_document("schema")
+                    .unwrap()
+                    .get_document("jsonSchema")
+                    .unwrap();
+                let schema: JsonSchema = bson::from_document(raw.clone()).unwrap();
+                by_db
+                    .entry("mydb".to_string())
+                    .or_default()
+                    .insert(coll, schema);
+            }
+            build_loaded_schema(by_db).expect("builds")
+        };
+        let cols = loaded
+            .columns
+            .get(&("mydb".to_string(), "events".to_string()))
+            .expect("events collection columns");
+        let long_col = cols
+            .iter()
+            .find(|c| c.name == "row_count")
+            .expect("row_count col");
+        let int_col = cols
+            .iter()
+            .find(|c| c.name == "compare_int")
+            .expect("compare_int col");
+        assert_eq!(
+            long_col.sql_type, "bigint",
+            "BsonTypeName::Long must map to bigint, got {}",
+            long_col.sql_type,
+        );
+        assert_eq!(
+            int_col.sql_type, "int",
+            "BsonTypeName::Int still maps to int (regression guard); got {}",
+            int_col.sql_type,
+        );
     }
 }

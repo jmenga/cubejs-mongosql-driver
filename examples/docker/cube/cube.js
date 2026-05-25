@@ -24,7 +24,29 @@
  */
 const { MongoSqlDriver, MongoSqlQuery } = require('mongosql-cubejs-driver');
 
+// Resolve which Mongo database a request maps to based on the Cube
+// `dataSource` configured on each cube model. This is the
+// `driverFactory(ctx)` multi-tenant pattern from Cube's docs.
+//
+// - Cubes WITHOUT a `data_source:` (or `data_source: 'default'`) get
+//   the primary driver — pulls database from `CUBEJS_DB_NAME` env.
+// - Cubes WITH `data_source: 'secondary'` get a driver explicitly
+//   pointed at `mongosql_test_secondary`.
+//
+// Cube caches one driver instance per `dataSource` name (per the
+// `DriverFactoryByDataSource` contract in
+// `@cubejs-backend/server-core/dist/src/core/RefreshScheduler.js`), so
+// each branch is invoked once per process lifetime, not per query.
+const DRIVER_FACTORY = (ctx) => {
+  // Cube passes `{ dataSource }`; default to 'default' when not set.
+  const ds = ctx?.dataSource || 'default';
+  if (ds === 'secondary') {
+    return new MongoSqlDriver({ database: 'mongosql_test_secondary' });
+  }
+  return new MongoSqlDriver({});
+};
+
 module.exports = {
-  driverFactory: () => new MongoSqlDriver({}),
+  driverFactory: DRIVER_FACTORY,
   dialectFactory: () => MongoSqlQuery,
 };

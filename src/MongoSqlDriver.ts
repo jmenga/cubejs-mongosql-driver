@@ -12,16 +12,27 @@
  *   - testConnection()                     — REQUIRED, override (lazy native init)
  *   - release()                            — override (closes native client)
  *   - tablesSchema()                       — override (delegate to native)
- *   - downloadQueryResults(sql, ...)       — override → query() shape; we have no streaming
+ *   - downloadQueryResults(sql, ...)       — override → memory shape; streamImport ignored
+ *                                            (capabilities().streamImport=false; see below)
  *   - capabilities()                       — override → no export bucket / streaming source
  *   - nowTimestamp()                       — INHERIT (Date.now())
+ *   - stream(table, values, opts)          — NOT implemented; `streamImport: false`
+ *                                            advertises this. Cube routes the
+ *                                            pre-agg upload path through
+ *                                            `downloadQueryResults` instead.
  *
  *  Schema-introspection helpers (BaseDriver default reads information_schema —
- *  MongoSQL doesn't expose one, so we route to tablesSchema() / native):
- *   - getSchemas()                         — N/A — we serve via tablesSchema()
+ *  MongoSQL doesn't expose one, so we route every shape through the native
+ *  cached `tablesSchema()` rendering):
+ *   - tablesSchema()                       — override (full snapshot, bulk path)
+ *   - getSchemas()                         — override (DB list from tablesSchema)
+ *   - getTablesForSpecificSchemas(...)     — override (filter tablesSchema by db)
+ *   - getColumnsForSpecificTables(...)     — override (filter tablesSchema by table)
+ *   - capabilities().incrementalSchemaLoading=true — opts Cube into the
+ *                                            granular three-method path; SQL
+ *                                            information_schema queries are
+ *                                            never issued against mongosql.
  *   - getTablesQuery(schema)               — N/A — runs SQL against information_schema
- *   - getTablesForSpecificSchemas(...)     — N/A
- *   - getColumnsForSpecificTables(...)     — N/A
  *   - informationSchemaQuery()             — N/A (protected default)
  *   - tableColumnTypes(table)              — INHERIT (uses query()); only needed for
  *                                            uploadTableWithIndexes path which we reject
@@ -61,7 +72,10 @@ import type {
   DriverCapabilities,
   ExternalCreateTableOptions,
   IndexesSQL,
+  QueryColumnsResult,
   QueryOptions,
+  QuerySchemasResult,
+  QueryTablesResult,
   TableColumn,
   TableStructure,
 } from '@cubejs-backend/base-driver';
@@ -162,12 +176,109 @@ export class MongoSqlDriver extends BaseDriver {
     const signal = extractAbortSignal(options);
     const client = this.ensureClient();
     const raw = await client.query<Record<string, unknown>>(finalSql, signal);
-    return flattenRows<R>(raw);
+    const flat = flattenRows<Record<string, unknown>>(raw);
+    return normalizeRowShape<R>(flat);
   }
 
   public override async tablesSchema(): Promise<TablesSchema> {
     const client = this.ensureClient();
     return client.tablesSchema();
+  }
+
+  /**
+   * Cube's incremental-schema-loading entry point #1.
+   *
+   * Returns the list of schemas (databases) we expose. BaseDriver's
+   * default issues `SELECT table_schema ... FROM information_schema.tables`,
+   * which MongoSQL has no equivalent for. We re-render from the cached
+   * `tablesSchema()` snapshot — which the native side already keeps
+   * fresh via the background refresh task (SPEC FR-3 / ARCHITECTURE §3.2).
+   * Each call into `client.tablesSchema()` returns a fresh clone of the
+   * cached snapshot, so the cost is O(N) in catalog column count — for
+   * the typical few-thousand-cell catalog this is sub-millisecond on the
+   * hot path (no native I/O, no `__sql_schemas` round-trip).
+   *
+   * Driver only ever exposes the database configured at construction
+   * (FR-7 — `CUBEJS_DB_NAME`), so the returned list has at most one
+   * entry. An empty list is possible if no schemas have been loaded
+   * yet (e.g. `testConnection()` was never called or the schema source
+   * is empty); Cube handles that case the same way it would for the
+   * SQL path's empty resultset.
+   */
+  public override async getSchemas(): Promise<QuerySchemasResult[]> {
+    const snapshot = await this.tablesSchema();
+    return Object.keys(snapshot).map((schema_name) => ({ schema_name }));
+  }
+
+  /**
+   * Cube's incremental-schema-loading entry point #2.
+   *
+   * For each requested schema, returns its table list from the cached
+   * `tablesSchema()`. Schemas the snapshot doesn't know about are
+   * silently dropped — mirrors the SQL path's "WHERE schema IN (...)"
+   * which would naturally exclude unknown names. Passing an empty
+   * `schemas` array returns an empty result with no native I/O cost
+   * beyond a single cache read.
+   */
+  public override async getTablesForSpecificSchemas(schemas: QuerySchemasResult[]): Promise<QueryTablesResult[]> {
+    if (schemas.length === 0) return [];
+    const snapshot = await this.tablesSchema();
+    const out: QueryTablesResult[] = [];
+    for (const { schema_name } of schemas) {
+      const tables = snapshot[schema_name];
+      if (!tables) continue;
+      for (const table_name of Object.keys(tables)) {
+        out.push({ schema_name, table_name });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Cube's incremental-schema-loading entry point #3.
+   *
+   * For each requested `(schema_name, table_name)`, returns one row
+   * per column with `column_name` and `data_type`. `data_type` is the
+   * Cube generic-type string emitted by the native side (`string`,
+   * `int`, `bigint`, `decimal`, `boolean`, `timestamp`, `text`) — the
+   * same values that surface in `tablesSchema()`. Unknown tables are
+   * silently dropped, same contract as `getTablesForSpecificSchemas`.
+   *
+   * `attributes` is forwarded verbatim from the column descriptor IF
+   * a future native version supplies one — but the Rust `do_tables_schema`
+   * (crates/native/src/client.rs:314) always emits `attributes: []` today,
+   * so in production this is effectively always an empty array. We do
+   * not emit `primaryKey` automatically — MongoDB's implicit `_id` IS a
+   * primary key, but tagging it without explicit schema annotation would
+   * surface as a foreign-key target in Cube's relationship inference and
+   * break heuristic joins. The TS-side forwarding path exists for a
+   * future Rust change where `__sql_schemas` documents' attribute fields
+   * are propagated; callers that need the tag today still must encode
+   * it explicitly in their __sql_schemas document AND in a Rust patch
+   * that surfaces it through `ColumnSchema::attributes`.
+   *
+   * `foreign_keys` is not derivable from MongoDB schema documents — the
+   * field is omitted (Cube's `QueryColumnsResult` declares it as
+   * optional via the spread of `TableColumnQueryResult`).
+   */
+  public override async getColumnsForSpecificTables(tables: QueryTablesResult[]): Promise<QueryColumnsResult[]> {
+    if (tables.length === 0) return [];
+    const snapshot = await this.tablesSchema();
+    const out: QueryColumnsResult[] = [];
+    for (const { schema_name, table_name } of tables) {
+      const cols = snapshot[schema_name]?.[table_name];
+      if (!cols) continue;
+      for (const col of cols) {
+        out.push({
+          schema_name,
+          table_name,
+          column_name: col.name,
+          data_type: col.type,
+          attributes: col.attributes,
+        });
+      }
+    }
+    return out;
   }
 
   public override async release(): Promise<void> {
@@ -186,6 +297,28 @@ export class MongoSqlDriver extends BaseDriver {
     // Pass through any caller-supplied AbortSignal so downloadQueryResults
     // is cancellable on the same terms as query().
     const signal = extractAbortSignal(options as Record<string, unknown> | undefined);
+    // The DownloadQueryResultsOptions interface includes `streamImport`
+    // (driver advertises whether it can stream rows during pre-aggregation
+    // builds). We advertise `streamImport: false` in `capabilities()` —
+    // mongosql v1.8.5 has no streaming cursor wired through napi-rs
+    // (napi-rs's ThreadsafeFunction round-trip is post-MVP per SPEC
+    // NFR-1) and the result is buffered up to `CUBEJS_MONGOSQL_MAX_ROWS`.
+    //
+    // Cube's contract: when a driver advertises `streamImport: false`,
+    // Cube does NOT call `downloadQueryResults` with `streamImport:
+    // true` (the option is reserved for `streamImport: true` drivers).
+    // We honor the contract by ignoring the flag entirely: callers that
+    // pass `streamImport: true` get the same memory `{rows, types}`
+    // shape — the option has no effect. This mirrors the BaseDriver
+    // default (`base-driver/dist/src/BaseDriver.js`), which also ignores
+    // `streamImport`.
+    //
+    // If a future caller wants streaming, the right shape is for the
+    // driver to ALSO implement the optional `stream(table, values,
+    // options) -> StreamTableData` method on `DriverInterface` (see
+    // `driver.interface.d.ts`). We do not implement it; until we do,
+    // `streamImport: false` is the right capability flag and the only
+    // honest answer is to keep returning the memory shape.
     // Cube's pre-aggregation upload path passes `types` (a `[{name, type},
     // ...]` list) to Cube Store to drive the LOAD ROWS column list. The
     // types come from `mongosql::Translation::{select_order, result_set_schema}`
@@ -209,16 +342,52 @@ export class MongoSqlDriver extends BaseDriver {
     }
     const client = this.ensureClient();
     const { rows, types } = await client.queryWithTypes<Record<string, unknown>>(finalSql, signal);
-    return { rows: flattenRows(rows), types: types.map(normalizeColumnType) };
+    // Use the authoritative type list (from `mongosql::Translation::select_order`)
+    // to null-fill any key that's expected by the projection but missing
+    // from some/all rows. Same root cause as `normalizeRowShape` — see its
+    // doc-comment. Here we prefer the type list over union-of-keys because
+    // (a) it's deterministic, and (b) it covers the edge case where a
+    // column is missing from EVERY row (a union would miss it; the type
+    // list still names it).
+    const flat = flattenRows<Record<string, unknown>>(rows);
+    const expected = types.map((t) => t.name);
+    // NOTE: Mutates `flat` in place (see `normalizeRowShape` doc-comment for the
+    // mutation contract). First pass: null-fill every projected column named in
+    // the authoritative type list — covers the rare case where a column is
+    // missing from EVERY row (a pure union-of-keys would miss it). If `expected`
+    // is empty (e.g. an empty native response with no types), the for-loop is a
+    // no-op and the union pass below alone honors the FR-1 contract.
+    for (const k of expected) {
+      for (const r of flat) {
+        if (!Object.hasOwn(r, k)) r[k] = null;
+      }
+    }
+    // Belt-and-braces union-of-keys pass — handles any row keys outside
+    // `expected` (e.g. a future mongosql version emitting an extra envelope
+    // field) so this path honors the FR-1 "every row has the same key set"
+    // contract symmetrically with `query()`.
+    normalizeRowShape<Record<string, unknown>>(flat);
+    return { rows: flat, types: types.map(normalizeColumnType) };
   }
 
   public override capabilities(): DriverCapabilities {
     return {
-      // No EXPORT_BUCKET, no streaming source, no incremental schema loading.
+      // No EXPORT_BUCKET, no streaming source, no CSV/stream import path.
       unloadWithoutTempTable: false,
       streamingSource: false,
-      incrementalSchemaLoading: false,
+      // We implement getSchemas / getTablesForSpecificSchemas /
+      // getColumnsForSpecificTables on top of the cached native
+      // `tablesSchema()` snapshot. Cube uses the granular three-method
+      // path when this flag is true, which means it never falls back to
+      // the BaseDriver default that issues SQL against
+      // `information_schema.*` (MongoSQL has no such schema).
+      incrementalSchemaLoading: true,
       csvImport: false,
+      // Driver has no streaming cursor wired through napi-rs
+      // (ThreadsafeFunction round-trip is post-MVP per SPEC NFR-1) so
+      // pre-aggregation builds use `downloadQueryResults`'s memory shape
+      // capped at `CUBEJS_MONGOSQL_MAX_ROWS`. The option is honored by
+      // `downloadQueryResults` as a no-op — see that method's comment.
       streamImport: false,
     };
   }
@@ -316,6 +485,66 @@ export class MongoSqlDriver extends BaseDriver {
 function flattenRows<R>(rows: Array<Record<string, unknown>>): R[] {
   return rows.map((row) => flattenRow<R>(row));
 }
+
+/**
+ * Make every row's key set identical by null-filling missing keys.
+ *
+ * **Mutates `rows` in place** — callers must not retain references to
+ * the pre-normalize array if they need the original sparse shape. The
+ * returned reference is the same array.
+ *
+ * **Why this exists.** Mongosql's `$project` stage that references a
+ * nested-path expression (e.g. `agent.displayName` on a docs collection)
+ * OMITS the field entirely when the source path is missing on the
+ * underlying document — it does not emit `null`. This bites downstream
+ * consumers whenever the row at index 0 happens to be sparser than later
+ * rows; `ORDER BY <nested-field> ASC` is the most common way this
+ * surfaces, but any query whose row 0 lacks a key that later rows have
+ * triggers the same.
+ *
+ * Downstream consumers (notably Cube's native `getFinalQueryResult`
+ * transform in `@cubejs-backend/native`) compile their row→member
+ * extraction plan from the keys present in **row 0**. A sparse row 0
+ * causes Cube to drop the column from every row in the response — even
+ * rows that DO have the value. Reproduced empirically against the
+ * `configs` collection (`SELECT id, agent_display_name FROM configs ...
+ * ORDER BY agent_display_name ASC LIMIT 500` → 500 rows, all missing
+ * `configs.agent_display_name`, even though 497/500 source docs have it).
+ *
+ * **Fix shape.** Take the union of keys across all rows and null-fill
+ * each row so every row has every key. We can't simply look at `row[0]`
+ * because that's the symptom. Iteration is O(rows × cols). At the
+ * `MAX_ROWS=100000` pre-agg cap with a ~20-column projection this is
+ * roughly 2M property-existence checks and stays under 100ms in practice.
+ *
+ * `downloadQueryResults` uses the authoritative type list instead of
+ * a key union (the union would miss columns absent from every row); that
+ * variant is implemented inline at the call site, not via this helper.
+ */
+function normalizeRowShape<R>(rows: Array<Record<string, unknown>>): R[] {
+  if (rows.length === 0) return rows as unknown as R[];
+  const union = new Set<string>();
+  for (const r of rows) {
+    for (const k of Object.keys(r)) union.add(k);
+  }
+  for (const r of rows) {
+    for (const k of union) {
+      // `Object.hasOwn` over `k in r` — the `in` operator traverses
+      // the prototype chain, which would diverge from `Object.keys(r)`
+      // above (own enumerable keys only) on rows that inherit through a
+      // non-default prototype.
+      if (!Object.hasOwn(r, k)) r[k] = null;
+    }
+  }
+  return rows as unknown as R[];
+}
+
+/**
+ * Test-only export. Lets `tests/unit/driver.test.ts` exercise the
+ * key-union null-fill in isolation without spinning up the driver.
+ * Not part of the public API.
+ */
+export const _normalizeRowShapeForTests = normalizeRowShape;
 
 function flattenRow<R>(row: Record<string, unknown>): R {
   const keys = Object.keys(row);

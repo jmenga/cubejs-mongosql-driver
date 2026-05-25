@@ -39,3 +39,63 @@ schema:
           amount:      { bsonType: decimal }
           category:    { bsonType: string }
           occurred_at: { bsonType: date }
+      # `configs` is the sparse-nested-path regression harness — see the
+      # row-shape normalization test (`tests/integration/row-shape-normalization.test.ts`)
+      # and `tests/integration/fixtures/seed-data.js` for the seed.
+      configs:
+        bsonType: object
+        properties:
+          _id: { bsonType: objectId }
+          id:  { bsonType: string }
+          agent:
+            bsonType: object
+            properties:
+              displayName: { bsonType: string }
+      # Phase B harnesses — must stay in sync with seed-schemas.js so the
+      # File-mode and Collection-mode comparison test sees identical
+      # schemas. Each block mirrors the corresponding `__sql_schemas` row.
+      product_catalog:
+        bsonType: object
+        properties:
+          _id:      { bsonType: objectId }
+          id:       { bsonType: string }
+          name:     { bsonType: string }
+          category: { bsonType: string }
+      weird_types:
+        bsonType: object
+        properties:
+          _id:         { bsonType: objectId }
+          id:          { bsonType: string }
+          id_long:     { bsonType: long }
+          bin:         { bsonType: binData }
+          uuid:        { bsonType: binData }
+          ts:          { bsonType: timestamp }
+          occurred_at: { bsonType: date }
+          nested:
+            bsonType: object
+            properties:
+              label: { bsonType: string }
+              count: { bsonType: int }
+          tags:
+            bsonType: array
+            items:    { bsonType: string }
+      granular_events:
+        bsonType: object
+        properties:
+          _id:         { bsonType: objectId }
+          id:          { bsonType: string }
+          occurred_at: { bsonType: date }
+      tz_events:
+        bsonType: object
+        properties:
+          _id:         { bsonType: objectId }
+          id:          { bsonType: string }
+          occurred_at: { bsonType: date }
+      driver_tests_shared:
+        bsonType: object
+        properties:
+          _id:      { bsonType: objectId }
+          id_num:   { bsonType: int }
+          id_str:   { bsonType: string }
+          last_mod: { bsonType: date }
+          name:     { bsonType: string }

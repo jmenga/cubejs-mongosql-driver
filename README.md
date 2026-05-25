@@ -303,6 +303,18 @@ A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privi
 
 If `sqlGetSchema` fails with code **59 (`CommandNotFound`)** the endpoint isn't an Atlas SQL endpoint at all (the typical "I'm pointing atlas-sql mode at a regular cluster" misconfiguration). The driver surfaces a distinct hint suggesting collection mode for that case. Any other failure is reported with the underlying message routed through the credential-redactor so connection strings don't leak.
 
+## Driver capabilities
+
+The driver advertises the following on `BaseDriver.capabilities()`:
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `incrementalSchemaLoading` | `true` | Driver implements `getSchemas` / `getTablesForSpecificSchemas` / `getColumnsForSpecificTables` on top of the cached `tablesSchema()` snapshot. Cube uses the granular three-method path for large catalogs; the BaseDriver SQL-fallback (which queries `information_schema.*`) is never invoked. |
+| `streamImport` | `false` | Driver does NOT implement the optional `stream()` method. Pre-aggregation builds use `downloadQueryResults`'s memory `{rows, types}` shape capped at `CUBEJS_MONGOSQL_MAX_ROWS`. Callers passing `streamImport: true` get the same memory shape — the flag is ignored, matching the BaseDriver default. |
+| `streamingSource` | `false` | Not a streaming source. |
+| `unloadWithoutTempTable` | `false` | No `EXPORT_BUCKET` / `UNLOAD` support — MongoDB has no equivalent. |
+| `csvImport` | `false` | No CSV import path. |
+
 ## Pre-aggregations
 
 Cube pre-aggregations work with the driver:
@@ -312,7 +324,7 @@ Cube pre-aggregations work with the driver:
 - Time-based and SQL-based refresh keys
 - Build-range (`build_range_start` / `build_range_end`)
 
-**`CUBEJS_DB_EXPORT_BUCKET` is NOT supported** (MongoDB has no `UNLOAD`/`COPY TO` equivalent). Pre-agg builds stream through the driver to Cube Store row-by-row.
+**`CUBEJS_DB_EXPORT_BUCKET` is NOT supported** (MongoDB has no `UNLOAD`/`COPY TO` equivalent). Pre-agg builds go through `downloadQueryResults` returning an in-memory `{rows, types}` payload capped at `CUBEJS_MONGOSQL_MAX_ROWS` — see the streaming-import contract in the capability table above.
 
 ### Partitioning around the row cap
 
@@ -374,6 +386,14 @@ const d = new Decimal(row.amount); // exact
 ```
 
 The string form is the canonical IEEE 754-2008 representation produced by `bson::Decimal128::to_string`.
+
+### Row-shape contract — every row has the same keys
+
+The driver guarantees that every row returned from `query()` and `downloadQueryResults()` carries the SAME key set — no row is sparser than any other. Missing values are returned as JSON `null` rather than as a missing key.
+
+Why this matters: mongosql's `$project` of a nested-path expression (e.g. `agent.displayName`) OMITS the field from the output row when the source document doesn't carry that path — it does not emit `null`. With a query that `ORDER BY <nested-field> ASC`, the rows missing the field sort to the top of the result, so the row at index 0 is sparse. Downstream consumers (notably Cube's native `getFinalQueryResult` transform in `@cubejs-backend/native`) compile their row→member extraction plan from the keys present in row 0, and a sparse row 0 causes Cube to drop the column from every row in the response. The driver normalizes the row shape (union of keys across all rows on the `/load` path; authoritative type list from `mongosql::Translation::select_order` on the pre-aggregation upload path) so the column survives.
+
+If you query the driver directly, you can rely on `row.<column>` returning either the value or `null` — never `undefined`-from-missing-key.
 
 ## Errors
 
@@ -452,8 +472,9 @@ Real-world Cube queries with `equals` (`IN`) or `notEquals` (`NOT IN`) filters c
    - **Flatten** any nested `$or` / `$and` chain into a single flat array (defensive; defends against any client-side chain shape from future translators).
    - **Collapse to `$in`** when every `$or` element is a `$eq` against the same field with literal scalars.
    - **Collapse to `{$not: {$in: …}}`** when every `$and` element is a `$ne` against the same field with literal scalars (the `NOT IN` symmetric path). NOTE: this emits `{$not: {$in: …}}` and NOT `{$nin: …}`. MongoDB's `$nin` is a *query* operator (valid only inside `$match.<field>: {$nin: …}`), not an aggregation expression operator. mongosql lands its NOT IN translation inside `$expr`, where `$nin` is rejected with `code 168: Unrecognized expression '$nin'`. Verified empirically against atlas-local.
+   - **Collapse `$let`-wrapped IN list to `{$cond: [<null-check>, null, {$in: ["$<src>", […values…]]}]}`** when `IN (…)` co-exists with `GROUP BY` in the SQL. Mongosql v1.8.5 emits a deeply nested `$let.vars[N] → $cond → $or` shape for that combination (see [`pipeline_rewrite.rs`](./crates/native/src/pipeline_rewrite.rs) module docstring for the exact shape). The flat-`$or` flattener can't recognise it because the chain is buried inside `$let.vars[N].$let.in.$cond` rather than at the top level; without the let-aware collapse the Atlas SQL proxy re-expands the inner `$or` and busts the BSON-depth cliff at N ≳ 100. Detection is conservative — every var must be a `desugared_sqlOr_input` slot, every per-operand `$let` must read the SAME source field, and the outer `$cond` must follow the canonical truthy/null/false null-propagation shape; any deviation aborts the collapse and leaves the document untouched.
 
-Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. If a future Atlas SQL release stops re-expanding flat boolean arrays, this rewrite becomes a no-op (the walker is shape-agnostic and runs in linear time per pipeline node).
+Both passes are internal to the driver — no SQL changes, no `mongosql` patches. See `crates/native/src/pipeline_rewrite.rs` for the full module and tests. If a future Atlas SQL release stops re-expanding flat boolean arrays, these rewrites become no-ops (the walker is shape-agnostic and runs in linear time per pipeline node).
 
 ### `MONGOSQL_SCHEMA_NOT_FOUND`
 

@@ -52,10 +52,20 @@ fn count_in_arrays_recursive(b: &bson::Bson) -> usize {
 }
 
 /// CRITIC: drive the rewriter on the local-fixture mongosql output and
-/// confirm that the post-rewriter pipeline contains NO `$in` (because the
-/// $$variable LHS guard prevents collapse).
+/// confirm that the post-rewriter pipeline collapses the let-wrapped
+/// IN-list down to a single `$in` with zero remaining `$or` arrays.
+///
+/// Before the let-wrapped collapse was added, mongosql's local fixture
+/// emission was untouched by the rewriter — the inner `$or` of `$eq`
+/// against `$$desugared_sqlOr_inputN` was rejected by the flat-`$or`
+/// collapse (variable LHS), and the outer `$let` envelope hid the
+/// inner chain. After the let-wrapped collapse, the ENTIRE `$let` is
+/// replaced with `{$cond: [<null-check>, null, {$in: [..]}]}`; the
+/// inner `$or` of variable-LHS `$eq`s disappears as part of that
+/// replacement (we don't try to collapse the inner `$or` — we replace
+/// the whole envelope it lives in).
 #[test]
-fn probe_local_in_list_post_rewriter_has_no_in() {
+fn probe_local_in_list_post_rewriter_collapses_to_in() {
     use cubejs_mongosql_driver_native::pipeline_rewrite::flatten_or_chains_and_collapse_to_in;
     use cubejs_mongosql_driver_native::schema::{load_from_file, FILE_MODE_DB_PLACEHOLDER};
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -105,13 +115,15 @@ fn probe_local_in_list_post_rewriter_has_no_in() {
         total_or += count_or_arrays_recursive(&b);
     }
     eprintln!("[LOCAL post-rewriter] total $or={total_or}, total $in={total_in}");
-    // Local fixture: collapse is BLOCKED by $$variable LHS guard.
+    // The let-wrapped collapse rewrites the outer `$let` (one envelope
+    // per IN-list LHS) into a `$cond`-wrapped `$in`. The inner
+    // variable-LHS `$or` is part of the replaced envelope and goes
+    // away wholesale — exactly one `$in` remains, no `$or` arrays.
+    assert_eq!(total_in, 1, "let-wrapped collapse fires; expected 1 $in");
     assert_eq!(
-        total_in, 0,
-        "local fixture has $$variable LHS — collapse must NOT fire; expected 0 $in, got {total_in}"
+        total_or, 0,
+        "let-wrapped collapse removes the inner $or as part of the envelope replacement"
     );
-    // Both flat $ors remain.
-    assert!(total_or >= 1, "flat $or remains after flatten");
 }
 
 /// CRITIC: probe local OR-chain shape (explicit `OR` operator, not `IN`).

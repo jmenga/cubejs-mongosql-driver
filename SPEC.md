@@ -27,8 +27,17 @@ Implement Cube's `BaseDriver` interface. The driver MUST:
 - Accept a SQL string via `query(sql, values?)` and return rows as a JSON array.
 - Implement `testConnection()` — verifies cluster connectivity AND schema availability; fails on either.
 - Implement `tablesSchema()` — returns Cube's expected table-introspection format, sourced from the cached schema.
+- Implement the granular schema-introspection trio `getSchemas()` / `getTablesForSpecificSchemas(schemas)` / `getColumnsForSpecificTables(tables)` AND advertise `capabilities().incrementalSchemaLoading: true` so Cube routes large-catalog introspection through this path instead of the BaseDriver SQL fallback (which would issue `SELECT ... FROM information_schema.*`, impossible on MongoSQL). All three methods re-render filtered views of the cached `tablesSchema()` snapshot — they MUST NOT issue separate native I/O per call.
 - Implement `release()` — closes the underlying MongoDB connection pool and stops background tasks.
 - Provide a `static dialectClass()` returning the `MongoSqlQuery` class for SQL generation.
+
+#### Streaming-import contract
+
+The driver MUST advertise `capabilities().streamImport: false` and MUST NOT implement the optional `DriverInterface.stream()` method. Mongosql v1.8.5 has no streaming cursor wired through napi-rs (napi-rs's `ThreadsafeFunction` Rust→Node round-trip is post-MVP per NFR-1); pre-aggregation builds use `downloadQueryResults`'s memory `{rows, types}` shape capped at `CUBEJS_MONGOSQL_MAX_ROWS`. When a caller passes `streamImport: true` to `downloadQueryResults`, the driver MUST honor the BaseDriver default and ignore the flag — returning the same memory shape it would for `streamImport: false`. This mirrors `@cubejs-backend/base-driver`'s default `downloadQueryResults` (which also ignores the flag). A future driver that DOES implement streaming would (a) implement `stream()` returning a `StreamTableData` with a `rowStream: Readable`, AND (b) flip the capability flag — both as a single coupled change.
+
+#### Row-shape contract
+
+Both `query()` and `downloadQueryResults()` MUST return rows where every row in the result set carries the SAME key set — no row may be sparser than any other. mongosql's `$project` of a nested-path expression OMITS the field from output rows when the source document lacks the path (it does not emit `null`); the driver MUST null-fill the missing keys before returning. Rationale: Cube's native `getFinalQueryResult` transform compiles its row→member extraction plan from the keys present in row 0, and a sparse row 0 (e.g. after `ORDER BY <nested> ASC` puts a null-bearing row first) would cause the column to be dropped from every row in the response. Implementation: see `normalizeRowShape` in `src/MongoSqlDriver.ts` (`query()` uses union-of-keys across all rows; `downloadQueryResults` uses the authoritative type list from `mongosql::Translation::select_order` so columns absent from EVERY row are still represented).
 
 ### FR-2 — SQL dialect
 
@@ -104,7 +113,7 @@ The driver MUST work with Cube pre-aggregations:
 - Time-based and SQL-based refresh keys
 - Build-range (`build_range_start` / `build_range_end`)
 
-`CUBEJS_DB_EXPORT_BUCKET` (S3 UNLOAD) is NOT supported (MongoDB has no equivalent). Pre-agg builds stream through the driver to Cube Store.
+`CUBEJS_DB_EXPORT_BUCKET` (S3 UNLOAD) is NOT supported (MongoDB has no equivalent). Pre-agg builds use `downloadQueryResults`'s in-memory `{rows, types}` payload capped at `CUBEJS_MONGOSQL_MAX_ROWS` — see the streaming-import contract in FR-1.
 
 ### FR-7 — Configuration
 

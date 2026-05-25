@@ -1,6 +1,8 @@
 //! Post-translation pipeline rewriter — flattens nested `$or` / `$and`
-//! chains and collapses same-field `$eq` / `$ne` disjunctions to
-//! `$in` / `$nin`.
+//! chains, collapses same-field `$eq` / `$ne` disjunctions to
+//! `$in` / `$nin`, AND collapses mongosql's `$let`-wrapped IN-list
+//! shape (the form mongosql v1.8.5 emits when an `IN (…)` filter
+//! co-exists with a `GROUP BY` in the same SQL) into a single `$in`.
 //!
 //! ## Why this exists
 //!
@@ -93,6 +95,99 @@
 //! Both rewrites preserve BSON value types byte-for-byte: `Decimal128`,
 //! `DateTime`, `ObjectId` operands round-trip without coercion.
 //!
+//! ## `$let`-wrapped IN-list shape (the third rewrite)
+//!
+//! When a SQL query mixes `IN (v1, …, vN)` with `GROUP BY` (or any other
+//! construct that triggers mongosql's let-binding for the IN-list LHS),
+//! the translator emits this shape (verified empirically against the
+//! real Atlas SQL endpoint for N=3, N=5, N=161):
+//!
+//! ```json
+//! {
+//!   "$let": {
+//!     "vars": {
+//!       "desugared_sqlOr_input0": {
+//!         "$let": {
+//!           "vars": { "desugared_sqlEq_input0": "$<source_field>" },
+//!           "in": {
+//!             "$cond": [
+//!               { "$lte": ["$$desugared_sqlEq_input0", { "$literal": null }] },
+//!               { "$literal": null },
+//!               { "$eq":  ["$$desugared_sqlEq_input0", { "$literal": "v0" }] }
+//!             ]
+//!           }
+//!         }
+//!       },
+//!       "desugared_sqlOr_input1": { /* … same shape, RHS literal "v1" … */ },
+//!       /* … N inputs total … */
+//!     },
+//!     "in": {
+//!       "$cond": [
+//!         { "$or": [
+//!             { "$eq": ["$$desugared_sqlOr_input0", { "$literal": true }] },
+//!             /* … N entries … */
+//!         ] },
+//!         { "$literal": true },
+//!         { "$cond": [
+//!             { "$or": [
+//!                 { "$lte": ["$$desugared_sqlOr_input0", { "$literal": null }] },
+//!                 /* … N entries … */
+//!             ] },
+//!             { "$literal": null },
+//!             { "$literal": false }
+//!         ] }
+//!       ]
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! The outer `$let` evaluates to `true` if any operand evaluates `true`;
+//! to `null` if every operand evaluates `null` (i.e. the source field is
+//! null/missing); to `false` otherwise. Since every per-operand `$let`
+//! reads the SAME source field and applies the SAME null-handling, the
+//! whole construct is semantically equivalent to:
+//!
+//! ```json
+//! {
+//!   "$cond": [
+//!     { "$lte": ["$<source_field>", { "$literal": null }] },
+//!     { "$literal": null },
+//!     { "$in":  ["$<source_field>", [v0, v1, …, vN-1]] }
+//!   ]
+//! }
+//! ```
+//!
+//! The Atlas SQL proxy cannot re-expand a `$in` value array into a
+//! right-leaning chain (there is no n-ary boolean array left to
+//! chain-ify), so the BSON-depth overflow goes away. The replacement
+//! `$cond.then`/`$cond.else` branches in `$expr` still evaluate to
+//! `true`, `null`, or `false` — semantically identical to the original
+//! (`$expr` filters out documents whose top-level expression evaluates
+//! to `null`/`false`/`0` and keeps documents whose expression is
+//! `truthy`).
+//!
+//! Detection is **conservative**:
+//!  - the outer `$let` must have ≥ 2 vars, all named with the
+//!    `desugared_sqlOr_input` prefix (a future mongosql release that
+//!    changes the prefix would silently disable this collapse, falling
+//!    back to the flat-`$or` shape that already works for N ≤ 99);
+//!  - every var's value must be a single-key `$let` whose inner `vars`
+//!    bind exactly one key (any name) to a single string starting with
+//!    `$` (the SAME field across all operands) and whose inner `in` is
+//!    the 3-element `$cond` array
+//!    `[<null-check>, {$literal: null}, {$eq: ["$$<inner-var>", <literal>]}]`;
+//!  - the outer `$let.in` must be the 3-element `$cond` array shape
+//!    whose `if` is a `$or` of
+//!    `{$eq: ["$$desugared_sqlOr_inputN", {$literal: true}]}` operands
+//!    (in any order — we match by var-name, not positional), whose
+//!    `then` is `{$literal: true}`, and whose `else` is the inner null-
+//!    propagation `$cond` over the SAME set of vars.
+//!
+//! ANY deviation → the collapse aborts and the document is left alone.
+//! The `collapse_mongosql_in_list_let_skipped_*` tests pin the negative
+//! cases.
+//!
 //! ## `$literal` preservation
 //!
 //! mongosql wraps RHS literals in `{$literal: x}`. We unwrap them when
@@ -129,12 +224,18 @@
 use bson::{Bson, Document};
 
 /// Public entry-point called from `translate.rs` immediately after
-/// `unwrap_pipeline`. Walks every stage and rewrites every `$or` /
-/// `$and` it finds.
+/// `unwrap_pipeline`. Walks every stage and applies all three rewrites
+/// at each level: flatten + collapse `$or`, flatten + collapse `$and`,
+/// AND collapse mongosql's `$let`-wrapped IN-list shape into a single
+/// `$cond`-wrapped `$in` (see [`collapse_mongosql_in_list_let`]).
+/// The function name is kept narrow for historical/diff-stability
+/// reasons; the IN-list-let collapse is the third rewrite this pass
+/// performs.
 ///
 /// Performance: for queries with no boolean disjunction/conjunction
-/// anywhere in the pipeline this is a linear pass over the BSON nodes
-/// with no allocations beyond a single boolean per recursive call.
+/// and no `$let`-wrapped IN-list anywhere in the pipeline this is a
+/// linear pass over the BSON nodes with no allocations beyond a single
+/// boolean per recursive call.
 pub fn flatten_or_chains_and_collapse_to_in(pipeline: &mut [Document]) {
     for stage in pipeline.iter_mut() {
         walk_document(stage);
@@ -160,6 +261,16 @@ pub fn flatten_or_chains_and_collapse_to_in(pipeline: &mut [Document]) {
 /// one level deep per leaf rather than re-walking N nested
 /// `{$or: [...]}` wrappers.
 fn walk_document(doc: &mut Document) {
+    // Try the `$let`-wrapped IN-list collapse FIRST at this level. When
+    // it fires it replaces the entire `$let` slot with a `$cond`-wrapped
+    // `$in` (see [`collapse_mongosql_in_list_let`]). Running it before
+    // descent saves walking the (about-to-be-replaced) per-operand
+    // `$let` subtrees and their N inner `$or` checks. When the shape
+    // doesn't match, the call is a cheap no-op pass-through.
+    if doc.contains_key("$let") {
+        collapse_mongosql_in_list_let(doc);
+    }
+
     // Flatten / collapse any `$or` / `$and` at THIS level first.
     if doc.contains_key("$or") {
         rewrite_bool_in_place(doc, BoolOp::Or);
@@ -209,6 +320,496 @@ fn walk_bson(b: &mut Bson) {
         }
         _ => {}
     }
+}
+
+/// mongosql's let-binding prefix for the per-operand IN-list var slots.
+///
+/// Verified by the in-tree probe (`crates/native/tests/critic_probe.rs`)
+/// against both the local YAML fixture catalog and the real Atlas SQL
+/// endpoint's `sqlGetSchema`-derived catalog. A future mongosql release
+/// that changes this prefix would silently disable the let-aware
+/// collapse; the fallback (flat `$or`) still works for N ≤ 99 (the BSON-
+/// depth cliff is at ~100). We use a name-prefix check rather than
+/// purely structural detection because the outer-`$let` shape is also
+/// produced for benign constructs (e.g. `BETWEEN`, top-level `AND`,
+/// `IS NOT NULL`); pure structural detection would risk false
+/// positives.
+const SQL_OR_INPUT_PREFIX: &str = "desugared_sqlOr_input";
+
+/// Try to collapse mongosql's `$let`-wrapped IN-list shape into a
+/// single `$in`. Returns `true` when the collapse fires (the document's
+/// `$let` slot is removed and replaced with a `$cond` carrying the
+/// `$in`); `false` when the shape does not match.
+///
+/// Caller has already verified `doc.contains_key("$let")`. See the
+/// module docstring for the exact shape we match against and why the
+/// replacement is semantics-preserving.
+///
+/// # Conservative matching
+///
+/// Every check below MUST pass — the moment a check fails we abort and
+/// leave the document byte-identical. We deliberately err on the side
+/// of false negatives (rather than risk rewriting a `$let` whose
+/// semantics aren't this exact mongosql IN-list emission, which would
+/// produce silently-wrong query results). The module docstring lists
+/// the criteria; the `collapse_mongosql_in_list_let_skipped_*` tests
+/// pin the negatives.
+pub(crate) fn collapse_mongosql_in_list_let(doc: &mut Document) -> bool {
+    // The `$let` value must itself be a document carrying exactly the
+    // pair {vars, in} (a third key would mean we don't recognise this
+    // mongosql emission shape).
+    let let_doc = match doc.get("$let") {
+        Some(Bson::Document(d)) => d,
+        _ => return false,
+    };
+    if let_doc.len() != 2 {
+        return false;
+    }
+    let vars = match let_doc.get("vars") {
+        Some(Bson::Document(v)) => v,
+        _ => return false,
+    };
+    if vars.len() < 2 {
+        // A single-element IN list is never the pathological shape
+        // (no BSON-depth risk) — and mongosql may not produce the same
+        // `$let.vars[*]` IN-list emission for 1 value anyway. Skip.
+        return false;
+    }
+
+    // Every var must be named with the SQL_OR_INPUT_PREFIX prefix. We
+    // accept any suffix (numeric is what mongosql emits today, but the
+    // prefix-only check is the load-bearing one — see
+    // SQL_OR_INPUT_PREFIX doc comment for the rationale).
+    if !vars.keys().all(|k| k.starts_with(SQL_OR_INPUT_PREFIX)) {
+        return false;
+    }
+
+    // Parse every var's value into (inner_var_name, source_field,
+    // literal). All operands must share the same source field. The
+    // inner var name (e.g. `desugared_sqlEq_input0`) is captured per-
+    // operand so we can verify the inner `$cond` references it
+    // consistently.
+    let mut source_field: Option<String> = None;
+    // (var_name, literal) preserving insertion order — we won't rely
+    // on this order for the output `$in` array (we use the outer-`$or`
+    // referenced order instead, which IS the user-source order), but
+    // the vector form lets us look up by var name later without a
+    // second map allocation.
+    let mut literal_by_var: Vec<(String, Bson)> = Vec::with_capacity(vars.len());
+    for (var_name, var_value) in vars.iter() {
+        let parsed = match parse_in_list_per_operand_let(var_value) {
+            Some(p) => p,
+            None => return false,
+        };
+        match &source_field {
+            None => source_field = Some(parsed.source_field.clone()),
+            Some(prev) if *prev == parsed.source_field => {}
+            Some(_) => return false,
+        }
+        literal_by_var.push((var_name.clone(), parsed.literal));
+    }
+    let source_field = match source_field {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Outer `$let.in` must be a 3-element `$cond` array whose `if` is a
+    // `$or` of `{$eq: ["$$desugared_sqlOr_inputN", {$literal: true}]}`
+    // operands. We capture the order of var names as they appear in the
+    // `$or`, because THAT is the user-source order (the `vars` map's
+    // iteration order is `IndexMap`-stable but not guaranteed to match
+    // the user's left-to-right `IN (…)` order). The same call also
+    // validates the `then`-branch is `{$literal: true}` and the `else`-
+    // branch is the inner null-propagation `$cond`.
+    let order = match parse_in_list_outer_cond(let_doc.get("in"), vars.len()) {
+        Some(o) => o,
+        None => return false,
+    };
+
+    // Reorder literals to match the outer-`$or` reference order. This
+    // is the cross-check that catches a mismatched var name set
+    // (e.g. `vars` defines varA/varB but the outer `$or` references
+    // varA/varC) — a missing var triggers `position(..) == None` and
+    // we abort.
+    let mut values: Vec<Bson> = Vec::with_capacity(order.len());
+    for var_name in &order {
+        let pos = match literal_by_var.iter().position(|(k, _)| k == var_name) {
+            Some(p) => p,
+            None => return false,
+        };
+        values.push(literal_by_var[pos].1.clone());
+    }
+
+    // Build the replacement: a `$cond` whose `if` is the null-check
+    // against the source field, whose `then` is `{$literal: null}`, and
+    // whose `else` is the `$in` against the same source field. The `$in`
+    // honours MongoDB's natural semantics for missing/null values
+    // (returns `null` on missing source — which matches the original
+    // `$let` evaluating to `null` for that case), so the explicit null-
+    // check is defensive but semantically equivalent to the original
+    // outer `$let`'s null-propagation cond.
+    let in_args = Bson::Array(vec![
+        Bson::String(source_field.clone()),
+        Bson::Array(values),
+    ]);
+    let lte_args = Bson::Array(vec![
+        Bson::String(source_field),
+        Bson::Document({
+            let mut d = Document::new();
+            d.insert("$literal", Bson::Null);
+            d
+        }),
+    ]);
+    let cond_args = Bson::Array(vec![
+        Bson::Document({
+            let mut d = Document::new();
+            d.insert("$lte", lte_args);
+            d
+        }),
+        Bson::Document({
+            let mut d = Document::new();
+            d.insert("$literal", Bson::Null);
+            d
+        }),
+        Bson::Document({
+            let mut d = Document::new();
+            d.insert("$in", in_args);
+            d
+        }),
+    ]);
+
+    // Swap the `$let` slot for a `$cond`. Sibling keys at the parent
+    // level (defensive — mongosql doesn't emit them alongside this
+    // shape) are preserved; the `$let` key is removed and a `$cond`
+    // key is appended (the `IndexMap` semantics match the existing
+    // `rewrite_bool_in_place` behaviour). When the parent is itself an
+    // `$expr` body or a `$cond.if` branch (the typical landing places),
+    // the resulting `$cond` is a valid drop-in replacement.
+    doc.remove("$let");
+    doc.insert("$cond", cond_args);
+    true
+}
+
+/// Parsed per-operand `$let` carrying a single IN-list value.
+struct InListPerOperand {
+    /// The source field reference (e.g. `"$agentId"` or
+    /// `"$evaluationResults.evaluations.callQuality.score"`). Captured
+    /// verbatim from the inner `$let.vars.<key>` value; dotted paths
+    /// pass through unchanged.
+    source_field: String,
+    /// The RHS literal value (e.g. `{$literal: "v0"}`, or a bare scalar
+    /// like a `Bson::Int64`). Preserved byte-identically via
+    /// [`extract_literal`] — the wrapper is kept when the inner value
+    /// would otherwise be reinterpreted as a field reference / operator
+    /// inside the resulting `$in` array.
+    literal: Bson,
+}
+
+/// Parse one per-operand `$let` from the outer-`$let.vars` map. Returns
+/// `Some(InListPerOperand)` when the value matches the mongosql IN-list
+/// per-operand shape, `None` otherwise.
+///
+/// The shape we accept (see the probe in `tests/critic_probe.rs`):
+///
+/// ```json
+/// { "$let": {
+///     "vars": { "<any-inner-var>": "$<source_field>" },
+///     "in":   { "$cond": [
+///       { "$lte": ["$$<any-inner-var>", { "$literal": null }] },
+///       { "$literal": null },
+///       { "$eq":  ["$$<any-inner-var>", <literal>] }
+///     ]}
+/// }}
+/// ```
+///
+/// The `<any-inner-var>` name (`desugared_sqlEq_input0` in v1.8.5) is
+/// captured from the `vars` map and required to be the SAME name in
+/// both `$lte` and `$eq` arms — this guards against false-positive
+/// rewrites of structurally similar `$let`s that bind multiple vars.
+fn parse_in_list_per_operand_let(value: &Bson) -> Option<InListPerOperand> {
+    let outer = value.as_document()?;
+    if outer.len() != 1 {
+        return None;
+    }
+    let inner = outer.get_document("$let").ok()?;
+    if inner.len() != 2 {
+        return None;
+    }
+    let vars = inner.get_document("vars").ok()?;
+    if vars.len() != 1 {
+        return None;
+    }
+    let (inner_var_name, inner_var_value) = vars.iter().next()?;
+    // The inner var must bind to a field reference string (a single `$`
+    // prefix; dotted paths allowed). Bare `$` or `$$<var>` reject — we
+    // need a field reference, not a variable reference.
+    let source_field = match inner_var_value {
+        Bson::String(s) if s.starts_with('$') && !s.starts_with("$$") => s.clone(),
+        _ => return None,
+    };
+
+    // `in` must be a single-key document carrying a `$cond` array of 3.
+    let in_doc = inner.get_document("in").ok()?;
+    if in_doc.len() != 1 {
+        return None;
+    }
+    let cond_arr = in_doc.get_array("$cond").ok()?;
+    if cond_arr.len() != 3 {
+        return None;
+    }
+    // Element 0: { $lte: ["$$<inner_var>", { $literal: null }] }
+    if !is_null_lte_check(&cond_arr[0], inner_var_name) {
+        return None;
+    }
+    // Element 1: { $literal: null }
+    if !is_literal_null(&cond_arr[1]) {
+        return None;
+    }
+    // Element 2: { $eq: ["$$<inner_var>", <literal-or-{$literal: x}>] }
+    let literal = parse_eq_against_inner_var(&cond_arr[2], inner_var_name)?;
+
+    Some(InListPerOperand {
+        source_field,
+        literal,
+    })
+}
+
+/// Match `{ $lte: ["$$<inner_var>", { $literal: null }] }`. Returns
+/// `true` on exact-shape match, `false` otherwise.
+fn is_null_lte_check(b: &Bson, inner_var: &str) -> bool {
+    let d = match b.as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if d.len() != 1 {
+        return false;
+    }
+    let arr = match d.get_array("$lte") {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    if arr.len() != 2 {
+        return false;
+    }
+    let lhs_ok = matches!(&arr[0], Bson::String(s) if s == &format!("$${inner_var}"));
+    let rhs_ok = is_literal_null(&arr[1]);
+    lhs_ok && rhs_ok
+}
+
+/// Match `{ $literal: null }` (a wrapped null literal). A bare
+/// `Bson::Null` (no wrapper) is NOT accepted — mongosql always wraps.
+fn is_literal_null(b: &Bson) -> bool {
+    let d = match b.as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if d.len() != 1 {
+        return false;
+    }
+    matches!(d.get("$literal"), Some(Bson::Null))
+}
+
+/// Match `{ $eq: ["$$<inner_var>", <literal-or-{$literal: x}>] }`.
+/// Returns the literal RHS on success, preserving any `{$literal: x}`
+/// wrapper for correctness — `$in` element evaluation treats
+/// `{$literal: x}` as `x`, so the wrapper is safe and necessary for
+/// `$`-prefixed strings / `$`-keyed sub-documents.
+fn parse_eq_against_inner_var(b: &Bson, inner_var: &str) -> Option<Bson> {
+    let d = b.as_document()?;
+    if d.len() != 1 {
+        return None;
+    }
+    let arr = d.get_array("$eq").ok()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let lhs_ok = matches!(&arr[0], Bson::String(s) if s == &format!("$${inner_var}"));
+    if !lhs_ok {
+        return None;
+    }
+    // RHS must be a literal — accept either a bare BSON scalar or a
+    // `{$literal: x}` wrapper. Reject bare `$`-prefixed strings
+    // (field references) and bare documents containing $-prefixed
+    // keys (operator expressions). Reuse `extract_literal` so the same
+    // safety rules apply as for the flat `$or` → `$in` collapse.
+    extract_literal(&arr[1])
+}
+
+/// Parse the outer `$let.in` (a 3-element `$cond` array whose `if` is a
+/// `$or` of `{$eq: ["$$<sqlOr_inputN>", {$literal: true}]}` operands).
+/// On success returns the order of var names as referenced by the `$or`
+/// — this is the order the resulting `$in` value array must take.
+///
+/// `expected_count` is the number of operands the outer `$let.vars`
+/// map carried; the `$or` array must have the same length, the
+/// `then`-branch must be `{$literal: true}`, and the `else`-branch
+/// must be the inner null-propagation `$cond` over the SAME set of
+/// vars.
+fn parse_in_list_outer_cond(value: Option<&Bson>, expected_count: usize) -> Option<Vec<String>> {
+    let in_doc = value?.as_document()?;
+    if in_doc.len() != 1 {
+        return None;
+    }
+    let cond_arr = in_doc.get_array("$cond").ok()?;
+    if cond_arr.len() != 3 {
+        return None;
+    }
+
+    // Element 0: the `if` is `{ $or: [ {$eq: ["$$varN", {$literal: true}]}, ... ] }`.
+    let if_doc = cond_arr[0].as_document()?;
+    if if_doc.len() != 1 {
+        return None;
+    }
+    let or_arr = if_doc.get_array("$or").ok()?;
+    if or_arr.len() != expected_count {
+        return None;
+    }
+    let mut order: Vec<String> = Vec::with_capacity(or_arr.len());
+    for op in or_arr {
+        let var = parse_eq_var_is_true(op)?;
+        order.push(var);
+    }
+
+    // Element 1: `{ $literal: true }` — the truthy then-branch of the
+    // outer cond. Pinned because a mismatch here would mean the `$let`
+    // does NOT evaluate to truthy when the `$or` is true.
+    if !is_literal_bool(&cond_arr[1], true) {
+        return None;
+    }
+
+    // Element 2: the inner null-propagation `$cond`. Validate its
+    // SHAPE — skipping this risks rewriting a structurally similar
+    // `$let` whose semantics differ.
+    if !validate_inner_null_cond(&cond_arr[2], &order) {
+        return None;
+    }
+
+    Some(order)
+}
+
+/// Match `{ $eq: ["$$<var>", { $literal: true }] }`. Returns
+/// `Some("<var>")` (the var name without the `$$` prefix) on success.
+fn parse_eq_var_is_true(b: &Bson) -> Option<String> {
+    let d = b.as_document()?;
+    if d.len() != 1 {
+        return None;
+    }
+    let arr = d.get_array("$eq").ok()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let var = match &arr[0] {
+        Bson::String(s) if s.starts_with("$$") => s[2..].to_string(),
+        _ => return None,
+    };
+    if !is_literal_bool(&arr[1], true) {
+        return None;
+    }
+    Some(var)
+}
+
+/// Match `{ $literal: <bool> }` for a specific boolean value.
+fn is_literal_bool(b: &Bson, want: bool) -> bool {
+    let d = match b.as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if d.len() != 1 {
+        return false;
+    }
+    matches!(d.get("$literal"), Some(Bson::Boolean(actual)) if *actual == want)
+}
+
+/// Validate the inner null-propagation `$cond`:
+///
+/// ```json
+/// { "$cond": [
+///   { "$or": [
+///     { "$lte": ["$$<varN>", { "$literal": null }] }, …
+///   ] },
+///   { "$literal": null },
+///   { "$literal": false }
+/// ] }
+/// ```
+///
+/// The `$or` operands must reference the SAME set of vars that the
+/// outer `$or` referenced (in any order — we compare sorted snapshots).
+/// Returns `true` on shape match.
+fn validate_inner_null_cond(b: &Bson, expected_vars: &[String]) -> bool {
+    let d = match b.as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if d.len() != 1 {
+        return false;
+    }
+    let arr = match d.get_array("$cond") {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    if arr.len() != 3 {
+        return false;
+    }
+    let if_doc = match arr[0].as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if if_doc.len() != 1 {
+        return false;
+    }
+    let or_arr = match if_doc.get_array("$or") {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    if or_arr.len() != expected_vars.len() {
+        return false;
+    }
+    // Every operand must be `{ $lte: ["$$<var>", { $literal: null }] }`
+    // referencing some var from `expected_vars`. Order-independent set
+    // equality is the correctness check (we already validate the
+    // user-source order via the outer `$or`).
+    let mut got: Vec<String> = Vec::with_capacity(or_arr.len());
+    for op in or_arr {
+        let opd = match op.as_document() {
+            Some(d) => d,
+            None => return false,
+        };
+        if opd.len() != 1 {
+            return false;
+        }
+        let lte_arr = match opd.get_array("$lte") {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        if lte_arr.len() != 2 {
+            return false;
+        }
+        let var = match &lte_arr[0] {
+            Bson::String(s) if s.starts_with("$$") => s[2..].to_string(),
+            _ => return false,
+        };
+        if !is_literal_null(&lte_arr[1]) {
+            return false;
+        }
+        got.push(var);
+    }
+    let mut got_sorted = got;
+    got_sorted.sort();
+    let mut expected_sorted: Vec<String> = expected_vars.to_vec();
+    expected_sorted.sort();
+    if got_sorted != expected_sorted {
+        return false;
+    }
+
+    // Then-branch must be `{ $literal: null }`.
+    if !is_literal_null(&arr[1]) {
+        return false;
+    }
+    // Else-branch must be `{ $literal: false }`.
+    if !is_literal_bool(&arr[2], false) {
+        return false;
+    }
+    true
 }
 
 /// Boolean operator we're flattening/collapsing — `$or` or `$and`.
@@ -1481,5 +2082,517 @@ mod tests {
             pipeline, snapshot,
             "walker must not descend into $nin value arrays",
         );
+    }
+
+    // ----- $let-wrapped IN-list collapse (GROUP BY + IN shape) -----
+
+    /// Build the verified mongosql v1.8.5 `$let`-wrapped IN-list shape
+    /// for `source_field IN (values…)`. The inner per-operand `$let.vars`
+    /// key is hardcoded to `desugared_sqlEq_input0` to match the real
+    /// translator output; the outer slot keys are
+    /// `desugared_sqlOr_input0..N-1`.
+    ///
+    /// `rhs_literal(i)` is invoked per operand to produce that
+    /// operand's RHS literal Bson value (already-wrapped in
+    /// `{$literal: x}` when appropriate). One helper drives every
+    /// scenario (string literals, Decimal128, ObjectId, nested-field
+    /// source, …).
+    fn build_mongosql_in_list_let<F>(source_field: &str, n: usize, mut rhs_literal: F) -> Document
+    where
+        F: FnMut(usize) -> Bson,
+    {
+        let mut vars = Document::new();
+        let mut outer_or_operands: Vec<Bson> = Vec::with_capacity(n);
+        let mut inner_null_or_operands: Vec<Bson> = Vec::with_capacity(n);
+        for i in 0..n {
+            let var_name = format!("desugared_sqlOr_input{i}");
+            vars.insert(
+                var_name.clone(),
+                doc! {
+                    "$let": {
+                        "vars": { "desugared_sqlEq_input0": source_field },
+                        "in": {
+                            "$cond": [
+                                {
+                                    "$lte": [
+                                        "$$desugared_sqlEq_input0",
+                                        { "$literal": Bson::Null },
+                                    ],
+                                },
+                                { "$literal": Bson::Null },
+                                {
+                                    "$eq": [
+                                        "$$desugared_sqlEq_input0",
+                                        rhs_literal(i),
+                                    ],
+                                },
+                            ],
+                        },
+                    },
+                },
+            );
+            outer_or_operands.push(bson!({
+                "$eq": [format!("$${var_name}"), { "$literal": true }],
+            }));
+            inner_null_or_operands.push(bson!({
+                "$lte": [format!("$${var_name}"), { "$literal": Bson::Null }],
+            }));
+        }
+        doc! {
+            "$let": {
+                "vars": vars,
+                "in": {
+                    "$cond": [
+                        { "$or": Bson::Array(outer_or_operands) },
+                        { "$literal": true },
+                        {
+                            "$cond": [
+                                { "$or": Bson::Array(inner_null_or_operands) },
+                                { "$literal": Bson::Null },
+                                { "$literal": false },
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+    }
+
+    /// Extract the `$cond` array from a collapsed document; panic
+    /// loudly when the shape is wrong so test failures point at the
+    /// actual structural deviation.
+    fn get_cond_array(d: &Document) -> &Vec<Bson> {
+        match d.get("$cond") {
+            Some(Bson::Array(a)) => a,
+            _ => panic!("expected $cond array after collapse; got {d:?}"),
+        }
+    }
+
+    /// Count occurrences of `key` in a Bson tree. Helper for pipeline-
+    /// shape invariants in the large-N tests.
+    fn count_key_in_bson(b: &Bson, key: &str) -> usize {
+        match b {
+            Bson::Document(d) => {
+                let here = d.iter().filter(|(k, _)| k.as_str() == key).count();
+                let child: usize = d.iter().map(|(_, v)| count_key_in_bson(v, key)).sum();
+                here + child
+            }
+            Bson::Array(a) => a.iter().map(|v| count_key_in_bson(v, key)).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_basic() {
+        // Canonical N=3 case: outer $let with 3 desugared_sqlOr_input
+        // vars, each binding `$agentId`, RHS literals "v0", "v1", "v2".
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 3, |i| bson!({ "$literal": format!("v{i}") }));
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired, "collapse must fire on the canonical IN-list shape");
+        assert!(!input.contains_key("$let"), "$let must be removed");
+        let cond = get_cond_array(&input);
+        assert_eq!(cond.len(), 3);
+        // cond[0] is `{$lte: ["$agentId", {$literal: null}]}`.
+        let lte_arr = cond[0].as_document().unwrap().get_array("$lte").unwrap();
+        assert_eq!(lte_arr[0], Bson::String("$agentId".into()));
+        assert!(is_literal_null(&lte_arr[1]));
+        // cond[1] is `{$literal: null}`.
+        assert!(is_literal_null(&cond[1]));
+        // cond[2] is `{$in: ["$agentId", [...]]}`.
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        assert_eq!(in_arr[0], Bson::String("$agentId".into()));
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), 3);
+        for (i, v) in vals.iter().enumerate() {
+            // Safe non-`$`-prefixed strings are unwrapped from
+            // `{$literal: "vN"}` to bare `"vN"` by `extract_literal` —
+            // semantically identical because `$in` evaluates each
+            // element as a value (a bare non-`$`-string is a string
+            // literal).
+            assert_eq!(v.as_str(), Some(format!("v{i}").as_str()));
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_161_elements_no_overflow() {
+        // The exact user-reported failure size. Post-collapse the
+        // pipeline must contain ZERO `$or`/`$let`, and exactly one `$in`
+        // whose value array carries 161 literals in input order.
+        let n = 161;
+        let inner =
+            build_mongosql_in_list_let("$agentId", n, |i| bson!({ "$literal": format!("v{i}") }));
+        let mut pipeline = vec![doc! {
+            "$match": { "$expr": Bson::Document(inner) },
+        }];
+        flatten_or_chains_and_collapse_to_in(&mut pipeline);
+
+        let or_total: usize = pipeline
+            .iter()
+            .map(|s| count_key_in_bson(&Bson::Document(s.clone()), "$or"))
+            .sum();
+        let in_total: usize = pipeline
+            .iter()
+            .map(|s| count_key_in_bson(&Bson::Document(s.clone()), "$in"))
+            .sum();
+        let let_total: usize = pipeline
+            .iter()
+            .map(|s| count_key_in_bson(&Bson::Document(s.clone()), "$let"))
+            .sum();
+        assert_eq!(or_total, 0, "all $or arrays must be eliminated");
+        assert_eq!(in_total, 1, "exactly one $in must replace the IN-list");
+        assert_eq!(let_total, 0, "no $let remains after collapse");
+
+        let cond = pipeline[0]
+            .get_document("$match")
+            .unwrap()
+            .get_document("$expr")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), n);
+        for (i, v) in vals.iter().enumerate() {
+            assert_eq!(v.as_str(), Some(format!("v{i}").as_str()));
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_n_1000_no_stack_overflow() {
+        // Stress test: 1000-element IN list. The collapse uses simple
+        // iteration (no recursion proportional to N), so this must
+        // finish quickly and produce a single `$in` of length 1000.
+        let n = 1000;
+        let mut input =
+            build_mongosql_in_list_let("$agentId", n, |i| bson!({ "$literal": (i as i64) }));
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired);
+        let cond = get_cond_array(&input);
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), n);
+        for (i, v) in vals.iter().enumerate() {
+            assert_eq!(v.as_i64(), Some(i as i64));
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_n_2_minimum() {
+        // The minimum-viable N=2 shape — the conservative threshold is
+        // 2 (single-element rejected by the `len() < 2` check).
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 2, |i| bson!({ "$literal": format!("v{i}") }));
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired);
+        let cond = get_cond_array(&input);
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0].as_str(), Some("v0"));
+        assert_eq!(vals[1].as_str(), Some("v1"));
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_different_fields() {
+        // Operand 1 binds `$agentId`; we mutate operand 1's inner var
+        // to bind `$callerId`. The same-source-field invariant must
+        // fail and the collapse must abort, leaving the doc untouched.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 3, |i| bson!({ "$literal": format!("v{i}") }));
+        if let Some(Bson::Document(let_doc)) = input.get_mut("$let") {
+            if let Some(Bson::Document(vars)) = let_doc.get_mut("vars") {
+                if let Some(Bson::Document(op1)) = vars.get_mut("desugared_sqlOr_input1") {
+                    if let Some(Bson::Document(inner_let)) = op1.get_mut("$let") {
+                        if let Some(Bson::Document(inner_vars)) = inner_let.get_mut("vars") {
+                            inner_vars.insert("desugared_sqlEq_input0", "$callerId");
+                        }
+                    }
+                }
+            }
+        }
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired, "must not collapse when source fields differ");
+        assert_eq!(input, snapshot, "document must be byte-identical");
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_non_literal_rhs() {
+        // One operand's `$eq` RHS is a bare `$`-prefixed string (field
+        // reference, not a literal). `extract_literal` rejects it →
+        // the per-operand parse returns None → the collapse aborts.
+        let mut input = build_mongosql_in_list_let("$agentId", 3, |i| {
+            if i == 1 {
+                Bson::String("$other_field".into())
+            } else {
+                bson!({ "$literal": format!("v{i}") })
+            }
+        });
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired, "must not collapse when an RHS is a field reference");
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_null_handling_mismatch() {
+        // Outer `else`-branch's `$or` operand uses a `$lt` (not `$lte`)
+        // null check. The shape mismatch must abort the collapse.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 3, |i| bson!({ "$literal": format!("v{i}") }));
+        if let Some(Bson::Document(let_doc)) = input.get_mut("$let") {
+            if let Some(Bson::Document(in_doc)) = let_doc.get_mut("in") {
+                if let Some(Bson::Array(outer_cond)) = in_doc.get_mut("$cond") {
+                    if let Some(Bson::Document(inner_cond_doc)) = outer_cond.get_mut(2) {
+                        if let Some(Bson::Array(inner_cond)) = inner_cond_doc.get_mut("$cond") {
+                            if let Some(Bson::Document(if_doc)) = inner_cond.get_mut(0) {
+                                if let Some(Bson::Array(or_arr)) = if_doc.get_mut("$or") {
+                                    // Replace first $lte operand with a $lt operand.
+                                    or_arr[0] = bson!({
+                                        "$lt": [
+                                            "$$desugared_sqlOr_input0",
+                                            { "$literal": Bson::Null },
+                                        ]
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired, "must not collapse when null-handling differs");
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_for_single_var() {
+        // N=1 is rejected by the `vars.len() < 2` precondition.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 1, |i| bson!({ "$literal": format!("v{i}") }));
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired, "single-var $let must NOT collapse (conservative)");
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_missing_inner_cond_shape() {
+        // Outer `$let.in` isn't the canonical 3-elem `$cond`. Reject.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 3, |i| bson!({ "$literal": format!("v{i}") }));
+        if let Some(Bson::Document(let_doc)) = input.get_mut("$let") {
+            let_doc.insert("in", bson!({ "$literal": true }));
+        }
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired);
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_skipped_missing_null_else_branch() {
+        // Outer `$let.in.$cond[2]` isn't the inner null-prop `$cond`.
+        // Reject — the semantics wouldn't be preserved otherwise.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 3, |i| bson!({ "$literal": format!("v{i}") }));
+        if let Some(Bson::Document(let_doc)) = input.get_mut("$let") {
+            if let Some(Bson::Document(in_doc)) = let_doc.get_mut("in") {
+                if let Some(Bson::Array(cond)) = in_doc.get_mut("$cond") {
+                    cond[2] = bson!({ "$literal": false });
+                }
+            }
+        }
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired);
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_preserves_literal_types() {
+        // Mixed BSON scalar types — Decimal128, DateTime, ObjectId,
+        // Int64. All must round-trip through the collapse byte-
+        // identically. `extract_literal` unwraps safe scalar literals
+        // (no `$`-prefix concern) → they appear bare in the value
+        // array, preserving BSON type fidelity.
+        let dec: Decimal128 = "123.456".parse().unwrap();
+        let dt = DateTime::from_millis(1_700_000_000_000);
+        let oid = ObjectId::new();
+        let int = 42_i64;
+        let rhs_values: Vec<Bson> = vec![
+            bson!({ "$literal": dec }),
+            bson!({ "$literal": Bson::DateTime(dt) }),
+            bson!({ "$literal": Bson::ObjectId(oid) }),
+            bson!({ "$literal": int }),
+        ];
+        let mut input =
+            build_mongosql_in_list_let("$mixed", rhs_values.len(), |i| rhs_values[i].clone());
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired);
+        let cond = get_cond_array(&input);
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), rhs_values.len());
+        assert_eq!(vals[0], Bson::Decimal128(dec));
+        assert_eq!(vals[1], Bson::DateTime(dt));
+        assert_eq!(vals[2], Bson::ObjectId(oid));
+        assert_eq!(vals[3], Bson::Int64(int));
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_with_nested_field() {
+        // Dotted source-field path survives the collapse verbatim.
+        let source = "$evaluationResults.evaluations.callQuality.score";
+        let mut input =
+            build_mongosql_in_list_let(source, 5, |i| bson!({ "$literal": (i as i64) }));
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired);
+        let cond = get_cond_array(&input);
+        let lte_arr = cond[0].as_document().unwrap().get_array("$lte").unwrap();
+        assert_eq!(lte_arr[0], Bson::String(source.into()));
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        assert_eq!(in_arr[0], Bson::String(source.into()));
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), 5);
+        for (i, v) in vals.iter().enumerate() {
+            assert_eq!(v.as_i64(), Some(i as i64));
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_does_not_touch_unrelated_let() {
+        // A `$let` with non-IN-list var names (e.g. for `BETWEEN` /
+        // top-level `AND`) must NOT be collapsed. The
+        // `SQL_OR_INPUT_PREFIX` check prevents false positives.
+        let mut input = doc! {
+            "$let": {
+                "vars": {
+                    "desugared_sqlAnd_input0": "$start_time",
+                    "desugared_sqlAnd_input1": "$end_time",
+                },
+                "in": { "$cond": [{ "$literal": true }, "$start_time", "$end_time"] },
+            },
+        };
+        let snapshot = input.clone();
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(!fired, "non-IN-list var-name prefix must NOT match");
+        assert_eq!(input, snapshot);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_walks_nested_lets() {
+        // The IN-list `$let` is nested INSIDE an outer `$let` (a
+        // BETWEEN + IS NOT NULL + IN scenario). The walker must
+        // descend and collapse ONLY the IN-list slot, leaving the
+        // outer envelope intact.
+        let in_list_let =
+            build_mongosql_in_list_let("$agentId", 4, |i| bson!({ "$literal": format!("v{i}") }));
+        let mut pipeline = vec![doc! {
+            "$match": {
+                "$expr": {
+                    "$let": {
+                        "vars": {
+                            "desugared_sqlAnd_input0": "$callStartTime",
+                            "desugared_sqlAnd_input1": "$callStartTime",
+                        },
+                        "in": {
+                            "$and": [
+                                { "$gte": ["$$desugared_sqlAnd_input0", { "$literal": "2024-01-01" }] },
+                                { "$lte": ["$$desugared_sqlAnd_input1", { "$literal": "2024-12-31" }] },
+                                Bson::Document(in_list_let),
+                                { "$ne": ["$agentName", { "$literal": Bson::Null }] },
+                            ],
+                        },
+                    },
+                },
+            },
+        }];
+        flatten_or_chains_and_collapse_to_in(&mut pipeline);
+
+        // Outer `$let` preserved (its var names don't match the
+        // IN-list prefix and its `in` isn't a `$cond`).
+        let outer_let = pipeline[0]
+            .get_document("$match")
+            .unwrap()
+            .get_document("$expr")
+            .unwrap()
+            .get_document("$let")
+            .unwrap();
+        let and_arr = outer_let
+            .get_document("in")
+            .unwrap()
+            .get_array("$and")
+            .unwrap();
+        assert_eq!(and_arr.len(), 4);
+        // Element 2 (the previously `$let`-wrapped IN list) became a
+        // `$cond` with `$in`.
+        let collapsed = and_arr[2].as_document().expect("inner doc");
+        assert!(
+            collapsed.contains_key("$cond") && !collapsed.contains_key("$let"),
+            "nested IN-list $let must be collapsed; got {collapsed:?}",
+        );
+        let cond = collapsed.get_array("$cond").unwrap();
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), 4);
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_var_order_preserved() {
+        // The outer `$or` defines the user-source order. If the `$or`
+        // operands are in non-trivial order (here: reversed), the
+        // resulting `$in` value array must honour THAT order, not the
+        // IndexMap iteration order of the outer `vars` map.
+        let mut input =
+            build_mongosql_in_list_let("$agentId", 5, |i| bson!({ "$literal": format!("v{i}") }));
+        if let Some(Bson::Document(let_doc)) = input.get_mut("$let") {
+            if let Some(Bson::Document(in_doc)) = let_doc.get_mut("in") {
+                if let Some(Bson::Array(cond)) = in_doc.get_mut("$cond") {
+                    if let Some(Bson::Document(if_doc)) = cond.get_mut(0) {
+                        if let Some(Bson::Array(or_arr)) = if_doc.get_mut("$or") {
+                            or_arr.reverse();
+                        }
+                    }
+                }
+            }
+        }
+        let fired = collapse_mongosql_in_list_let(&mut input);
+        assert!(fired);
+        let cond = get_cond_array(&input);
+        let in_arr = cond[2].as_document().unwrap().get_array("$in").unwrap();
+        let vals = in_arr[1].as_array().unwrap();
+        assert_eq!(vals.len(), 5);
+        // Expect reversed-order values: v4, v3, v2, v1, v0.
+        for (i, v) in vals.iter().enumerate() {
+            let want = format!("v{}", 4 - i);
+            assert_eq!(v.as_str(), Some(want.as_str()));
+        }
+    }
+
+    #[test]
+    fn collapse_mongosql_in_list_let_inside_full_pipeline() {
+        // End-to-end inside a 3-stage pipeline that mirrors the
+        // user-reported shape ($match.$expr → $group → $limit).
+        let in_list =
+            build_mongosql_in_list_let("$agentId", 161, |i| bson!({ "$literal": format!("v{i}") }));
+        let mut pipeline = vec![
+            doc! { "$match": { "$expr": Bson::Document(in_list) } },
+            doc! { "$group": { "_id": "$agentName", "_agg1": { "$sum": { "$literal": 1_i64 } } } },
+            doc! { "$limit": 30_i64 },
+        ];
+        flatten_or_chains_and_collapse_to_in(&mut pipeline);
+        let expr = pipeline[0]
+            .get_document("$match")
+            .unwrap()
+            .get_document("$expr")
+            .unwrap();
+        assert!(expr.contains_key("$cond"));
+        assert!(!expr.contains_key("$let"));
+        assert!(pipeline[1].contains_key("$group"));
+        assert!(pipeline[2].contains_key("$limit"));
     }
 }

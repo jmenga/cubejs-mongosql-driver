@@ -69,7 +69,7 @@ Two arrows from Rust to the cluster: data queries (MQL) and schema reads — bot
 | `client.rs` | `MongoSqlClient` impl — orchestrates schema, translation, execution | no (internal) |
 | `schema.rs` | `SchemaSource` enum, `SchemaCache`, refresh task | no |
 | `translate.rs` | Wraps `mongosql` crate; converts errors | no |
-| `pipeline_rewrite.rs` | Post-translation BSON rewriter — flattens right-leaning `$or` chains and collapses same-field `$eq` disjunctions to `$in` (defeats MongoDB's max-BSON-nested-object-depth limit on large `IN` lists) | no |
+| `pipeline_rewrite.rs` | Post-translation BSON rewriter — (a) flattens right-leaning `$or` / `$and` chains and collapses same-field `$eq` / `$ne` disjunctions to `$in` / `{$not: {$in: …}}`; (b) collapses mongosql's `$let`-wrapped IN-list shape (emitted when `IN (…)` co-exists with `GROUP BY`) to a single `$cond`-wrapped `$in`. Both passes defeat MongoDB's max-BSON-nested-object-depth limit on large `IN` / `NOT IN` lists when sent via the Atlas SQL endpoint. | no |
 | `execute.rs` | Wraps `mongodb` crate; cursor draining; BSON → JSON marshaling | no |
 | `error.rs` | `Error` type, `From` impls, error-code mapping | no |
 | `config.rs` | `ClientConfig` struct + validation | yes (as napi object) |
@@ -154,6 +154,18 @@ pub struct SchemaSource {
 ```
 
 **Eager-vs-lazy schema loading.** The current design eagerly loads all `__sql_schemas` documents at startup and caches them. The `mongosql` crate also exposes `get_namespaces(default_db, sql) -> HashSet<Namespace>` which would let us load only the schemas referenced by each query (lazy mode). Eager is sufficient for our scale (~20–50 collections per partner database). If a tenant catalog ever exceeds ~1000 collections, switch the loader to lazy: in `query()`, call `get_namespaces`, fetch any uncached schemas with TTL caching, then translate.
+
+**Incremental schema-loading three-method suite.** The driver advertises `capabilities().incrementalSchemaLoading: true` and implements:
+
+| Method | Returns | Implementation |
+|---|---|---|
+| `getSchemas()` | `Array<{schema_name}>` | `Object.keys(tablesSchema()).map(s => ({schema_name: s}))` |
+| `getTablesForSpecificSchemas(schemas)` | `Array<{schema_name, table_name}>` | Filter `tablesSchema()` by requested schema names; emit one row per table |
+| `getColumnsForSpecificTables(tables)` | `Array<{schema_name, table_name, column_name, data_type, attributes?}>` | Filter `tablesSchema()` by `(schema_name, table_name)`; emit one row per column |
+
+All three re-render filtered views of the same cached snapshot — there is no per-method native I/O; the native side caches schema in `Arc<RwLock<MongoSqlSchema>>` and serves it from memory (see §3.2). Empty input arrays short-circuit to empty output without touching the snapshot. Unknown schemas / tables silently drop (mirroring the SQL path's `WHERE schema IN (...)` natural filter). Pre-fix the driver advertised `incrementalSchemaLoading: false`, which forced Cube into the BaseDriver SQL fallback (`SELECT ... FROM information_schema.*`) — impossible on MongoSQL, so introspection would crash on any catalog Cube treated as large enough to warrant the incremental path.
+
+**Streaming contract (`streamImport: false`).** The driver does NOT implement `DriverInterface.stream(table, values, options)`; `capabilities().streamImport: false` advertises this. `downloadQueryResults` is the only path Cube exercises for pre-aggregation upload, and it returns the memory `{rows, types}` shape capped at `CUBEJS_MONGOSQL_MAX_ROWS`. When a caller (test harness or future Cube version) passes `streamImport: true` in `DownloadQueryResultsOptions`, the driver honors the BaseDriver default and IGNORES the flag — returning the same memory shape it would for `streamImport: false`. This mirrors `base-driver/dist/src/BaseDriver.js`'s default `downloadQueryResults`, which also ignores the option. A future streaming implementation would couple (a) a real `stream()` method returning `StreamTableData { rowStream: Readable }` AND (b) flipping the capability flag — both as a single change.
 
 ### 3.3 `__sql_schemas` document shape
 
@@ -301,22 +313,33 @@ Rust MongoSqlClient::query(sql)
   │      )?
   │
   ├─ // Post-translation pipeline rewrite (pure, CPU-only). Walks every
-  │   // BSON node in the pipeline and at every `$or` / `$and` location:
-  │   //   1. Flattens any nested chain into a flat array (defensive).
-  │   //   2. Collapses same-field `$eq` disjunctions to `$in` and
-  │   //      same-field `$ne` conjunctions to `{$not: {$in: ...}}`
-  │   //      (NOT `$nin` — invalid in `$expr` context, see
-  │   //      `pipeline_rewrite.rs` module docstring).
+  │   // BSON node in the pipeline. At each visited document:
+  │   //   1. If it has a `$let` slot that matches mongosql's let-wrapped
+  │   //      IN-list shape (vars prefix `desugared_sqlOr_input`, per-
+  │   //      operand `$let` carrying `{$eq: ["$$var", <literal>]}` all
+  │   //      against the SAME source field, outer `$cond.if` is a `$or`
+  │   //      of `{$eq: ["$$var", {$literal: true}]}`), replace the
+  │   //      entire `$let` with a `$cond`-wrapped `$in` — the shape
+  │   //      mongosql v1.8.5 emits when `IN (…)` co-exists with
+  │   //      `GROUP BY`.
+  │   //   2. At every `$or` / `$and` location: flatten nested chains
+  │   //      into a flat array, then collapse same-field `$eq`
+  │   //      disjunctions to `$in` and same-field `$ne` conjunctions
+  │   //      to `{$not: {$in: ...}}` (NOT `$nin` — invalid in `$expr`
+  │   //      context, see `pipeline_rewrite.rs` module docstring).
   │   //
   │   // Why: `mongosql::translate_sql` v1.8.5 outputs a FLAT `$or` /
-  │   // `$and` (depth 1) — but the Atlas SQL endpoint's proxy
-  │   // re-expands flat boolean arrays into a right-leaning chain of
-  │   // binary `$or` / `$and`s server-side. For N ≥ ~100 the chain
-  │   // busts MongoDB's max BSON nested-object depth (100). Collapsing
-  │   // to `$in` / `$nin` defeats the re-expansion (no n-ary boolean
-  │   // array left to chain-ify). See `crates/native/src/pipeline_rewrite.rs`
-  │   // and the README "Large `IN (...)` / `NOT IN (...)` lists"
-  │   // troubleshooting section.
+  │   // `$and` (depth 1) for plain `IN`/`NOT IN`, OR a `$let`-wrapped
+  │   // IN-list when GROUP BY is in the SQL — but the Atlas SQL
+  │   // endpoint's proxy re-expands flat boolean arrays (including
+  │   // the inner `$or` of the let-wrapped IN list) into a right-
+  │   // leaning chain of binary `$or` / `$and`s server-side. For N ≥
+  │   // ~100 the chain busts MongoDB's max BSON nested-object depth
+  │   // (100). Collapsing to `$in` / `$cond+$in` defeats the
+  │   // re-expansion (no n-ary boolean array left to chain-ify). See
+  │   // `crates/native/src/pipeline_rewrite.rs` and the README
+  │   // "Large `IN (...)` / `NOT IN (...)` lists" troubleshooting
+  │   // section.
   │   pipeline_rewrite::flatten_or_chains_and_collapse_to_in(&mut pipeline);
   │
   ├─ db = self.mongo_client.database(&target_db)
@@ -436,6 +459,53 @@ The TS-side `flattenRow` rule applies here too — for a multi-key
 envelope the name is `<namespace>__<column>` (an empty-string namespace
 yields `__<column>` to match flattenRow byte-for-byte); for a single-key
 envelope it's the bare column.
+
+#### Post-flatten row-shape normalization (`normalizeRowShape`)
+
+`flattenRow` unwraps mongosql's per-collection envelope into a flat
+JS object keyed by column name. But there's a second issue mongosql's
+`$project` introduces that `flattenRow` alone doesn't address:
+
+> **mongosql's `$project` of a nested-path expression (e.g.
+> `agent.displayName`) OMITS the field from the output row entirely
+> when the source document doesn't carry that path.** It does NOT emit
+> `null`. With a query that `ORDER BY <nested-field> ASC`, the rows
+> missing the field sort to the top of the result (nulls-first), so the
+> row at index 0 is sparse.
+
+Downstream consumers compile their row→member extraction plan from the
+keys present in **row 0**. Cube's native `getFinalQueryResult`
+transform (in `@cubejs-backend/native`) is the canonical example —
+a sparse row 0 causes it to drop the column from EVERY row in the
+response, even rows that DO have the value. The production symptom was
+the frontend's `useAgentsList` query (500 rows, 497 with names
+populated, 3 without; sorted ascending → row 0 sparse → all 500 rows
+missing the `configs.agent_display_name` key → KPI tiles showed 0).
+
+Fix lives in `src/MongoSqlDriver.ts::normalizeRowShape` and runs AFTER
+`flattenRows` on both the `query()` (regular `/load`) and
+`downloadQueryResults` (pre-aggregation build) paths:
+
+| Call site | Key source | Why |
+|---|---|---|
+| `query()` | Union of keys across all rows | See "Why union-of-keys at `query()`" below. |
+| `downloadQueryResults()` | `types.map(t => t.name)` from `mongosql::Translation::select_order`, then union-of-keys as a belt-and-braces second pass | Type list is deterministic and covers the (rare) edge case where a column is missing from EVERY row — a union alone would still miss it. The second union pass picks up any stray row keys outside the type list so the "every row has the same key set" contract holds symmetrically with `query()`. |
+
+**Why union-of-keys at the `query()` layer (rather than the typed null-fill used in `downloadQueryResults`)?** `BaseDriver.query()` returns rows only — the type list isn't part of its contract. Internally we could call `client.queryWithTypes()` and use the types, but it would buy nothing: union-of-keys produces the same result for any rowset where at least one row has each projected column (which is the actual on-the-wire shape — mongosql's sparse-omission only drops keys from individual rows, never from an entire column). `downloadQueryResults` uses the type list because its contract surfaces types to Cube Store anyway; `query()` uses union because it's all that's needed.
+
+Net effect: every row in the result set carries every key in the union
+(or in the type list, for the download path), with `null` filling any
+gap. `flattenRow` runs first to unwrap the envelope; `normalizeRowShape`
+runs second on the post-flatten rows. Iteration is O(rows × cols). At
+the `MAX_ROWS=100000` pre-agg cap with a ~20-column projection this is
+roughly 2M property-existence checks and stays under 100ms in practice.
+
+Regression harness: `tests/unit/driver.test.ts` (the
+"row-shape normalization" describe block + the direct
+`normalizeRowShape` test), `tests/integration/row-shape-normalization.test.ts`
+(real atlas-local with sparse-nested-path docs), and the
+`sparse nested-path` test in `tests/cube-e2e/cube-e2e.test.ts` (full
+Cube `/load` round-trip).
 
 ### 4.3 Errors mapped
 

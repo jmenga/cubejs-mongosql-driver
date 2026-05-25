@@ -60,6 +60,7 @@
  * | subtractInterval / addInterval            | OVERRIDE (T12b)   | DATEADD with positive/negative numeric. Compound = chained calls.   |
  * | intervalString(interval)                  | OVERRIDE (T12b)   | Quote-and-pass; no INTERVAL keyword. Used only in error/diag paths. |
  * | seriesSql(td)                             | OVERRIDE (T12b)   | UNION ALL of literal rows (MysqlQuery pattern, CAST not TIMESTAMP). |
+ * | newFilter(f)                              | OVERRIDE (Gap 4)  | Return MongoSqlFilter — rewrites ILIKE (unsupported) to LOWER+LIKE. |
  * | newParamAllocator(p)                      | INHERIT           | Default `?` placeholder works for MongoSQL.                         |
  * | escapeColumnName-driven preAggTableName   | INHERIT           | Inherited tableName logic produces backtick-safe identifiers.       |
  *
@@ -67,7 +68,7 @@
  * (a) provably valid MongoSQL or (b) routed through the overrides above.
  */
 
-import { BaseQuery } from '@cubejs-backend/schema-compiler';
+import { BaseFilter, BaseQuery } from '@cubejs-backend/schema-compiler';
 
 /**
  * Inlined re-implementation of `@cubejs-backend/shared`'s `parseSqlInterval`.
@@ -230,7 +231,7 @@ export class MongoSqlQuery extends BaseQuery {
    * Same constraint as `groupByClause` — mongosql requires named refs.
    */
   public override orderHashToString(hash: { id: string; desc: boolean } | null | undefined): string | null {
-    if (!hash || !hash.id) {
+    if (!hash?.id) {
       return null;
     }
     const fieldAlias = (this as unknown as { getFieldAlias(id: string): string | null }).getFieldAlias(hash.id);
@@ -461,6 +462,40 @@ export class MongoSqlQuery extends BaseQuery {
   }
 
   /**
+   * Override Cube's filter class for every filter on a MongoSQL query.
+   *
+   * Background (Gap 4 discovery): Cube's default `BaseFilter.likeIgnoreCase`
+   * emits `<col> [NOT] ILIKE <pattern>` for `contains`, `notContains`,
+   * `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`. mongosql
+   * v1.8.5's grammar does NOT include the `ILIKE` keyword (verified
+   * empirically against atlas-local — the parser reports
+   * `Error 2001: Unrecognized token ILIKE, expected: BETWEEN` /
+   * `expected COMMA, RIGHT_PAREN`). mongosql DOES support the standard
+   * SQL-92 `LIKE` keyword.
+   *
+   * Strategy: subclass BaseFilter and override `likeIgnoreCase` to
+   * emit `LOWER(<col>) LIKE LOWER(<pattern>)` instead of
+   * `<col> ILIKE <pattern>`. Wrapping both sides in `LOWER(...)`
+   * preserves case-insensitive semantics; mongosql's `LOWER` is the
+   * standard SQL function and round-trips strings unchanged for ASCII
+   * content. We do NOT use `ESCAPE` clauses here because Cube's
+   * `escapeWildcardChars` pre-escapes `%` and `_` with `\` and SQL's
+   * default LIKE escape character IS `\` per the SQL standard (mongosql
+   * v1.8.5 follows this).
+   *
+   * **Non-ASCII / Unicode caveat.** This override is ASCII-aware case
+   * folding only. mongosql v1.8.5 does not expose `COLLATE` at the SQL
+   * surface, so case-folding non-ASCII characters (e.g. the German
+   * sharp-s `ß` → `ss`, Turkish dotless-i, etc.) is NOT performed. For
+   * pure-Latin inputs (the dominant Cube use case) this is correct.
+   * For locale-sensitive case-insensitive search, use MongoDB's
+   * collation feature outside the SQL surface or pre-normalise data.
+   */
+  public override newFilter(filter: unknown): BaseFilter {
+    return new MongoSqlFilter(this as unknown as BaseQuery, filter);
+  }
+
+  /**
    * Patch the SQL templates that drive the rest of BaseQuery's builders.
    * Mirrors MysqlQuery.sqlTemplates()'s pattern of `super` + targeted
    * overrides.
@@ -512,5 +547,47 @@ export class MongoSqlQuery extends BaseQuery {
     }
 
     return templates;
+  }
+}
+
+/**
+ * Filter override for MongoSQL — rewrites `ILIKE` to `LOWER(...) LIKE LOWER(...)`.
+ *
+ * See `MongoSqlQuery.newFilter` for the rationale. Exported so unit tests
+ * can exercise `likeIgnoreCase` in isolation without instantiating the
+ * whole query stack.
+ */
+export class MongoSqlFilter extends BaseFilter {
+  /**
+   * Emit `LOWER(<col>) [NOT] LIKE LOWER(<wrapped-param>)` for mongosql.
+   *
+   * Layout mirrors BaseFilter.likeIgnoreCase:
+   *   - `type === 'contains'`: wrap pattern with `'%' || ... || '%'`
+   *   - `type === 'starts'`:   suffix with `|| '%'` only (no prefix)
+   *   - `type === 'ends'`:     prefix with `'%' ||` only (no suffix)
+   *
+   * Cube's BaseFilter passes type as 'contains' / 'starts' / 'ends'
+   * (NOT the camelized operator — see BaseFilter.likeOr where `type`
+   * is hardcoded to one of those three values).
+   *
+   * `allocateParam` returns Cube's `?` placeholder; the driver's
+   * `substituteParameters` inlines literals before sending to mongosql.
+   */
+  public override likeIgnoreCase(column: string, not: boolean, param: unknown, type: string): string {
+    const p = !type || type === 'contains' || type === 'ends' ? "'%' || " : '';
+    const s = !type || type === 'contains' || type === 'starts' ? " || '%'" : '';
+    // Wrap the param-allocated placeholder in LOWER so the parser sees
+    // `LOWER(<col>) [NOT] LIKE LOWER('%' || ? || '%')`. mongosql's LOWER
+    // accepts the concatenated string expression as input.
+    //
+    // **Performance.** `LOWER(<col>)` is non-sargable — it prevents
+    // MongoDB from using any B-tree index on `<col>`. For high-volume
+    // case-insensitive search consider EITHER (a) materialising a
+    // lowercase shadow column at ingestion time and indexing that, OR
+    // (b) using MongoDB's collation feature outside the SQL surface
+    // (mongosql v1.8.5 does not expose `COLLATE`).
+    const wrapped = `${p}${this.allocateParam(param)}${s}`;
+    const direction = not ? ' NOT' : '';
+    return `LOWER(${column})${direction} LIKE LOWER(${wrapped})`;
   }
 }
