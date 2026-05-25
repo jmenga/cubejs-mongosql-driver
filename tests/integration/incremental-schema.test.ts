@@ -70,13 +70,14 @@ describe('MongoSqlDriver — incremental schema loading (E2E)', () => {
     const tables = await driver.getTablesForSpecificSchemas([{ schema_name: TEST_DB }]);
     const tableNames = tables.map((t) => t.table_name).sort();
     // Per fixtures/seed-schemas.js the database registers schemas for
-    // these 9 collections — must be the same set tablesSchema()
+    // these 10 collections — must be the same set tablesSchema()
     // surfaces in basic-queries.test.ts. Phase B added product_catalog
     // (Gap 4), granular_events (Gap 6), tz_events (Gap 7), weird_types
-    // (Gap 10).
+    // (Gap 10); Phase C added driver_tests_shared (Gap 11).
     expect(tableNames).toEqual([
       'accounts',
       'configs',
+      'driver_tests_shared',
       'granular_events',
       'orders',
       'product_catalog',

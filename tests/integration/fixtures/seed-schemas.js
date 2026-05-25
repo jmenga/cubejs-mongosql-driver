@@ -203,6 +203,25 @@ const schemas = [
       },
     },
   },
+  // `driver_tests_shared` — Gap 11. Mirrors the 4-row canned fixture
+  // shape Cube's `@cubejs-backend/testing-shared.DriverTests.QUERY`
+  // issues against every driver.
+  {
+    _id: 'driver_tests_shared',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:      { bsonType: 'objectId' },
+          id_num:   { bsonType: 'int'      },
+          id_str:   { bsonType: 'string'   },
+          last_mod: { bsonType: 'date'     },
+          name:     { bsonType: 'string'   },
+        },
+      },
+    },
+  },
 ];
 
 // Use bracket-property access; mongosh's `db` proxy chokes on the dot-form

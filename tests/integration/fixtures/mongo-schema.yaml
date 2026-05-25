@@ -91,3 +91,11 @@ schema:
           _id:         { bsonType: objectId }
           id:          { bsonType: string }
           occurred_at: { bsonType: date }
+      driver_tests_shared:
+        bsonType: object
+        properties:
+          _id:      { bsonType: objectId }
+          id_num:   { bsonType: int }
+          id_str:   { bsonType: string }
+          last_mod: { bsonType: date }
+          name:     { bsonType: string }

@@ -1,0 +1,58 @@
+name: integration-matrix
+
+# Runs the integration test suite against multiple MongoDB Atlas-local
+# image versions to catch BSON / driver-protocol drift across supported
+# MongoDB versions. The default e2e workflow pins one version (the
+# dev cycle's target); this matrix workflow is a slower, broader sweep.
+#
+# Gated to nightly + on-demand to keep PR CI fast.
+
+on:
+  schedule:
+    # 07:00 UTC daily — pick a window outside main-branch peak hours.
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      # `fail-fast: false` so one version's failure doesn't mask the others.
+      fail-fast: false
+      matrix:
+        # MongoDB versions tracked by Atlas-local. 6.0 is the current LTS;
+        # 7.0 and 8.0 are the rolling-release tracks. Add 9.0 when MongoDB
+        # promotes the major version.
+        atlas-version: ['6.0', '7.0', '8.0']
+    env:
+      # The compose file at `tests/integration/docker-compose.test.yml`
+      # picks the image from `ATLAS_LOCAL_IMAGE` (default 8.0).
+      ATLAS_LOCAL_IMAGE: 'mongodb/mongodb-atlas-local:${{ matrix.atlas-version }}'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:rust:debug
+      - name: Run integration suite (MongoDB ${{ matrix.atlas-version }})
+        run: pnpm test:integration
+      - name: Dump compose logs on failure
+        if: failure()
+        run: |
+          docker compose -f tests/integration/docker-compose.test.yml logs
+          echo "===== atlas-local config ====="
+          docker compose -f tests/integration/docker-compose.test.yml config

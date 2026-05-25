@@ -301,4 +301,22 @@ if (db.tz_events.countDocuments() === 0) {
   ]);
 }
 
+// `driver_tests_shared` — Gap 11. Mirrors the 4-row canned fixture
+// shape from Cube's `@cubejs-backend/testing-shared.DriverTests.QUERY`:
+// `(id_num INT, id_str STRING, last_mod TIMESTAMP, name STRING)`.
+// Cube's testing-shared issues this exact query against every driver
+// to pin: read happens at all, types come back in the expected
+// generic-Cube shape, no transparent type coercion drops information.
+// We reproduce the contract here as a collection (vs the upstream
+// UNION-ALL-of-literals) because mongosql doesn't accept the upstream
+// literal-only form. Same 4 rows, same semantic check.
+if (db.driver_tests_shared.countDocuments() === 0) {
+  db.driver_tests_shared.insertMany([
+    { _id: ObjectId(), id_num: NumberInt(1), id_str: 'one',   last_mod: new Date('2024-01-01T00:00:00Z'), name: 'a' },
+    { _id: ObjectId(), id_num: NumberInt(2), id_str: 'two',   last_mod: new Date('2024-02-01T00:00:00Z'), name: 'b' },
+    { _id: ObjectId(), id_num: NumberInt(3), id_str: 'three', last_mod: new Date('2024-03-01T00:00:00Z'), name: 'c' },
+    { _id: ObjectId(), id_num: NumberInt(4), id_str: 'four',  last_mod: new Date('2024-04-01T00:00:00Z'), name: 'd' },
+  ]);
+}
+
 print('seed-data: collections seeded');

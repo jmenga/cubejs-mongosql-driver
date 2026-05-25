@@ -1,6 +1,9 @@
 services:
   atlas-local:
-    image: mongodb/mongodb-atlas-local:8.0
+    # MongoDB version is overridable via env (used by the multi-version
+    # CI matrix in `.github/workflows/integration-matrix.yaml`). Default
+    # is 8.0 (matches the dev cycle); CI also runs against 7.0.
+    image: ${ATLAS_LOCAL_IMAGE:-mongodb/mongodb-atlas-local:8.0}
     container_name: mongosql-cubejs-driver-atlas
     ports:
       - '27017:27017'

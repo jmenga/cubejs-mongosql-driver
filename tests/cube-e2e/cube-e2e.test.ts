@@ -38,6 +38,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execSync } from 'node:child_process';
+import * as path from 'node:path';
 
 const CUBE_URL = process.env.CUBE_E2E_URL ?? 'http://localhost:4000';
 const LOAD_ENDPOINT = `${CUBE_URL}/cubejs-api/v1/load`;
@@ -1695,6 +1696,200 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
       expect(a).toBe(5);
       expect(b).toBe(2);
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Gap 15 — /load annotation shape snapshot.
+  //
+  // Cube clients (Studio, frontend dashboards) parse the `annotation`
+  // block of /load responses to render measure titles, dimension types,
+  // granularity labels, etc. A dialect change to type derivation, or a
+  // Cube upgrade that adjusts the annotation envelope, could silently
+  // flip downstream rendering.
+  //
+  // This test locks the annotation for a representative query
+  // (measure + dimension + time-dimension with granularity) using
+  // `toMatchInlineSnapshot`. The snapshot includes `type` (`number` /
+  // `string` / `time`), `title`, `shortTitle`, `drillMembers`, and the
+  // `granularity` sub-block for time-dimensions.
+  //
+  // Run `pnpm test:cube-e2e -- -u` to regenerate the snapshot when an
+  // intentional annotation change lands.
+  // ---------------------------------------------------------------------------
+  describe('Gap 15 — /load annotation shape snapshot', () => {
+    it('matches the locked annotation envelope for a measure + dimension + time-dimension query', async () => {
+      const body = await loadQuery({
+        query: {
+          measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+          dimensions: ['revenue_events.category'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-01-01', '2026-04-01'],
+            },
+          ],
+        },
+      });
+      const annotation = (body as { annotation?: unknown }).annotation;
+      expect(annotation).toMatchInlineSnapshot(`
+        {
+          "dimensions": {
+            "revenue_events.category": {
+              "shortTitle": "Category",
+              "title": "Revenue Events Category",
+              "type": "string",
+            },
+          },
+          "measures": {
+            "revenue_events.count": {
+              "drillMembers": [],
+              "drillMembersGrouped": {
+                "dimensions": [],
+                "measures": [],
+              },
+              "shortTitle": "Count",
+              "title": "Revenue Events Count",
+              "type": "number",
+            },
+            "revenue_events.totalAmount": {
+              "drillMembers": [],
+              "drillMembersGrouped": {
+                "dimensions": [],
+                "measures": [],
+              },
+              "shortTitle": "Total Amount",
+              "title": "Revenue Events Total Amount",
+              "type": "number",
+            },
+          },
+          "segments": {},
+          "timeDimensions": {
+            "revenue_events.occurredAt": {
+              "shortTitle": "Occurred at",
+              "title": "Revenue Events Occurred at",
+              "type": "time",
+            },
+            "revenue_events.occurredAt.month": {
+              "granularity": {
+                "interval": "1 month",
+                "name": "month",
+                "title": "month",
+              },
+              "shortTitle": "Occurred at",
+              "title": "Revenue Events Occurred at",
+              "type": "time",
+            },
+          },
+        }
+      `);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Gap 12 — SIGTERM lifecycle (graceful shutdown).
+  //
+  // Cube's `cubejs-testing/test/smoke-graceful-shutdown.test.ts` pins
+  // that the server tears down cleanly under SIGTERM mid-operation —
+  // any leaked DB connection or background task that hangs past the
+  // signal would fail the test. Our driver releases its native Mongo
+  // client via `release()`; if Cube wires SIGTERM to that path, no
+  // hung connections remain on the Mongo side.
+  //
+  // This test sends SIGTERM to the idle cube container and asserts:
+  //   - Container exits within 30s (no hung process).
+  //   - Exit code is 0 or 143 (143 = 128+15, the standard SIGTERM
+  //     code; some shells normalise to 0 on graceful exit).
+  //   - The cube logs an explicit shutdown message (proves Cube saw
+  //     the signal and ran its teardown, not just got hard-killed).
+  //
+  // After the test, we restart the cube container so subsequent tests
+  // in the suite (if any) see a healthy stack. `afterAll` would be
+  // wrong here because globalSetup's teardown is what runs the next
+  // `docker compose down -v`; this test brings the container BACK up
+  // explicitly so the remainder of the suite has a working /load.
+  // ---------------------------------------------------------------------------
+  describe('Gap 12 — SIGTERM lifecycle (graceful shutdown)', () => {
+    it('cube container exits cleanly under SIGTERM and Cube logs a shutdown marker', () => {
+      // Send SIGTERM. Docker compose `kill --signal=SIGTERM` is the
+      // canonical way to inject the signal at the PID-1 level.
+      execSync('docker compose -f examples/docker/docker-compose.yaml kill --signal=SIGTERM cube', {
+        cwd: path.resolve(__dirname, '..', '..'),
+      });
+
+      // Poll the container state — Cube should exit within a few
+      // seconds. 30 s is the upper bound from upstream's
+      // `smoke-graceful-shutdown` test.
+      const deadline = Date.now() + 30_000;
+      let exitCode: number | null = null;
+      let isRunning = true;
+      while (Date.now() < deadline) {
+        try {
+          const out = execSync(
+            'docker inspect cubejs-mongosql-e2e-cube --format "{{.State.Running}} {{.State.ExitCode}}"',
+            { encoding: 'utf-8' },
+          ).trim();
+          const [running, code] = out.split(/\s+/);
+          if (running === 'false') {
+            isRunning = false;
+            exitCode = Number(code);
+            break;
+          }
+        } catch {
+          // container may transiently be unreachable during exit
+        }
+        // Coarse poll — 500 ms is fine; exit happens within seconds.
+        const start = Date.now();
+        while (Date.now() - start < 500) {
+          /* busy-wait — sync */
+        }
+      }
+
+      expect(isRunning, 'cube did not exit within 30s of SIGTERM').toBe(false);
+      // 0 = clean exit; 143 = 128 + SIGTERM (15). Some node-runtime
+      // versions emit 0 when the process catches SIGTERM and runs
+      // shutdown handlers; others propagate 143. Both are acceptable.
+      expect([0, 143]).toContain(exitCode);
+
+      // Verify Cube logged its shutdown path — "shutting down" /
+      // "process exit" / "stop" markers from `@cubejs-backend/server`.
+      const logs = execSync('docker logs --tail 200 cubejs-mongosql-e2e-cube 2>&1', {
+        encoding: 'utf-8',
+      }).toLowerCase();
+      const sawShutdown =
+        logs.includes('shutting down') ||
+        logs.includes('shutdown') ||
+        logs.includes('sigterm') ||
+        logs.includes('graceful');
+      expect(sawShutdown, `expected a shutdown marker in cube logs; last 4KB:\n${logs.slice(-4096)}`).toBe(true);
+
+      // Restart the cube container so the rest of the suite (and
+      // subsequent runs) see a healthy stack.
+      execSync('docker compose -f examples/docker/docker-compose.yaml up -d cube', {
+        cwd: path.resolve(__dirname, '..', '..'),
+      });
+      // Wait for readiness — coarse poll, /readyz comes back inside ~5s.
+      const upDeadline = Date.now() + 60_000;
+      let ready = false;
+      while (Date.now() < upDeadline) {
+        try {
+          const code = execSync('curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:4000/readyz', {
+            encoding: 'utf-8',
+          }).trim();
+          if (code === '200') {
+            ready = true;
+            break;
+          }
+        } catch {
+          /* ignore */
+        }
+        const start = Date.now();
+        while (Date.now() - start < 1000) {
+          /* busy-wait */
+        }
+      }
+      expect(ready, 'cube did not come back up within 60s after SIGTERM test').toBe(true);
+    }, 120_000);
   });
 });
 
