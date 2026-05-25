@@ -41,3 +41,9 @@ test-results
 
 # T19 E2E artefacts (npm pack output staged for the docker build)
 examples/docker/pkg/*.tgz
+
+# Internal planning doc — kept locally, not published.
+IMPLEMENTATION_PLAN.md
+
+# Playwright MCP artefacts
+.playwright-mcp/
