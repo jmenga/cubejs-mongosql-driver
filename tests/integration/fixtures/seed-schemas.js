@@ -102,6 +102,107 @@ const schemas = [
       },
     },
   },
+  // `product_catalog` — filter-operator matrix harness (Gap 4). Contains
+  // distinct prefixes/suffixes/substrings plus special-character payloads
+  // (`%`, `_`, regex metachars) so the filter-operator tests can pin
+  // both happy-path matches AND that LIKE wildcards / regex metachars
+  // are treated as LITERAL pattern bytes by the dialect.
+  {
+    _id: 'product_catalog',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:      { bsonType: 'objectId' },
+          id:       { bsonType: 'string'   },
+          name:     { bsonType: 'string'   },
+          category: { bsonType: 'string'   },
+        },
+      },
+    },
+  },
+  // `weird_types` — BSON type matrix harness (Gap 10). Covers Long, Binary
+  // (subtype 0 + subtype 4/UUID), BSON Timestamp (distinct from Date),
+  // embedded array, and nested document — types that production schemas
+  // commonly carry but our other fixtures didn't exercise.
+  //
+  // Per mongosql's schema syntax (mongosql v1.8.5 `bsonType` enum, see
+  // `mongosql/src/schema/mod.rs::BsonType::try_from`):
+  //   - `long` for NumberLong
+  //   - `binData` for BinData (subtype generic or UUID — mongosql does
+  //     NOT split subtype 4 into a separate `uuid` SQL type at v1.8.5;
+  //     both surface as BINDATA).
+  //   - `timestamp` for BSON Timestamp (the replication-internal type;
+  //     distinct from `date`).
+  //   - `array` with `items` for embedded arrays.
+  //   - `object` with `properties` for embedded documents.
+  {
+    _id: 'weird_types',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:         { bsonType: 'objectId' },
+          id:          { bsonType: 'string'   },
+          id_long:     { bsonType: 'long'     },
+          bin:         { bsonType: 'binData'  },
+          uuid:        { bsonType: 'binData'  },
+          ts:          { bsonType: 'timestamp'},
+          occurred_at: { bsonType: 'date'     },
+          nested: {
+            bsonType: 'object',
+            properties: {
+              label: { bsonType: 'string' },
+              count: { bsonType: 'int'    },
+            },
+          },
+          tags: {
+            bsonType: 'array',
+            items:    { bsonType: 'string' },
+          },
+        },
+      },
+    },
+  },
+  // `granular_events` — time-granularity matrix harness (Gap 6). Single
+  // time column whose values are placed across all eight granularities
+  // (second/minute/hour/day/week/month/quarter/year). The cube-e2e test
+  // pins one bucket-count per granularity against the seed truth.
+  {
+    _id: 'granular_events',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:         { bsonType: 'objectId' },
+          id:          { bsonType: 'string'   },
+          occurred_at: { bsonType: 'date'     },
+        },
+      },
+    },
+  },
+  // `tz_events` — timezone-boundary harness (Gap 7). Three timestamps
+  // chosen so their UTC vs Asia/Kolkata/EST day-buckets differ. The
+  // cube-e2e test queries with `timezone: 'UTC'` and a non-UTC value to
+  // assert either correct bucket migration OR a clean error per the
+  // documented UTC-only contract.
+  {
+    _id: 'tz_events',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id:         { bsonType: 'objectId' },
+          id:          { bsonType: 'string'   },
+          occurred_at: { bsonType: 'date'     },
+        },
+      },
+    },
+  },
 ];
 
 // Use bracket-property access; mongosh's `db` proxy chokes on the dot-form

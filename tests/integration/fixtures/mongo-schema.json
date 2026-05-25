@@ -56,6 +56,54 @@
               }
             }
           }
+        },
+        "product_catalog": {
+          "bsonType": "object",
+          "properties": {
+            "_id": { "bsonType": "objectId" },
+            "id": { "bsonType": "string" },
+            "name": { "bsonType": "string" },
+            "category": { "bsonType": "string" }
+          }
+        },
+        "weird_types": {
+          "bsonType": "object",
+          "properties": {
+            "_id": { "bsonType": "objectId" },
+            "id": { "bsonType": "string" },
+            "id_long": { "bsonType": "long" },
+            "bin": { "bsonType": "binData" },
+            "uuid": { "bsonType": "binData" },
+            "ts": { "bsonType": "timestamp" },
+            "occurred_at": { "bsonType": "date" },
+            "nested": {
+              "bsonType": "object",
+              "properties": {
+                "label": { "bsonType": "string" },
+                "count": { "bsonType": "int" }
+              }
+            },
+            "tags": {
+              "bsonType": "array",
+              "items": { "bsonType": "string" }
+            }
+          }
+        },
+        "granular_events": {
+          "bsonType": "object",
+          "properties": {
+            "_id": { "bsonType": "objectId" },
+            "id": { "bsonType": "string" },
+            "occurred_at": { "bsonType": "date" }
+          }
+        },
+        "tz_events": {
+          "bsonType": "object",
+          "properties": {
+            "_id": { "bsonType": "objectId" },
+            "id": { "bsonType": "string" },
+            "occurred_at": { "bsonType": "date" }
+          }
         }
       }
     }

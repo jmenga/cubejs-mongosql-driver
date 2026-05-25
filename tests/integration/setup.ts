@@ -78,7 +78,16 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
  * change.
  */
 function reseed(): void {
-  const scripts = ['/docker-entrypoint-initdb.d/01-seed-data.js', '/docker-entrypoint-initdb.d/02-seed-schemas.js'];
+  // All four initdb scripts. atlas-local runs these on first volume
+  // init; we re-run each setup so pre-existing volumes pick up newly
+  // added collections (e.g. the `mongosql_test_secondary` Gap 8
+  // tenant).
+  const scripts = [
+    '/docker-entrypoint-initdb.d/01-seed-data.js',
+    '/docker-entrypoint-initdb.d/02-seed-schemas.js',
+    '/docker-entrypoint-initdb.d/03-seed-secondary-data.js',
+    '/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js',
+  ];
   for (const script of scripts) {
     execSync(
       `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --file ${script}`,

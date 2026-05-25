@@ -1,0 +1,54 @@
+# Docker Compose overlay — Cube against a deliberately-broken DB URI.
+#
+# Gap 9 harness — assertions:
+#   1. Container does NOT crash-loop on a misconfigured driver. The
+#      cube process must stay alive — the driver's `testConnection()`
+#      can fail repeatedly, and Cube's own readiness gate keeps /readyz
+#      reporting non-OK without taking the process down.
+#   2. `/readyz` returns non-200 (Cube uses /readyz as a liveness proxy
+#      and a failed driver init causes a non-200 / connection error
+#      response — depending on Cube version).
+#   3. The driver-init error is surfaced in container logs cleanly (a
+#      MongoSqlError with a documented code, NOT a panic / segfault).
+#
+# Reuses the same prebuilt cube image as the local-fixture compose so we
+# don't pay a separate build. No atlas-local — the URI points at a
+# guaranteed-unreachable host so connect() always fails.
+#
+# Run via:
+#   docker compose -f examples/docker/docker-compose.broken.yaml up -d
+#
+# Cube serves on http://localhost:4002 in dev mode.
+services:
+  cube-broken:
+    image: mongosql-cubejs-driver-e2e:latest
+    container_name: cubejs-mongosql-e2e-cube-broken
+    ports:
+      - '4002:4000'
+    environment:
+      CUBEJS_DB_TYPE: mongosql
+      # `.invalid` is reserved per RFC 6761 so it never resolves —
+      # mongo's connect() fails fast on a DNS resolution error every
+      # time. `serverSelectionTimeoutMS=2000` keeps the failure quick.
+      CUBEJS_DB_URI: 'mongodb://nonexistent-host.invalid:27017/?directConnection=true&serverSelectionTimeoutMS=2000'
+      CUBEJS_DB_NAME: broken_test_db
+      CUBEJS_DEV_MODE: 'true'
+      CUBEJS_API_SECRET: e2e-test-secret-not-for-prod
+      CUBEJS_MONGOSQL_SCHEMA_SOURCE: collection
+      CUBEJS_MONGOSQL_SCHEMA_REFRESH_SEC: '300'
+      CUBEJS_MONGOSQL_APP_NAME: cube-e2e-broken
+      # Keep the schema-init failure observable. `trace` to ensure the
+      # error gets logged for the cube-e2e test to assert against.
+      CUBEJS_LOG_LEVEL: trace
+      # NOTE: SCHEMA_FAIL_OPEN deliberately NOT set (default = false).
+      # With fail-open, schema-refresh would silently succeed-with-empty
+      # and downstream queries would surface as MONGOSQL_TRANSLATE_FAILED
+      # ("table unknown") rather than the underlying connect failure.
+      # Letting the connect failure propagate at testConnection time
+      # produces the canonical MONGOSQL_CONNECT_FAILED error code which
+      # is what Gap 9 asserts.
+      NODE_ENV: production
+    # No healthcheck — Gap 9 explicitly asserts what /readyz returns
+    # when the driver can't reach the DB. A passing healthcheck here
+    # would mask the contract.
+    restart: 'no'

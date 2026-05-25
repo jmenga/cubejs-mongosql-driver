@@ -46,6 +46,11 @@ services:
       # row that `tests/integration/basic-queries.test.ts` already pins.
       - ../../tests/integration/fixtures/seed-data.js:/docker-entrypoint-initdb.d/01-seed-data.js:ro
       - ../../tests/integration/fixtures/seed-schemas.js:/docker-entrypoint-initdb.d/02-seed-schemas.js:ro
+      # Secondary database — used by the driverFactory(ctx) multi-tenant
+      # cube-e2e test (Gap 8). Distinct row count from primary so a
+      # mis-routed query is visible as a count mismatch.
+      - ../../tests/integration/fixtures/seed-secondary-data.js:/docker-entrypoint-initdb.d/03-seed-secondary-data.js:ro
+      - ../../tests/integration/fixtures/seed-secondary-schemas.js:/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js:ro
     networks:
       - cube-e2e
     healthcheck:

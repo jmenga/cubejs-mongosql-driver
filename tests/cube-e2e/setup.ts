@@ -102,7 +102,16 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
  * fresh volumes.
  */
 function reseed(): void {
-  const scripts = ['/docker-entrypoint-initdb.d/01-seed-data.js', '/docker-entrypoint-initdb.d/02-seed-schemas.js'];
+  // Idempotent re-seed of all four initdb scripts. atlas-local only runs
+  // these once on volume init; we re-run them on every setup so a
+  // pre-existing volume picks up newly-added rows (e.g. the secondary
+  // database introduced with Gap 8).
+  const scripts = [
+    '/docker-entrypoint-initdb.d/01-seed-data.js',
+    '/docker-entrypoint-initdb.d/02-seed-schemas.js',
+    '/docker-entrypoint-initdb.d/03-seed-secondary-data.js',
+    '/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js',
+  ];
   for (const script of scripts) {
     const r = spawnSync(
       'docker',
@@ -133,21 +142,64 @@ function reseed(): void {
 }
 
 async function waitForSchemaIncludesSeededCollections(maxSeconds = 30): Promise<void> {
+  // List of schema rows the cube-e2e suite REQUIRES to be present in
+  // `__sql_schemas` before we let Cube come up. Each entry corresponds
+  // to a cube model under `examples/docker/cube/model/` that the test
+  // suite issues queries against. Failing to wait for any of these
+  // would let Cube come up with that cube failing to compile (a
+  // missing schema means mongosql can't resolve `sql_table`), which
+  // surfaces as a cryptic /meta 500.
+  //
+  // Newly added (Gaps 4 / 6 / 7 / 10):
+  //   - product_catalog (Gap 4)
+  //   - granular_events (Gap 6)
+  //   - tz_events       (Gap 7)
+  //   - weird_types     (Gap 10)
+  const required = ['revenue_events', 'configs', 'product_catalog', 'granular_events', 'tz_events', 'weird_types'];
+  const inList = required.map((id) => JSON.stringify(id)).join(', ');
   const deadline = Date.now() + maxSeconds * 1000;
   while (Date.now() < deadline) {
     try {
       const out = execSync(
-        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments({_id: {$in: ["revenue_events", "configs"]}})'`,
+        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments({_id: {$in: [${inList}]}})'`,
         { encoding: 'utf-8', cwd: REPO_ROOT },
       ).trim();
       const n = parseInt(out, 10);
-      if (n >= 2) return;
+      if (n >= required.length) {
+        // Also wait for the secondary-database schema (Gap 8 multi-tenant).
+        // We don't fold it into the same in-list because it lives in a
+        // different DB (`mongosql_test_secondary`).
+        await waitForSecondaryDbSchema(maxSeconds);
+        return;
+      }
     } catch {
       // ignore
     }
     await sleep(1500);
   }
-  throw new Error('revenue_events / configs rows never appeared in __sql_schemas after reseed');
+  throw new Error(
+    `expected ${required.length} schema rows (${required.join(', ')}) but they never appeared after reseed`,
+  );
+}
+
+async function waitForSecondaryDbSchema(maxSeconds: number): Promise<void> {
+  const deadline = Date.now() + maxSeconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const out = execSync(
+        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test_secondary").getCollection("__sql_schemas").countDocuments({_id: "orders_secondary"})'`,
+        { encoding: 'utf-8', cwd: REPO_ROOT },
+      ).trim();
+      const n = parseInt(out, 10);
+      if (n >= 1) return;
+    } catch {
+      // ignore
+    }
+    await sleep(1500);
+  }
+  throw new Error(
+    'expected `mongosql_test_secondary.__sql_schemas` to contain the `orders_secondary` row (Gap 8 multi-tenant)',
+  );
 }
 
 async function waitForCubeReady(maxSeconds = 120): Promise<void> {

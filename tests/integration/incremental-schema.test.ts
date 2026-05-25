@@ -70,9 +70,21 @@ describe('MongoSqlDriver — incremental schema loading (E2E)', () => {
     const tables = await driver.getTablesForSpecificSchemas([{ schema_name: TEST_DB }]);
     const tableNames = tables.map((t) => t.table_name).sort();
     // Per fixtures/seed-schemas.js the database registers schemas for
-    // these 5 collections — must be the same set tablesSchema()
-    // surfaces in basic-queries.test.ts.
-    expect(tableNames).toEqual(['accounts', 'configs', 'orders', 'revenue_events', 'users']);
+    // these 9 collections — must be the same set tablesSchema()
+    // surfaces in basic-queries.test.ts. Phase B added product_catalog
+    // (Gap 4), granular_events (Gap 6), tz_events (Gap 7), weird_types
+    // (Gap 10).
+    expect(tableNames).toEqual([
+      'accounts',
+      'configs',
+      'granular_events',
+      'orders',
+      'product_catalog',
+      'revenue_events',
+      'tz_events',
+      'users',
+      'weird_types',
+    ]);
     // Every row carries the requested schema name.
     for (const r of tables) expect(r.schema_name).toBe(TEST_DB);
   });
@@ -84,7 +96,8 @@ describe('MongoSqlDriver — incremental schema loading (E2E)', () => {
     ]);
     // Only the known schema contributes rows.
     expect(tables.some((t) => t.schema_name === 'does_not_exist')).toBe(false);
-    expect(tables.length).toBeGreaterThanOrEqual(5);
+    // Expect at least the 9 seeded collections.
+    expect(tables.length).toBeGreaterThanOrEqual(9);
   });
 
   it('getColumnsForSpecificTables() returns one row per (table, column) with snake_case keys', async () => {

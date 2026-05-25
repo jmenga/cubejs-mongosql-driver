@@ -280,15 +280,29 @@ describe('MongoSqlDriver — basic queries (E2E)', () => {
     expect(schema).toHaveProperty(TEST_DB);
     const db = schema[TEST_DB];
     expect(db).toBeDefined();
-    // The fixture seeds five collections in `__sql_schemas`:
+    // The fixture seeds nine collections in `__sql_schemas`:
     //   accounts, orders, users — the original integration set;
     //   revenue_events — added for the cube-e2e rollup-partition test;
     //   configs — added for the sparse-nested-path row-shape
-    //   normalization regression test.
-    // Older builds saw only 3; we now require the multi-month
-    // revenue_events row AND the configs row to be registered so the
-    // downstream tests can run against them.
-    expect(Object.keys(db).sort()).toEqual(['accounts', 'configs', 'orders', 'revenue_events', 'users']);
+    //   normalization regression test;
+    //   product_catalog — Gap 4 (filter-operator matrix);
+    //   granular_events — Gap 6 (granularity matrix);
+    //   tz_events — Gap 7 (non-UTC timezone);
+    //   weird_types — Gap 10 (unusual BSON types).
+    // Older builds saw fewer rows; we now require the full Phase B set
+    // to be registered so the downstream cube-e2e tests can run against
+    // them.
+    expect(Object.keys(db).sort()).toEqual([
+      'accounts',
+      'configs',
+      'granular_events',
+      'orders',
+      'product_catalog',
+      'revenue_events',
+      'tz_events',
+      'users',
+      'weird_types',
+    ]);
 
     // users columns
     const userColNames = db.users.map((c) => c.name).sort();

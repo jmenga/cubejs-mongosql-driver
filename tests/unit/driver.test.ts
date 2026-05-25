@@ -1279,3 +1279,121 @@ describe('MongoSqlDriver — query() row-shape normalization', () => {
     });
   });
 });
+
+// ===========================================================================
+// Gap 8 — driverFactory(ctx) multi-tenant CONSTRUCTOR-INDEPENDENCE pins.
+//
+// CubeJS's recommended pattern for multi-tenant data routing is:
+//
+//   driverFactory: (ctx) => new MongoSqlDriver({
+//     uri:      lookupTenantUri(ctx.dataSource, ctx.securityContext),
+//     database: lookupTenantDb(ctx.dataSource, ctx.securityContext),
+//   })
+//
+// where `ctx.dataSource` is the cube's declared `data_source` name and
+// `ctx.securityContext` carries per-request claims. Cube invokes the
+// factory PER `(dataSource, securityContext)` tuple and caches the
+// returned driver instance for the duration of the orchestrator window.
+//
+// **This unit block pins driver-side constructor independence only:**
+//   1. The MongoSqlDriver constructor accepts the same config from EITHER
+//      env vars OR explicit args — letting `driverFactory(ctx)` map a
+//      tenant key to a driver instance without polluting process.env.
+//   2. Two driver instances constructed with different configs route to
+//      distinct native clients (no shared state).
+//   3. Each driver's `_config()` reports the same uri/database it was
+//      constructed with — so a test harness (or production diagnostic)
+//      can verify the routing decision.
+//
+// **What this block does NOT verify:** the cube-server-side dispatch
+// itself — Cube invoking `driverFactory(ctx)` with a real `dataSource`,
+// caching per-tuple, and routing /load to the right driver. That contract
+// is pinned end-to-end by the multi-tenant cube-e2e test:
+//
+//   tests/cube-e2e/cube-e2e.test.ts → "driverFactory(ctx) routes
+//   `dataSource: 'secondary'` queries to mongosql_test_secondary"
+//
+// which seeds two databases (`mongosql_test` + `mongosql_test_secondary`),
+// wires `driverFactory: (ctx) => ...` in `examples/docker/cube/cube.js`
+// to branch on `ctx.dataSource`, and queries through both cubes asserting
+// distinct row counts.
+// ===========================================================================
+describe('MongoSqlDriver — Gap 8 driverFactory(ctx) constructor-independence', () => {
+  it('two drivers with distinct configs route to distinct native clients', async () => {
+    installMockNative();
+    // Tenant A — analytics database.
+    const driverA = new MongoSqlDriver({
+      uri: 'mongodb://host-a/?authSource=admin',
+      database: 'tenant_a',
+    });
+    // Tenant B — separate database on a separate host.
+    const driverB = new MongoSqlDriver({
+      uri: 'mongodb://host-b/?authSource=admin',
+      database: 'tenant_b',
+    });
+    // Force lazy client creation on both.
+    await driverA.testConnection();
+    const clientA = lastClient;
+    await driverB.testConnection();
+    const clientB = lastClient;
+    // Two distinct native client instances — multi-tenant routing MUST
+    // NOT alias to a shared client.
+    expect(clientA).toBeDefined();
+    expect(clientB).toBeDefined();
+    expect(clientA).not.toBe(clientB);
+    // Each client received its own config.
+    expect((clientA!.config as { uri: string }).uri).toBe('mongodb://host-a/?authSource=admin');
+    expect((clientA!.config as { database: string }).database).toBe('tenant_a');
+    expect((clientB!.config as { uri: string }).uri).toBe('mongodb://host-b/?authSource=admin');
+    expect((clientB!.config as { database: string }).database).toBe('tenant_b');
+    // Reflective accessor — useful for production diagnostics and the
+    // canonical hook for `driverFactory(ctx)` to verify routing.
+    expect(driverA._config().database).toBe('tenant_a');
+    expect(driverB._config().database).toBe('tenant_b');
+  });
+
+  it('mimics Cube driverFactory(ctx) → returns the right driver per dataSource', async () => {
+    // Build a `driverFactory` like a production cube.js would: it maps
+    // ctx.dataSource to a per-tenant config and returns a fresh driver.
+    // Pin that the returned driver's _config matches the per-tenant
+    // values — i.e. there's no accidental aliasing, no env-var bleed.
+    installMockNative();
+    const tenantConfig: Record<string, { uri: string; database: string }> = {
+      tenant_a: { uri: 'mongodb://host-a/?authSource=admin', database: 'tenant_a_db' },
+      tenant_b: { uri: 'mongodb://host-b/?authSource=admin', database: 'tenant_b_db' },
+    };
+    // The shape Cube actually invokes: `(ctx) => BaseDriver`. We only
+    // depend on `ctx.dataSource` here; the security context shape is
+    // documented in Cube docs but unused for the routing decision.
+    const driverFactory = (ctx: { dataSource: string }): MongoSqlDriver => {
+      const cfg = tenantConfig[ctx.dataSource];
+      if (!cfg) throw new Error(`unknown dataSource ${ctx.dataSource}`);
+      return new MongoSqlDriver({ uri: cfg.uri, database: cfg.database });
+    };
+
+    const driverA = driverFactory({ dataSource: 'tenant_a' });
+    const driverB = driverFactory({ dataSource: 'tenant_b' });
+    expect(driverA._config().database).toBe('tenant_a_db');
+    expect(driverB._config().database).toBe('tenant_b_db');
+    expect(driverA._config().uri).toContain('host-a');
+    expect(driverB._config().uri).toContain('host-b');
+
+    // Cube caches and reuses driver instances per `(dataSource,
+    // securityContext)` tuple — for a second invocation with the same
+    // dataSource the factory MUST be able to produce an equivalent
+    // driver (i.e. no hidden state in the constructor).
+    const driverA2 = driverFactory({ dataSource: 'tenant_a' });
+    expect(driverA2._config().database).toBe('tenant_a_db');
+    expect(driverA2).not.toBe(driverA); // distinct instances
+  });
+
+  it('driverFactory pattern returns distinct dialectClass-stable instances', () => {
+    // Pin that dialectClass is INSTANCE-INDEPENDENT — Cube calls it via
+    // the static reference `MongoSqlDriver.dialectClass()`, so even if
+    // a factory hands out two driver instances they both share the
+    // same dialect class. A future regression that instance-attached
+    // `dialectClass` could break Cube's compile path silently.
+    expect(MongoSqlDriver.dialectClass()).toBe(MongoSqlQuery);
+    expect(MongoSqlDriver.dialectClass()).toBe(MongoSqlDriver.dialectClass());
+  });
+});
