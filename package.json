@@ -6,7 +6,6 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "npm",
     "index.js",
     "index.d.ts",
     "README.md",
@@ -40,7 +39,6 @@
     "build:rust": "node scripts/build-rust.mjs --release",
     "build:rust:debug": "node scripts/build-rust.mjs",
     "artifacts": "napi artifacts --output-dir artifacts --npm-dir npm",
-    "prepublishOnly": "napi prepublish -t npm --skip-gh-release",
     "build:ts": "tsc -p tsconfig.build.json",
     "test": "pnpm test:unit && pnpm test:rust",
     "test:unit": "vitest run --config vitest.config.ts",
