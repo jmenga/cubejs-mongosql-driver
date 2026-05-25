@@ -79,7 +79,7 @@ describe('resolveUriConfig — base URI precedence', () => {
         CUBEJS_DB_NAME: 'example',
       }),
     );
-    expect(out.uri).toBe('mongodb://mongo.internal:27017/mongosql_test');
+    expect(out.uri).toBe('mongodb://mongo.internal:27017/example');
   });
 
   it('composes userinfo from _USER/_PASS when both set', () => {
