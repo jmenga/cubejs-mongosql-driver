@@ -11,8 +11,10 @@ Cargo.lock
 **/*.rs.bk
 
 # napi-rs
+# Prebuilt platform binaries are NOT committed — CI rebuilds them per
+# release. They're staged into npm/<short>/ at publish time and bundled
+# into the per-platform sub-package tarball, never tracked in git.
 *.node
-!npm/**/*.node
 # napi-rs auto-generated bindings at project root (overwritten by `napi build`)
 /index.js
 /index.d.ts

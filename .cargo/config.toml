@@ -1,0 +1,15 @@
+# Cargo configuration — musl cross-build for napi-rs.
+#
+# By default, the Rust musl targets statically link the C runtime, which
+# blocks producing a cdylib (`.so`). napi-rs needs a cdylib output to
+# package the platform `.node` shared library. Disabling `crt-static`
+# for musl targets makes the cdylib build cleanly.
+#
+# See: https://github.com/napi-rs/napi-rs/issues/2104
+#      https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

@@ -21,7 +21,6 @@
     "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   }
 }
