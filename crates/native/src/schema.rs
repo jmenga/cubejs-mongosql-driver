@@ -3115,7 +3115,11 @@ mod tests {
             let mut by_db: BTreeMap<String, BTreeMap<String, JsonSchema>> = BTreeMap::new();
             for d in docs {
                 let coll = d.get_str("_id").unwrap().to_string();
-                let raw = d.get_document("schema").unwrap().get_document("jsonSchema").unwrap();
+                let raw = d
+                    .get_document("schema")
+                    .unwrap()
+                    .get_document("jsonSchema")
+                    .unwrap();
                 let schema: JsonSchema = bson::from_document(raw.clone()).unwrap();
                 by_db
                     .entry("mydb".to_string())
@@ -3128,8 +3132,14 @@ mod tests {
             .columns
             .get(&("mydb".to_string(), "events".to_string()))
             .expect("events collection columns");
-        let long_col = cols.iter().find(|c| c.name == "row_count").expect("row_count col");
-        let int_col = cols.iter().find(|c| c.name == "compare_int").expect("compare_int col");
+        let long_col = cols
+            .iter()
+            .find(|c| c.name == "row_count")
+            .expect("row_count col");
+        let int_col = cols
+            .iter()
+            .find(|c| c.name == "compare_int")
+            .expect("compare_int col");
         assert_eq!(
             long_col.sql_type, "bigint",
             "BsonTypeName::Long must map to bigint, got {}",

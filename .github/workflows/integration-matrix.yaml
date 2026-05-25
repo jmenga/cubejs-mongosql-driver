@@ -30,6 +30,10 @@ jobs:
         # MongoDB versions tracked by Atlas-local. 6.0 is the current LTS;
         # 7.0 and 8.0 are the rolling-release tracks. Add 9.0 when MongoDB
         # promotes the major version.
+        #
+        # **EOL plan:** drop 6.0 from the matrix once MongoDB community
+        # support ends (currently scheduled mid-2026). Track upstream
+        # at https://www.mongodb.com/legal/support-policy/lifecycles.
         atlas-version: ['6.0', '7.0', '8.0']
     env:
       # The compose file at `tests/integration/docker-compose.test.yml`
@@ -45,6 +49,11 @@ jobs:
           node-version: '22'
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
+      # Note: rust-cache is per-matrix-entry by default (the cache key
+      # includes the matrix variable). We deliberately do NOT share the
+      # build cache across `atlas-version` entries so a future
+      # MongoDB-specific build flag (e.g. mongo crate feature gates) is
+      # caught by the matrix rather than masked by a shared artifact.
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
       - run: pnpm build:rust:debug

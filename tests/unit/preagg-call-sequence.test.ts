@@ -55,6 +55,13 @@ const tablesSchemaResult: TablesSchema = {
 };
 
 // Recorded call sequence — populated by the wrapper mocks below.
+//
+// Each entry is `[method, args.length]` where `args.length` is the
+// **native-binding arity** (what `MongoSqlClient` in `src/native.ts`
+// passes to the underlying NAPI), NOT the JS-caller arity. The TS
+// wrapper always allocates an abort-handle and forwards it to the
+// native side, so `query` always shows arity 2 (`sql, handle`) even
+// when the JS-side caller omits a signal.
 const callLog: Array<[string, number]> = [];
 
 beforeEach(() => {
