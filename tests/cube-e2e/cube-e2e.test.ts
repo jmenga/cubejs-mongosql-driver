@@ -1796,14 +1796,24 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
   //      process). Exit code is 0 or 143 (128 + SIGTERM=15).
   //   2. The cube log carries the specific marker Cube emits from
   //      its SIGTERM handler — `Received SIGTERM signal` (verified
-  //      empirically against cubejs/cube v1.6.44 output). This is
-  //      tighter than a generic "shutdown" substring which can match
-  //      startup-banner text like "register shutdown hooks".
-  //   3. After SIGTERM, no MongoDB ops tagged with our appName
-  //      `cube-e2e-driver` remain on the atlas-local server. If our
-  //      driver leaked its native client past SIGTERM, the leaked
-  //      connection would still appear in `$currentOp`. This is the
-  //      atlas-local-side proof that our `release()` actually fires.
+  //      empirically against cubejs/cube v1.6.44 output). Tighter
+  //      than a generic 'shutdown' substring, which could match
+  //      unrelated startup-banner text in future Cube versions.
+  //   3. After SIGTERM + 2s settle, no MongoDB ops tagged with our
+  //      appName `cube-e2e-driver` remain on the atlas-local server.
+  //
+  // **What contract #3 actually pins.** This is a post-exit cleanup
+  // window check: the kernel closes the cube process's FDs on exit
+  // regardless of whether our `release()` handler ran, and MongoDB
+  // evicts orphaned connections from `$currentOp` within seconds. So
+  // a non-zero count after 2s indicates EITHER (a) a leaked native
+  // handle that escaped process exit (rare; would require a forked
+  // child or napi reference cycle past the process boundary), OR (b)
+  // a Cube-side hung pre-agg task that kept the process alive long
+  // enough that the inspect-state check above timed out — but the
+  // inspect check would have already failed in that case. So this
+  // check is mostly a sanity guard, not a positive proof that
+  // `release()` fired.
   //
   // After the test we restart the cube container so subsequent tests
   // in the suite see a healthy stack. globalSetup's teardown does
@@ -1851,9 +1861,9 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
       expect([0, 143]).toContain(exitCode);
 
       // Tight marker: Cube v1.6.44 emits "Received SIGTERM signal" from
-      // its SIGTERM handler. A generic 'shutdown' substring would also
-      // match startup-banner text ("register shutdown hooks"); we want
-      // a marker that only appears when the SIGTERM handler ran.
+      // its SIGTERM handler. Tighter than a generic 'shutdown'
+      // substring, which could match unrelated startup-banner text in
+      // future Cube versions.
       const logs = execSync('docker logs --tail 200 cubejs-mongosql-e2e-cube 2>&1', {
         encoding: 'utf-8',
       }).toLowerCase();
@@ -1864,19 +1874,15 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
         )}`,
       ).toBe(true);
 
-      // Atlas-local-side proof: no Mongo ops tagged with our appName
-      // remain after SIGTERM. If `release()` failed to drain the
-      // native client, leaked sockets would surface as ops with
-      // `appName: 'cube-e2e-driver'` (set in
-      // `examples/docker/docker-compose.yaml` via
-      // CUBEJS_MONGOSQL_APP_NAME). The atlas-local image lets us
-      // query this via the connections list inside the container.
-      //
-      // We allow a brief settle window (sockets close async) and
-      // then read the connection count. A non-zero count means we
-      // leaked.
+      // Post-exit cleanup window check (see "What contract #3 actually
+      // pins" in the describe-block docstring above). 2s settle for
+      // MongoDB to evict the now-orphaned ops from `$currentOp`.
+      // `appName: 'cube-e2e-driver'` is set via
+      // CUBEJS_MONGOSQL_APP_NAME in
+      // `examples/docker/docker-compose.yaml`.
       await sleep(2_000);
       let leakedConns = 0;
+      let mongoshError: unknown = null;
       try {
         const out = execSync(
           `docker exec cubejs-mongosql-e2e-atlas mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.adminCommand({currentOp: 1, $all: true}).inprog.filter(o => o.appName === "cube-e2e-driver").length'`,
@@ -1885,15 +1891,25 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
         // Last line is the eval result.
         leakedConns = Number(out.split('\n').pop()?.trim() ?? '0');
         if (!Number.isFinite(leakedConns)) leakedConns = 0;
-      } catch {
-        // If mongosh exec fails, treat as 0 (don't false-positive on
-        // a tooling error). The container-exit + marker checks above
-        // already cover the primary contract.
+      } catch (e) {
+        mongoshError = e;
+        // Surface to maintainers so a broken mongosh exec doesn't
+        // silently pass. The container-exit + marker checks above
+        // already cover the primary contract; we don't fail-loud on
+        // this tooling error because the assertion semantics are
+        // weak anyway (see docstring).
+        // eslint-disable-next-line no-console
+        console.warn(
+          'Gap 12: mongosh currentOp probe failed; connection-drain check is skipped. Error:',
+          e instanceof Error ? e.message : String(e),
+        );
         leakedConns = 0;
       }
       expect(
         leakedConns,
-        `expected no leaked MongoDB connections tagged appName=cube-e2e-driver after SIGTERM; found ${leakedConns}`,
+        `expected no leaked MongoDB connections tagged appName=cube-e2e-driver after SIGTERM; found ${leakedConns}${
+          mongoshError ? ' (mongosh probe failed; skipped — see warning above)' : ''
+        }`,
       ).toBe(0);
 
       // Restart the cube container so the rest of the suite (and
