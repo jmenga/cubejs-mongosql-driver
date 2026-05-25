@@ -12,16 +12,27 @@
  *   - testConnection()                     — REQUIRED, override (lazy native init)
  *   - release()                            — override (closes native client)
  *   - tablesSchema()                       — override (delegate to native)
- *   - downloadQueryResults(sql, ...)       — override → query() shape; we have no streaming
+ *   - downloadQueryResults(sql, ...)       — override → memory shape; streamImport ignored
+ *                                            (capabilities().streamImport=false; see below)
  *   - capabilities()                       — override → no export bucket / streaming source
  *   - nowTimestamp()                       — INHERIT (Date.now())
+ *   - stream(table, values, opts)          — NOT implemented; `streamImport: false`
+ *                                            advertises this. Cube routes the
+ *                                            pre-agg upload path through
+ *                                            `downloadQueryResults` instead.
  *
  *  Schema-introspection helpers (BaseDriver default reads information_schema —
- *  MongoSQL doesn't expose one, so we route to tablesSchema() / native):
- *   - getSchemas()                         — N/A — we serve via tablesSchema()
+ *  MongoSQL doesn't expose one, so we route every shape through the native
+ *  cached `tablesSchema()` rendering):
+ *   - tablesSchema()                       — override (full snapshot, bulk path)
+ *   - getSchemas()                         — override (DB list from tablesSchema)
+ *   - getTablesForSpecificSchemas(...)     — override (filter tablesSchema by db)
+ *   - getColumnsForSpecificTables(...)     — override (filter tablesSchema by table)
+ *   - capabilities().incrementalSchemaLoading=true — opts Cube into the
+ *                                            granular three-method path; SQL
+ *                                            information_schema queries are
+ *                                            never issued against mongosql.
  *   - getTablesQuery(schema)               — N/A — runs SQL against information_schema
- *   - getTablesForSpecificSchemas(...)     — N/A
- *   - getColumnsForSpecificTables(...)     — N/A
  *   - informationSchemaQuery()             — N/A (protected default)
  *   - tableColumnTypes(table)              — INHERIT (uses query()); only needed for
  *                                            uploadTableWithIndexes path which we reject
@@ -61,7 +72,10 @@ import type {
   DriverCapabilities,
   ExternalCreateTableOptions,
   IndexesSQL,
+  QueryColumnsResult,
   QueryOptions,
+  QuerySchemasResult,
+  QueryTablesResult,
   TableColumn,
   TableStructure,
 } from '@cubejs-backend/base-driver';
@@ -171,6 +185,102 @@ export class MongoSqlDriver extends BaseDriver {
     return client.tablesSchema();
   }
 
+  /**
+   * Cube's incremental-schema-loading entry point #1.
+   *
+   * Returns the list of schemas (databases) we expose. BaseDriver's
+   * default issues `SELECT table_schema ... FROM information_schema.tables`,
+   * which MongoSQL has no equivalent for. We re-render from the cached
+   * `tablesSchema()` snapshot — which the native side already keeps
+   * fresh via the background refresh task (SPEC FR-3 / ARCHITECTURE §3.2).
+   * Each call into `client.tablesSchema()` returns a fresh clone of the
+   * cached snapshot, so the cost is O(N) in catalog column count — for
+   * the typical few-thousand-cell catalog this is sub-millisecond on the
+   * hot path (no native I/O, no `__sql_schemas` round-trip).
+   *
+   * Driver only ever exposes the database configured at construction
+   * (FR-7 — `CUBEJS_DB_NAME`), so the returned list has at most one
+   * entry. An empty list is possible if no schemas have been loaded
+   * yet (e.g. `testConnection()` was never called or the schema source
+   * is empty); Cube handles that case the same way it would for the
+   * SQL path's empty resultset.
+   */
+  public override async getSchemas(): Promise<QuerySchemasResult[]> {
+    const snapshot = await this.tablesSchema();
+    return Object.keys(snapshot).map((schema_name) => ({ schema_name }));
+  }
+
+  /**
+   * Cube's incremental-schema-loading entry point #2.
+   *
+   * For each requested schema, returns its table list from the cached
+   * `tablesSchema()`. Schemas the snapshot doesn't know about are
+   * silently dropped — mirrors the SQL path's "WHERE schema IN (...)"
+   * which would naturally exclude unknown names. Passing an empty
+   * `schemas` array returns an empty result with no native I/O cost
+   * beyond a single cache read.
+   */
+  public override async getTablesForSpecificSchemas(schemas: QuerySchemasResult[]): Promise<QueryTablesResult[]> {
+    if (schemas.length === 0) return [];
+    const snapshot = await this.tablesSchema();
+    const out: QueryTablesResult[] = [];
+    for (const { schema_name } of schemas) {
+      const tables = snapshot[schema_name];
+      if (!tables) continue;
+      for (const table_name of Object.keys(tables)) {
+        out.push({ schema_name, table_name });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Cube's incremental-schema-loading entry point #3.
+   *
+   * For each requested `(schema_name, table_name)`, returns one row
+   * per column with `column_name` and `data_type`. `data_type` is the
+   * Cube generic-type string emitted by the native side (`string`,
+   * `int`, `bigint`, `decimal`, `boolean`, `timestamp`, `text`) — the
+   * same values that surface in `tablesSchema()`. Unknown tables are
+   * silently dropped, same contract as `getTablesForSpecificSchemas`.
+   *
+   * `attributes` is forwarded verbatim from the column descriptor IF
+   * a future native version supplies one — but the Rust `do_tables_schema`
+   * (crates/native/src/client.rs:314) always emits `attributes: []` today,
+   * so in production this is effectively always an empty array. We do
+   * not emit `primaryKey` automatically — MongoDB's implicit `_id` IS a
+   * primary key, but tagging it without explicit schema annotation would
+   * surface as a foreign-key target in Cube's relationship inference and
+   * break heuristic joins. The TS-side forwarding path exists for a
+   * future Rust change where `__sql_schemas` documents' attribute fields
+   * are propagated; callers that need the tag today still must encode
+   * it explicitly in their __sql_schemas document AND in a Rust patch
+   * that surfaces it through `ColumnSchema::attributes`.
+   *
+   * `foreign_keys` is not derivable from MongoDB schema documents — the
+   * field is omitted (Cube's `QueryColumnsResult` declares it as
+   * optional via the spread of `TableColumnQueryResult`).
+   */
+  public override async getColumnsForSpecificTables(tables: QueryTablesResult[]): Promise<QueryColumnsResult[]> {
+    if (tables.length === 0) return [];
+    const snapshot = await this.tablesSchema();
+    const out: QueryColumnsResult[] = [];
+    for (const { schema_name, table_name } of tables) {
+      const cols = snapshot[schema_name]?.[table_name];
+      if (!cols) continue;
+      for (const col of cols) {
+        out.push({
+          schema_name,
+          table_name,
+          column_name: col.name,
+          data_type: col.type,
+          attributes: col.attributes,
+        });
+      }
+    }
+    return out;
+  }
+
   public override async release(): Promise<void> {
     if (this.client) {
       const c = this.client;
@@ -187,6 +297,28 @@ export class MongoSqlDriver extends BaseDriver {
     // Pass through any caller-supplied AbortSignal so downloadQueryResults
     // is cancellable on the same terms as query().
     const signal = extractAbortSignal(options as Record<string, unknown> | undefined);
+    // The DownloadQueryResultsOptions interface includes `streamImport`
+    // (driver advertises whether it can stream rows during pre-aggregation
+    // builds). We advertise `streamImport: false` in `capabilities()` —
+    // mongosql v1.8.5 has no streaming cursor wired through napi-rs
+    // (napi-rs's ThreadsafeFunction round-trip is post-MVP per SPEC
+    // NFR-1) and the result is buffered up to `CUBEJS_MONGOSQL_MAX_ROWS`.
+    //
+    // Cube's contract: when a driver advertises `streamImport: false`,
+    // Cube does NOT call `downloadQueryResults` with `streamImport:
+    // true` (the option is reserved for `streamImport: true` drivers).
+    // We honor the contract by ignoring the flag entirely: callers that
+    // pass `streamImport: true` get the same memory `{rows, types}`
+    // shape — the option has no effect. This mirrors the BaseDriver
+    // default (`base-driver/dist/src/BaseDriver.js`), which also ignores
+    // `streamImport`.
+    //
+    // If a future caller wants streaming, the right shape is for the
+    // driver to ALSO implement the optional `stream(table, values,
+    // options) -> StreamTableData` method on `DriverInterface` (see
+    // `driver.interface.d.ts`). We do not implement it; until we do,
+    // `streamImport: false` is the right capability flag and the only
+    // honest answer is to keep returning the memory shape.
     // Cube's pre-aggregation upload path passes `types` (a `[{name, type},
     // ...]` list) to Cube Store to drive the LOAD ROWS column list. The
     // types come from `mongosql::Translation::{select_order, result_set_schema}`
@@ -240,11 +372,22 @@ export class MongoSqlDriver extends BaseDriver {
 
   public override capabilities(): DriverCapabilities {
     return {
-      // No EXPORT_BUCKET, no streaming source, no incremental schema loading.
+      // No EXPORT_BUCKET, no streaming source, no CSV/stream import path.
       unloadWithoutTempTable: false,
       streamingSource: false,
-      incrementalSchemaLoading: false,
+      // We implement getSchemas / getTablesForSpecificSchemas /
+      // getColumnsForSpecificTables on top of the cached native
+      // `tablesSchema()` snapshot. Cube uses the granular three-method
+      // path when this flag is true, which means it never falls back to
+      // the BaseDriver default that issues SQL against
+      // `information_schema.*` (MongoSQL has no such schema).
+      incrementalSchemaLoading: true,
       csvImport: false,
+      // Driver has no streaming cursor wired through napi-rs
+      // (ThreadsafeFunction round-trip is post-MVP per SPEC NFR-1) so
+      // pre-aggregation builds use `downloadQueryResults`'s memory shape
+      // capped at `CUBEJS_MONGOSQL_MAX_ROWS`. The option is honored by
+      // `downloadQueryResults` as a no-op — see that method's comment.
       streamImport: false,
     };
   }

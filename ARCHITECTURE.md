@@ -155,6 +155,18 @@ pub struct SchemaSource {
 
 **Eager-vs-lazy schema loading.** The current design eagerly loads all `__sql_schemas` documents at startup and caches them. The `mongosql` crate also exposes `get_namespaces(default_db, sql) -> HashSet<Namespace>` which would let us load only the schemas referenced by each query (lazy mode). Eager is sufficient for our scale (~20–50 collections per partner database). If a tenant catalog ever exceeds ~1000 collections, switch the loader to lazy: in `query()`, call `get_namespaces`, fetch any uncached schemas with TTL caching, then translate.
 
+**Incremental schema-loading three-method suite.** The driver advertises `capabilities().incrementalSchemaLoading: true` and implements:
+
+| Method | Returns | Implementation |
+|---|---|---|
+| `getSchemas()` | `Array<{schema_name}>` | `Object.keys(tablesSchema()).map(s => ({schema_name: s}))` |
+| `getTablesForSpecificSchemas(schemas)` | `Array<{schema_name, table_name}>` | Filter `tablesSchema()` by requested schema names; emit one row per table |
+| `getColumnsForSpecificTables(tables)` | `Array<{schema_name, table_name, column_name, data_type, attributes?}>` | Filter `tablesSchema()` by `(schema_name, table_name)`; emit one row per column |
+
+All three re-render filtered views of the same cached snapshot — there is no per-method native I/O; the native side caches schema in `Arc<RwLock<MongoSqlSchema>>` and serves it from memory (see §3.2). Empty input arrays short-circuit to empty output without touching the snapshot. Unknown schemas / tables silently drop (mirroring the SQL path's `WHERE schema IN (...)` natural filter). Pre-fix the driver advertised `incrementalSchemaLoading: false`, which forced Cube into the BaseDriver SQL fallback (`SELECT ... FROM information_schema.*`) — impossible on MongoSQL, so introspection would crash on any catalog Cube treated as large enough to warrant the incremental path.
+
+**Streaming contract (`streamImport: false`).** The driver does NOT implement `DriverInterface.stream(table, values, options)`; `capabilities().streamImport: false` advertises this. `downloadQueryResults` is the only path Cube exercises for pre-aggregation upload, and it returns the memory `{rows, types}` shape capped at `CUBEJS_MONGOSQL_MAX_ROWS`. When a caller (test harness or future Cube version) passes `streamImport: true` in `DownloadQueryResultsOptions`, the driver honors the BaseDriver default and IGNORES the flag — returning the same memory shape it would for `streamImport: false`. This mirrors `base-driver/dist/src/BaseDriver.js`'s default `downloadQueryResults`, which also ignores the option. A future streaming implementation would couple (a) a real `stream()` method returning `StreamTableData { rowStream: Readable }` AND (b) flipping the capability flag — both as a single change.
+
 ### 3.3 `__sql_schemas` document shape
 
 Each document represents one *collection*'s schema, keyed by `_id` (the collection name) within a database. The `schema.rs` loader collects all such documents from a database, builds a `BTreeMap<String, json_schema::Schema>` (collection → schema), and constructs a `mongosql::catalog::Catalog` via `build_catalog_from_catalog_schema(BTreeMap<db_name, BTreeMap<coll_name, json_schema::Schema>>)`. Reference shape:

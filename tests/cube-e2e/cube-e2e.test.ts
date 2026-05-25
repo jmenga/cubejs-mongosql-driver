@@ -229,6 +229,46 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(body).toHaveProperty('lastRefreshTime');
   });
 
+  // ---------------------------------------------------------------------------
+  // Cube model compilation smoke — every modeled cube reaches /meta.
+  //
+  // NOTE on what this test does NOT cover: Cube's `/meta` endpoint is
+  // populated by the schema compiler reading `cube/model/*.js` files
+  // directly (`@cubejs-backend/schema-compiler` walks the model dir at
+  // boot). It does NOT invoke the driver's introspection methods
+  // (`getSchemas` / `getTablesForSpecificSchemas` /
+  // `getColumnsForSpecificTables`). Those three methods are dispatched
+  // exclusively from `QueryOrchestrator.queryDataSourceSchemas /
+  // queryTablesForSchemas / queryColumnsForTables` (see
+  // `node_modules/@cubejs-backend/query-orchestrator/dist/src/orchestrator/
+  // QueryCache.js`) — the pre-aggregation refresh path — and never from
+  // the `/meta` route. The end-to-end coverage for the incremental
+  // schema-loading three-method contract lives in
+  // `tests/integration/incremental-schema.test.ts`, which calls each
+  // method directly on a real driver instance.
+  //
+  // What this test DOES pin: every cube declared under
+  // `examples/docker/cube/model/` compiles successfully (no SQL
+  // generation errors, no missing `sql_table` references, no model
+  // syntax errors). A missing entry means the cube failed to compile —
+  // typically a missing `__sql_schemas` row that mongosql couldn't
+  // resolve at schema-compile time, OR a syntax error in the model
+  // file.
+  // ---------------------------------------------------------------------------
+  it('cube model compilation — every modeled cube reaches /meta', async () => {
+    const res = await fetch(META_ENDPOINT, { headers: { Authorization: AUTH_HEADER } });
+    expect(res.ok).toBe(true);
+    const meta = (await res.json()) as CubeMetaResponse;
+    const names = meta.cubes.map((c) => c.name).sort();
+    // All four cubes from examples/docker/cube/model/. A missing entry
+    // means the cube failed to compile (model syntax error or unresolved
+    // `sql_table` at compile time).
+    expect(names).toContain('orders');
+    expect(names).toContain('revenue_events');
+    expect(names).toContain('configs');
+    expect(names).toContain('revenue_events_raw');
+  });
+
   it('meta endpoint — orders cube exposes the configured measures', async () => {
     const res = await fetch(META_ENDPOINT, {
       headers: { Authorization: AUTH_HEADER },
@@ -361,6 +401,342 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(byCategory.subscription.total).toBeCloseTo(725.25, 2);
     expect(byCategory.usage.count).toBe(3);
     expect(byCategory.usage.total).toBeCloseTo(225.49, 2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Pre-aggregation correctness equivalence — Gap 3 (HIGH).
+  //
+  // CubeJS's `testQueries.ts` pattern: alongside every rollup-routed
+  // query, run the SAME logical query directly against the source
+  // collection (via a sibling no-pre-aggregation dimension) and assert
+  // identical results. Otherwise a future bug in the rollup definition
+  // (wrong measure aggregation, missing dimension, off-by-one date
+  // partition) would not surface — the rollup-routed result would
+  // diverge silently.
+  //
+  // Setup: `revenue_events` declares a `partition_granularity: 'month'`
+  // pre-aggregation; `revenue_events_raw` (added for this test) mirrors
+  // it field-for-field WITHOUT any `pre_aggregations` block, so Cube
+  // always queries the source. Both cubes resolve to the SAME mongosql
+  // collection, so a divergence between their results proves a bug in
+  // either the rollup OR the source-query path.
+  //
+  // For determinism: sort rows on the dimension columns before
+  // comparison (Cube's row order is not guaranteed across the rollup
+  // and source paths). Numeric assertions use `Number(value)` so the
+  // string-form decimal SUM (from `downloadQueryResults`'s
+  // type-list-driven shape) compares cleanly with the source-path
+  // shape regardless of which is the JSON-number vs JSON-string.
+  // ---------------------------------------------------------------------------
+  describe('pre-aggregation correctness equivalence (rollup-routed vs direct-against-source)', () => {
+    /**
+     * Compare a single (potentially-decimal, potentially-date, possibly
+     * stringified) value pair for value-equality. Used by
+     * `assertEquivalent` to compare individual cells.
+     *
+     * Three rails:
+     *   1. Numeric — if BOTH sides parse cleanly as finite numbers
+     *      (e.g. '300.00' vs '300', or 5 vs '5'), compare as numbers
+     *      with a 1e-6 tolerance. Handles the Decimal128
+     *      trailing-zero-vs-no-trailing-zero shape between Cube Store
+     *      (rollup) and the source path (raw).
+     *   2. Date-shaped string — if BOTH sides look like ISO date/time
+     *      strings (heuristic: contains '-' and 'T' or matches
+     *      YYYY-MM-DD), compare via `Date.parse()` epoch milli with a
+     *      1ms tolerance. Cube Store occasionally strips/adds
+     *      milliseconds (e.g. '2026-01-01T00:00:00.000Z' vs
+     *      '2026-01-01T00:00:00.000') and the raw string compare would
+     *      false-positive failure.
+     *   3. Fallback — raw string compare.
+     */
+    function compareValues(va: unknown, vb: unknown, msg: string): void {
+      // Step 1: numeric rail.
+      const na = Number(va);
+      const nb = Number(vb);
+      const numericA = typeof va !== 'object' && va !== null && Number.isFinite(na) && String(va).length > 0;
+      const numericB = typeof vb !== 'object' && vb !== null && Number.isFinite(nb) && String(vb).length > 0;
+      if (numericA && numericB) {
+        expect(Math.abs(na - nb), `${msg}: a=${String(va)} b=${String(vb)}`).toBeLessThan(1e-6);
+        return;
+      }
+      // Step 2: date-shaped string rail. Detect "looks like an ISO
+      // timestamp or YYYY-MM-DD date" and compare epoch milliseconds.
+      // `Number(...)` already returned NaN for these — that's why we
+      // fell through.
+      const looksLikeDate = (v: unknown): v is string => {
+        if (typeof v !== 'string' || v.length === 0) return false;
+        // ISO-shaped: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS[.fff][Z]'.
+        // Don't be over-clever — Date.parse is permissive but we want to
+        // only attempt date compare when both sides plausibly look like
+        // dates, to avoid stringifying e.g. 'acct-2026'.
+        return /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v);
+      };
+      if (looksLikeDate(va) && looksLikeDate(vb)) {
+        const ta = Date.parse(va);
+        const tb = Date.parse(vb);
+        if (Number.isFinite(ta) && Number.isFinite(tb)) {
+          // 1ms tolerance — handles Cube Store occasionally dropping or
+          // adding the milliseconds component on round-trip.
+          expect(Math.abs(ta - tb), `${msg} (date compare): a=${va} b=${vb}`).toBeLessThanOrEqual(1);
+          return;
+        }
+      }
+      // Step 3: raw fallback for non-numeric, non-date strings (e.g.
+      // `category`, `accountId`).
+      expect(vb, msg).toBe(va);
+    }
+
+    /**
+     * Compare two Cube /load responses row-for-row after the rows have
+     * been sorted on the DIMENSION keys only. Both responses must come
+     * from cubes that share the same source data, so the row sets MUST
+     * be identical (modulo measure name prefix — the keys differ
+     * because each cube namespaces its measures with its own name).
+     *
+     * IMPORTANT — Sorting strategy:
+     *   We sort ONLY on the dimension-key pairs (passed via
+     *   `dimensionKeys`), NEVER on measures. If we sorted on measure
+     *   values too, then a real rollup-vs-source MEASURE mismatch on
+     *   the same dimension tuple would cause the rows to misalign
+     *   (each side sorts its own value to a different position), and
+     *   the lockstep walk would then compare the wrong rows — hiding
+     *   the very divergence the equivalence test exists to catch.
+     *
+     * `dimensionKeys` is the list of `[cubeAField, cubeBField]` pairs
+     * to sort by. `measureKeys` is the list of `[cubeAField,
+     * cubeBField]` pairs to compare after the sort (NOT used for
+     * sorting).
+     */
+    function assertEquivalent(
+      a: Array<Record<string, unknown>>,
+      b: Array<Record<string, unknown>>,
+      dimensionKeys: Array<[string, string]>,
+      measureKeys: Array<[string, string]>,
+    ): void {
+      expect(a.length).toBe(b.length);
+      // Sort ONLY on dimensions (see doc-comment above for rationale).
+      const aSorted = [...a].sort((r1, r2) =>
+        sortKey(
+          r1,
+          dimensionKeys.map(([k]) => k),
+        ).localeCompare(
+          sortKey(
+            r2,
+            dimensionKeys.map(([k]) => k),
+          ),
+        ),
+      );
+      const bSorted = [...b].sort((r1, r2) =>
+        sortKey(
+          r1,
+          dimensionKeys.map(([_, k]) => k),
+        ).localeCompare(
+          sortKey(
+            r2,
+            dimensionKeys.map(([_, k]) => k),
+          ),
+        ),
+      );
+      for (let i = 0; i < aSorted.length; i++) {
+        // Compare every dimension AND every measure for the same row.
+        for (const [keyA, keyB] of dimensionKeys) {
+          compareValues(aSorted[i][keyA], bSorted[i][keyB], `row ${i} dimension ${keyB}`);
+        }
+        for (const [keyA, keyB] of measureKeys) {
+          compareValues(aSorted[i][keyA], bSorted[i][keyB], `row ${i} measure ${keyB}`);
+        }
+      }
+    }
+
+    function sortKey(row: Record<string, unknown>, keys: string[]): string {
+      return keys.map((k) => String(row[k] ?? '')).join('|');
+    }
+
+    it('simple count — rollup-routed === direct-against-source (total roll-up)', async () => {
+      // INTENT NOTE: An earlier Phase A critique read claimed this query
+      // could not match the rollup (no `timeDimensions` = "no time bucket
+      // to partition against"). That read was wrong: Cube's rollup
+      // matcher routes ANY query whose measures are a subset of the
+      // rollup's measures through the materialized aggregate IF the
+      // rollup is additive over the requested dimensions (and the
+      // monthly partitions are unioned to compute the total). The
+      // observed behaviour against atlas-local confirms: `revenue_events`
+      // routes through `monthlyRevenue` for the bare `measures:
+      // ['count']` shape too (top-level `usedPreAggregations` is
+      // non-empty). The raw sibling cube has no pre-aggregations and
+      // MUST bypass — together this is a genuine rollup-vs-source
+      // equivalence assertion on a total-roll-up shape (no dimensions,
+      // no time dimensions) that complements the dimensional shapes
+      // tested below.
+      const rollup = await loadQuery({
+        query: { measures: ['revenue_events.count'] },
+      });
+      const raw = await loadQuery({
+        query: { measures: ['revenue_events_raw.count'] },
+      });
+      // Both queries return a single aggregate row. Compare totals.
+      expect(rollup.data.length).toBe(1);
+      expect(raw.data.length).toBe(1);
+      expect(Number(rollup.data[0]['revenue_events.count'])).toBe(Number(raw.data[0]['revenue_events_raw.count']));
+      // Sanity: it matches the seed total (7 events).
+      expect(Number(raw.data[0]['revenue_events_raw.count'])).toBe(7);
+      // Pin the rollup-routed status — this is the entire point of the
+      // equivalence harness. A future change that silently disables the
+      // pre-aggregation would make the numeric assertions still pass
+      // (by falling back to direct query) but weaken the regression
+      // net. Conversely, the raw cube MUST bypass — `revenue_events_raw`
+      // declares no `pre_aggregations` block.
+      expect(Object.keys(rollup.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+      expect(Object.keys(raw.usedPreAggregations ?? {}).length).toBe(0);
+    });
+
+    it('count grouped by month — rollup-routed === direct-against-source', async () => {
+      // With monthly partitioning on the rollup, this exercises the
+      // exact UNION path the dedicated partition test pins. Equivalence
+      // with the source-path result proves the UNION recomposes the
+      // same row set the source would have emitted.
+      const rollup = await loadQuery({
+        query: {
+          measures: ['revenue_events.count'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-01-01', '2026-03-31'],
+            },
+          ],
+        },
+      });
+      const raw = await loadQuery({
+        query: {
+          measures: ['revenue_events_raw.count'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events_raw.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-01-01', '2026-03-31'],
+            },
+          ],
+        },
+      });
+      // Rollup must actually be used — guards against a silent fallback.
+      expect(Object.keys(rollup.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+      // Raw cube has no pre-aggregations — it MUST bypass.
+      expect(Object.keys(raw.usedPreAggregations ?? {}).length).toBe(0);
+
+      assertEquivalent(
+        rollup.data,
+        raw.data,
+        // Dimensions (used for sort + compare).
+        [['revenue_events.occurredAt.month', 'revenue_events_raw.occurredAt.month']],
+        // Measures (compared but NOT used for sort).
+        [['revenue_events.count', 'revenue_events_raw.count']],
+      );
+    });
+
+    it('count + sum_amount grouped by month + category — rollup-routed === direct-against-source', async () => {
+      // The most-rolled-up shape exercising both COUNT and SUM(decimal)
+      // across the partition boundaries.
+      const rollup = await loadQuery({
+        query: {
+          measures: ['revenue_events.count', 'revenue_events.totalAmount'],
+          dimensions: ['revenue_events.category'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-01-01', '2026-03-31'],
+            },
+          ],
+        },
+      });
+      const raw = await loadQuery({
+        query: {
+          measures: ['revenue_events_raw.count', 'revenue_events_raw.totalAmount'],
+          dimensions: ['revenue_events_raw.category'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events_raw.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-01-01', '2026-03-31'],
+            },
+          ],
+        },
+      });
+      expect(Object.keys(rollup.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+      // Raw cube has no pre-aggregations — it MUST bypass.
+      expect(Object.keys(raw.usedPreAggregations ?? {}).length).toBe(0);
+
+      assertEquivalent(
+        rollup.data,
+        raw.data,
+        // Dimensions (used for sort + compare).
+        [
+          ['revenue_events.category', 'revenue_events_raw.category'],
+          ['revenue_events.occurredAt.month', 'revenue_events_raw.occurredAt.month'],
+        ],
+        // Measures (compared but NOT used for sort).
+        [
+          ['revenue_events.count', 'revenue_events_raw.count'],
+          ['revenue_events.totalAmount', 'revenue_events_raw.totalAmount'],
+        ],
+      );
+    });
+
+    it('count grouped by month filtered to Feb — rollup-routed === direct-against-source', async () => {
+      // Narrow the date range to a single partition's worth of data —
+      // exercises the build_range_start / build_range_end + filter
+      // intersection. Pre-fix, an off-by-one bug in the partition bound
+      // would have surfaced here (rollup would either over- or under-
+      // count vs the source-path result).
+      //
+      // NOTE: the date filter alone is NOT enough to route through the
+      // rollup — Cube's rollup matcher requires a granularity match too
+      // (the partition is `granularity: 'month'`). We add
+      // `granularity: 'month'` so the query is actually rollup-routed;
+      // without it Cube falls back to direct-source on BOTH cubes and
+      // the test would compare apples to apples (both bypassing the
+      // rollup), defeating the purpose of the equivalence check.
+      const rollup = await loadQuery({
+        query: {
+          measures: ['revenue_events.count'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-02-01', '2026-02-28'],
+            },
+          ],
+        },
+      });
+      const raw = await loadQuery({
+        query: {
+          measures: ['revenue_events_raw.count'],
+          timeDimensions: [
+            {
+              dimension: 'revenue_events_raw.occurredAt',
+              granularity: 'month',
+              dateRange: ['2026-02-01', '2026-02-28'],
+            },
+          ],
+        },
+      });
+      // Pin the rollup-routed status — see comment above for why we
+      // added `granularity: 'month'`. Without this assertion a future
+      // schema-compile race that silently disables the rollup would
+      // weaken the regression net without failing the numeric checks.
+      expect(Object.keys(rollup.usedPreAggregations ?? {}).length).toBeGreaterThan(0);
+      // Raw cube has no pre-aggregations — it MUST bypass.
+      expect(Object.keys(raw.usedPreAggregations ?? {}).length).toBe(0);
+
+      // Both should produce one row with the same count value. The
+      // February seed has 2 events.
+      expect(rollup.data.length).toBe(raw.data.length);
+      const rollupSum = rollup.data.reduce((acc, r) => acc + Number(r['revenue_events.count'] ?? 0), 0);
+      const rawSum = raw.data.reduce((acc, r) => acc + Number(r['revenue_events_raw.count'] ?? 0), 0);
+      expect(rollupSum).toBe(rawSum);
+      expect(rawSum).toBe(2);
+    });
   });
 
   // ---------------------------------------------------------------------------

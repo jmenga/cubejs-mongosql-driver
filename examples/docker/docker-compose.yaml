@@ -31,7 +31,16 @@ services:
       MONGODB_INITDB_ROOT_USERNAME: admin
       MONGODB_INITDB_ROOT_PASSWORD: admin
     volumes:
+      # Both /data/db and /data/configdb must persist together. The mongo
+      # bootstrap script generates a replica-set keyfile into /data/configdb
+      # on first boot when /data/db is empty. If /data/configdb is wiped
+      # (e.g. the anonymous volume that docker creates by default when only
+      # /data/db is mounted) while /data/db survives across teardowns, the
+      # next start sees "data already initialized" + "no keyfile" and crashes
+      # with `Location5579201: Unable to acquire security key[s]`. Mirrors
+      # `tests/integration/docker-compose.test.yml`.
       - atlas-data:/data/db
+      - atlas-configdb:/data/configdb
       # Reuse the integration test fixtures verbatim so the cube model
       # in cube/model/orders.js operates against the same `__sql_schemas`
       # row that `tests/integration/basic-queries.test.ts` already pins.
@@ -109,6 +118,7 @@ services:
 
 volumes:
   atlas-data:
+  atlas-configdb:
 
 networks:
   cube-e2e:

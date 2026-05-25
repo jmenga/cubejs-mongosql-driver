@@ -303,6 +303,18 @@ A user who can authenticate and `listCollections` but lacks `sqlGetSchema` privi
 
 If `sqlGetSchema` fails with code **59 (`CommandNotFound`)** the endpoint isn't an Atlas SQL endpoint at all (the typical "I'm pointing atlas-sql mode at a regular cluster" misconfiguration). The driver surfaces a distinct hint suggesting collection mode for that case. Any other failure is reported with the underlying message routed through the credential-redactor so connection strings don't leak.
 
+## Driver capabilities
+
+The driver advertises the following on `BaseDriver.capabilities()`:
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `incrementalSchemaLoading` | `true` | Driver implements `getSchemas` / `getTablesForSpecificSchemas` / `getColumnsForSpecificTables` on top of the cached `tablesSchema()` snapshot. Cube uses the granular three-method path for large catalogs; the BaseDriver SQL-fallback (which queries `information_schema.*`) is never invoked. |
+| `streamImport` | `false` | Driver does NOT implement the optional `stream()` method. Pre-aggregation builds use `downloadQueryResults`'s memory `{rows, types}` shape capped at `CUBEJS_MONGOSQL_MAX_ROWS`. Callers passing `streamImport: true` get the same memory shape — the flag is ignored, matching the BaseDriver default. |
+| `streamingSource` | `false` | Not a streaming source. |
+| `unloadWithoutTempTable` | `false` | No `EXPORT_BUCKET` / `UNLOAD` support — MongoDB has no equivalent. |
+| `csvImport` | `false` | No CSV import path. |
+
 ## Pre-aggregations
 
 Cube pre-aggregations work with the driver:
@@ -312,7 +324,7 @@ Cube pre-aggregations work with the driver:
 - Time-based and SQL-based refresh keys
 - Build-range (`build_range_start` / `build_range_end`)
 
-**`CUBEJS_DB_EXPORT_BUCKET` is NOT supported** (MongoDB has no `UNLOAD`/`COPY TO` equivalent). Pre-agg builds stream through the driver to Cube Store row-by-row.
+**`CUBEJS_DB_EXPORT_BUCKET` is NOT supported** (MongoDB has no `UNLOAD`/`COPY TO` equivalent). Pre-agg builds go through `downloadQueryResults` returning an in-memory `{rows, types}` payload capped at `CUBEJS_MONGOSQL_MAX_ROWS` — see the streaming-import contract in the capability table above.
 
 ### Partitioning around the row cap
 

@@ -606,6 +606,233 @@ describe('MongoSqlDriver — unsupported BaseDriver methods', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Capability flags pinned — Cube branches on these to decide whether to
+// invoke streaming / incremental-schema paths. The values are part of
+// the driver's contract and any change must be paired with the path
+// implementation.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — capabilities', () => {
+  it('advertises streamImport=false, incrementalSchemaLoading=true (contract)', () => {
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const caps = d.capabilities();
+    // streamImport: we have no Rust→Node streaming cursor; pre-agg
+    // builds go through downloadQueryResults's memory path. Cube reads
+    // this flag and avoids calling downloadQueryResults with
+    // streamImport=true (and avoids invoking driver.stream()).
+    expect(caps.streamImport).toBe(false);
+    // incrementalSchemaLoading: we provide getSchemas /
+    // getTablesForSpecificSchemas / getColumnsForSpecificTables so
+    // Cube uses the granular three-method introspection path instead
+    // of the SQL information_schema fallback.
+    expect(caps.incrementalSchemaLoading).toBe(true);
+    // Defence-in-depth — pin the other flags too so a future change
+    // to any one of them surfaces explicitly here.
+    expect(caps.streamingSource).toBe(false);
+    expect(caps.unloadWithoutTempTable).toBe(false);
+    expect(caps.csvImport).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gap 1 — `streamImport: true` on downloadQueryResults is a no-op (we
+// advertise streamImport=false; Cube SHOULDN'T pass true, but the
+// driver must remain compatible with the BaseDriver default which
+// ignores the flag). Pin the behavior so a future "let's accept it"
+// refactor cannot silently advertise streaming we don't implement.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — downloadQueryResults streaming-flag contract', () => {
+  it('ignores streamImport:true and returns the memory shape', async () => {
+    installMockNative({
+      query: mockQueryRows([{ orders: { a: 1 } }], [{ name: 'a', type: 'int' }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT a FROM orders', [], {
+      highWaterMark: 100,
+      streamImport: true,
+    });
+    // The contract: `streamImport:true` does NOT change the response
+    // shape — driver always returns memory `{rows, types}`. No
+    // `rowStream` field; rows are an in-memory array.
+    expect(result).not.toHaveProperty('rowStream');
+    expect(result).toHaveProperty('rows');
+    expect((result as { rows: unknown[] }).rows).toEqual([{ a: 1 }]);
+    expect(result).toHaveProperty('types');
+  });
+
+  it('ignores streamImport:false (same memory shape)', async () => {
+    installMockNative({
+      query: mockQueryRows([{ orders: { a: 2 } }], [{ name: 'a', type: 'int' }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT a FROM orders', [], {
+      highWaterMark: 100,
+      streamImport: false,
+    });
+    expect(result).not.toHaveProperty('rowStream');
+    expect((result as { rows: unknown[] }).rows).toEqual([{ a: 2 }]);
+  });
+
+  it('does NOT implement DriverInterface.stream() — flag advertises this', () => {
+    // Belt-and-braces — confirm that `driver.stream` is not exposed.
+    // Cube checks for the method's presence on some paths; advertising
+    // `streamImport: false` is the contract, but having the property
+    // also be absent removes any ambiguity.
+    //
+    // INTENT NOTE: BaseDriver itself does NOT define `stream`, so absent
+    // any explicit override this assertion is trivially true. The point
+    // of pinning it is to catch an accidental future override (e.g. a
+    // refactor that adds `public override stream(...)` without flipping
+    // `capabilities().streamImport` to `true`). Treat as a regression
+    // guard against accidental implementation, not a load-bearing
+    // capability check.
+    installMockNative();
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    expect((d as unknown as { stream?: unknown }).stream).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gap 2 — incremental-schema-loading three-method suite. Each method
+// re-renders from the cached native `tablesSchema()` snapshot; here we
+// stub the snapshot directly and assert filtering correctness.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — incremental schema loading (getSchemas / *ForSpecificSchemas / *ForSpecificTables)', () => {
+  const fullSnapshot: TablesSchema = {
+    mongosql_test: {
+      orders: [
+        { name: '_id', type: 'string', attributes: [] },
+        { name: 'amount', type: 'decimal', attributes: [] },
+        { name: 'status', type: 'string', attributes: [] },
+      ],
+      users: [
+        { name: '_id', type: 'string', attributes: [] },
+        { name: 'email', type: 'string', attributes: [] },
+      ],
+    },
+  };
+
+  function driverWithSnapshot(snapshot: TablesSchema): MongoSqlDriver {
+    installMockNative({ tablesSchema: vi.fn().mockResolvedValue(snapshot) });
+    return new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'mongosql_test' });
+  }
+
+  it('getSchemas() returns the DB list extracted from tablesSchema()', async () => {
+    const d = driverWithSnapshot(fullSnapshot);
+    const out = await d.getSchemas();
+    expect(out).toEqual([{ schema_name: 'mongosql_test' }]);
+  });
+
+  it('getSchemas() returns empty list when the snapshot is empty', async () => {
+    const d = driverWithSnapshot({});
+    expect(await d.getSchemas()).toEqual([]);
+  });
+
+  it('getTablesForSpecificSchemas() returns one row per table in each requested schema', async () => {
+    const d = driverWithSnapshot(fullSnapshot);
+    const out = await d.getTablesForSpecificSchemas([{ schema_name: 'mongosql_test' }]);
+    // Two tables in mongosql_test → two rows.
+    expect(out).toHaveLength(2);
+    expect(out).toContainEqual({ schema_name: 'mongosql_test', table_name: 'orders' });
+    expect(out).toContainEqual({ schema_name: 'mongosql_test', table_name: 'users' });
+  });
+
+  it('getTablesForSpecificSchemas() silently drops unknown schemas', async () => {
+    const d = driverWithSnapshot(fullSnapshot);
+    const out = await d.getTablesForSpecificSchemas([
+      { schema_name: 'mongosql_test' },
+      { schema_name: 'never_existed' },
+    ]);
+    // Only the known schema contributes rows; unknown silently skipped.
+    expect(out).toHaveLength(2);
+    for (const r of out) expect(r.schema_name).toBe('mongosql_test');
+  });
+
+  it('getTablesForSpecificSchemas() returns empty list for empty input (no native I/O)', async () => {
+    const snapshotMock = vi.fn().mockResolvedValue(fullSnapshot);
+    installMockNative({ tablesSchema: snapshotMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'mongosql_test' });
+    const out = await d.getTablesForSpecificSchemas([]);
+    expect(out).toEqual([]);
+    // Empty input short-circuits — no need to refresh the snapshot.
+    expect(snapshotMock).not.toHaveBeenCalled();
+  });
+
+  it('getColumnsForSpecificTables() returns one row per (table, column)', async () => {
+    const d = driverWithSnapshot(fullSnapshot);
+    const out = await d.getColumnsForSpecificTables([
+      { schema_name: 'mongosql_test', table_name: 'orders' },
+      { schema_name: 'mongosql_test', table_name: 'users' },
+    ]);
+    // 3 columns in orders + 2 in users = 5 rows.
+    expect(out).toHaveLength(5);
+    // Each row carries (schema_name, table_name, column_name, data_type).
+    const ordersAmount = out.find((r) => r.table_name === 'orders' && r.column_name === 'amount');
+    expect(ordersAmount).toBeDefined();
+    expect(ordersAmount).toMatchObject({
+      schema_name: 'mongosql_test',
+      table_name: 'orders',
+      column_name: 'amount',
+      data_type: 'decimal',
+    });
+    const usersEmail = out.find((r) => r.table_name === 'users' && r.column_name === 'email');
+    expect(usersEmail).toMatchObject({
+      schema_name: 'mongosql_test',
+      table_name: 'users',
+      column_name: 'email',
+      data_type: 'string',
+    });
+  });
+
+  it('getColumnsForSpecificTables() silently drops unknown tables', async () => {
+    const d = driverWithSnapshot(fullSnapshot);
+    const out = await d.getColumnsForSpecificTables([
+      { schema_name: 'mongosql_test', table_name: 'orders' },
+      { schema_name: 'mongosql_test', table_name: 'never_table' },
+      { schema_name: 'never_schema', table_name: 'orders' },
+    ]);
+    // Only the known (schema,table) pair contributes columns.
+    expect(out).toHaveLength(3);
+    for (const r of out) {
+      expect(r.schema_name).toBe('mongosql_test');
+      expect(r.table_name).toBe('orders');
+    }
+  });
+
+  it('getColumnsForSpecificTables() returns empty list for empty input (no native I/O)', async () => {
+    const snapshotMock = vi.fn().mockResolvedValue(fullSnapshot);
+    installMockNative({ tablesSchema: snapshotMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'mongosql_test' });
+    const out = await d.getColumnsForSpecificTables([]);
+    expect(out).toEqual([]);
+    expect(snapshotMock).not.toHaveBeenCalled();
+  });
+
+  it('getColumnsForSpecificTables() forwards attribute arrays verbatim (TS-layer wiring smoke test)', async () => {
+    // NOTE: This test pins a TS-layer wiring path that is NEVER exercised
+    // in production today. The Rust `do_tables_schema`
+    // (crates/native/src/client.rs:314) hard-codes `attributes: []`, so
+    // the snapshot returned from the real native binding never carries a
+    // non-empty array. The test stubs `tablesSchema()` directly with a
+    // synthetic `['primaryKey']` attribute to verify that IF a future
+    // Rust change propagates `__sql_schemas` document attribute fields,
+    // the TS forwarding path would surface them on
+    // `QueryColumnsResult.attributes` for Cube's relationship inference.
+    // Until that Rust change lands, treat this as a forwarding-path
+    // smoke test, not a production-attribute test.
+    const taggedSnapshot: TablesSchema = {
+      mongosql_test: {
+        orders: [{ name: '_id', type: 'string', attributes: ['primaryKey'] }],
+      },
+    };
+    const d = driverWithSnapshot(taggedSnapshot);
+    const out = await d.getColumnsForSpecificTables([{ schema_name: 'mongosql_test', table_name: 'orders' }]);
+    expect(out).toHaveLength(1);
+    expect(out[0].attributes).toEqual(['primaryKey']);
+  });
+});
+
 describe('MongoSqlDriver — downloadQueryResults', () => {
   it('routes through query() and returns BaseDriver memory shape with authoritative types', async () => {
     // Native binding returns the `(name, type)` list derived from

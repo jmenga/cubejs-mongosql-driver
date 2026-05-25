@@ -14,12 +14,18 @@
  *   3. `docker compose up -d` to start atlas-local + cube.
  *   4. Wait for atlas-local healthy, `__sql_schemas` populated, and
  *      Cube `/readyz` returning 200.
- *   5. On teardown, `down` (no -v) — preserves the seeded volume so
- *      iterative runs skip the ~30 s mongod-replicaset bootstrap.
+ *   5. On teardown, `down -v` by default (destroys named volumes). The
+ *      atlas-local image bakes its randomly-generated container hostname
+ *      into the persisted replSet config on first start; preserving
+ *      `/data/db` across `down` + `up` causes the next start to land in
+ *      "node is not in primary or recovering state" and block
+ *      `__sql_schemas` queries. Same root cause and mitigation as
+ *      `tests/integration/setup.ts`.
  *
  * Tear-down policy mirrors `tests/integration/setup.ts` —
- * `CUBE_E2E_TEARDOWN=destroy` for `down -v`, `keep` to skip teardown,
- * default `stop`.
+ * `CUBE_E2E_TEARDOWN=keep` skips teardown, `=stop` does `down` (no -v)
+ * if you trust the replSet hostname will be stable across recreates;
+ * default `destroy` does `down -v`.
  */
 import { execSync, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -159,7 +165,15 @@ async function waitForCubeReady(maxSeconds = 120): Promise<void> {
 }
 
 export default async function setup(): Promise<() => Promise<void>> {
-  const teardownMode = process.env.CUBE_E2E_TEARDOWN ?? 'stop';
+  // Default to `destroy` so subsequent runs start from a fresh replica-set
+  // state. atlas-local embeds the randomly-generated container hostname
+  // into the persisted replSet config; preserving `/data/db` (and even
+  // `/data/configdb`) across container recreates results in "node is not
+  // in primary or recovering state" on the next start, blocking
+  // `__sql_schemas` queries. Match `tests/integration/setup.ts`. Set
+  // `CUBE_E2E_TEARDOWN=keep` for iterative dev, `=stop` if you trust
+  // your replSet hostname stability.
+  const teardownMode = process.env.CUBE_E2E_TEARDOWN ?? 'destroy';
 
   console.log('cube-e2e setup: building driver tarball (build-driver.sh)...');
   const buildResult = spawnSync('bash', [BUILD_SCRIPT], {
