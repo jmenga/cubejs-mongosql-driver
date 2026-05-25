@@ -29,6 +29,7 @@ build
 # Editor
 .vscode
 .idea
+.claude/
 
 # OS
 .DS_Store

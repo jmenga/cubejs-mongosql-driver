@@ -74,6 +74,34 @@ const schemas = [
       },
     },
   },
+  // `configs` is the sparse-nested-path harness for the row-shape
+  // normalization fix. `agent` is an embedded document with a
+  // `displayName` field — but a subset of docs OMIT the `agent` field
+  // entirely. With `SELECT id, agent.displayName ... ORDER BY
+  // agent.displayName ASC`, mongosql emits no `agent_display_name`-shaped
+  // key on the rows lacking the source path, and those rows sort to
+  // row 0 (nulls-first). The driver's `normalizeRowShape` (TS) +
+  // `downloadQueryResults` types-list null-fill (TS) keep the column
+  // present on every row so Cube's first-row sniff doesn't drop it.
+  {
+    _id: 'configs',
+    schema: {
+      version: NumberLong(1),
+      jsonSchema: {
+        bsonType: 'object',
+        properties: {
+          _id: { bsonType: 'objectId' },
+          id:  { bsonType: 'string'   },
+          agent: {
+            bsonType: 'object',
+            properties: {
+              displayName: { bsonType: 'string' },
+            },
+          },
+        },
+      },
+    },
+  },
 ];
 
 // Use bracket-property access; mongosh's `db` proxy chokes on the dot-form

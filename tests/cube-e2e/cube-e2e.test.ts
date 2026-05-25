@@ -110,6 +110,10 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     // (Critic v3 — Issue #2). Failing here means the model didn't compile
     // — typically a missing __sql_schemas row or a Cube model syntax error.
     expect(meta.cubes.map((c) => c.name)).toContain('revenue_events');
+    // configs cube was added for the sparse-nested-path row-shape
+    // normalization regression test. Failing here means the configs
+    // schema row didn't make it into __sql_schemas.
+    expect(meta.cubes.map((c) => c.name)).toContain('configs');
   }, 60_000);
 
   afterAll(() => {
@@ -455,6 +459,63 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(body.data.length).toBe(1);
     expect(body.data[0]?.['orders.accountId']).toBe('acct_b');
     expect(Number(body.data[0]?.['orders.count'])).toBe(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Sparse nested-path row-shape normalization — exact-shape regression.
+  //
+  // Mongosql's `$project` of `agent.displayName` OMITS the field from
+  // docs missing the source path (does NOT emit null). With `ORDER BY
+  // <nested-field> ASC`, the sparse rows sort to row 0. Cube's native
+  // `getFinalQueryResult` compiles its row→member extraction plan from
+  // row 0's keys — pre-fix, the column would be dropped from every row
+  // in the response.
+  //
+  // The fixture seeds 10 docs in `configs`: 7 with `agent.displayName`
+  // populated, 3 without the `agent` field at all. The /load query
+  // below mirrors the production `useAgentsList` shape: project `id` +
+  // `agent.displayName` with an ascending sort on the name. Post-fix,
+  // all 10 rows carry `configs.agentDisplayName`; pre-fix, all 10 rows
+  // would be missing it (the bug being pinned).
+  // ---------------------------------------------------------------------------
+  it('sparse nested-path — configs.agentDisplayName survives Cube /load with ORDER BY ASC', async () => {
+    const body = await loadQuery({
+      query: {
+        dimensions: ['configs.id', 'configs.agentDisplayName'],
+        order: { 'configs.agentDisplayName': 'asc' },
+        limit: 10,
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    expect(body.data.length).toBe(10);
+
+    // THE assertion the bug was about. Pre-fix: every row would be
+    // missing `configs.agentDisplayName` because Cube's native
+    // `getFinalQueryResult` compiles its row→member plan from row 0's
+    // keys, and row 0 was sparse (nulls-first sort). Post-fix: every
+    // row carries the key (null for the sparse rows, string for the
+    // populated rows).
+    for (const r of body.data) {
+      expect(r).toHaveProperty('configs.agentDisplayName');
+    }
+
+    // The 7 populated rows carry real strings, the 3 sparse rows null.
+    const populated = body.data.filter((r) => r['configs.agentDisplayName'] !== null);
+    const sparse = body.data.filter((r) => r['configs.agentDisplayName'] === null);
+    expect(populated).toHaveLength(7);
+    expect(sparse).toHaveLength(3);
+
+    // The downstream `agents.filter(a => a.id && a.name)` shape from the
+    // production bug — confirm both `id` AND `name` are present on the
+    // populated rows so the filter yields non-empty results.
+    const usableAgents = body.data.filter((r) => r['configs.id'] && r['configs.agentDisplayName']);
+    expect(usableAgents).toHaveLength(7);
+    // Names come back in ascending alphabetical order on the populated rows.
+    const populatedNames = body.data.map((r) => r['configs.agentDisplayName']).filter((n) => n !== null);
+    expect(populatedNames).toEqual(['Alice', 'Bob', 'Carol', 'Dave', 'Eve', 'Frank', 'Grace']);
   });
 
   it('dimension query — count grouped by status (T19a regression test)', async () => {

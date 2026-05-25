@@ -56,4 +56,32 @@ if (db.revenue_events.countDocuments() === 0) {
   ]);
 }
 
+// `configs` is the sparse-nested-path harness for the row-shape
+// normalization fix. Each doc has a top-level `id` plus an embedded
+// `agent.displayName` — but a deliberate subset of docs are missing
+// the `agent` field entirely. With a query that projects
+// `agent.displayName` AND `ORDER BY agent.displayName ASC`, mongosql
+// emits rows with NO `agent_display_name` key on the missing-source
+// docs, and those rows sort to row 0 (nulls-first). Cube's native
+// `getFinalQueryResult` transform compiles its row→member extraction
+// plan from row 0's keys — without the driver-side normalization, it
+// would drop the column from every row in the response. This collection
+// is the regression harness for that bug.
+if (db.configs.countDocuments() === 0) {
+  db.configs.insertMany([
+    // 7 docs WITH `agent.displayName` populated.
+    { _id: ObjectId(), id: 'cfg_a', agent: { displayName: 'Alice' } },
+    { _id: ObjectId(), id: 'cfg_b', agent: { displayName: 'Bob' } },
+    { _id: ObjectId(), id: 'cfg_c', agent: { displayName: 'Carol' } },
+    { _id: ObjectId(), id: 'cfg_d', agent: { displayName: 'Dave' } },
+    { _id: ObjectId(), id: 'cfg_e', agent: { displayName: 'Eve' } },
+    { _id: ObjectId(), id: 'cfg_f', agent: { displayName: 'Frank' } },
+    { _id: ObjectId(), id: 'cfg_g', agent: { displayName: 'Grace' } },
+    // 3 docs WITHOUT the `agent` field at all — the sparse rows.
+    { _id: ObjectId(), id: 'cfg_h' },
+    { _id: ObjectId(), id: 'cfg_i' },
+    { _id: ObjectId(), id: 'cfg_j' },
+  ]);
+}
+
 print('seed-data: collections seeded');

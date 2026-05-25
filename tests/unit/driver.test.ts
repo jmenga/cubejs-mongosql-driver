@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { _resetNativeModuleForTests, _setNativeModuleForTests, type TablesSchema } from '../../src/native.js';
 import { MongoSqlDriver, MongoSqlQuery } from '../../src/index.js';
+import { _normalizeRowShapeForTests as normalizeRowShape } from '../../src/MongoSqlDriver.js';
 import type { MongoSqlError } from '../../src/types.js';
 
 interface FakeClient {
@@ -742,5 +743,312 @@ describe('MongoSqlDriver — downloadQueryResults', () => {
       .catch((e: unknown) => e)) as MongoSqlError;
     expect(err.code).toBe('MONGOSQL_TRANSLATE_FAILED');
     expect(createdClients).toBe(0);
+  });
+
+  it('null-fills keys named in the types list but missing from every row (defensive)', async () => {
+    // The authoritative type list comes from mongosql's `select_order`
+    // — it's the SQL projection order, not derived from row values. If
+    // the rows happen to lack one of the projected keys entirely (e.g.
+    // mongosql's nested-path-missing behaviour drops the column from
+    // every doc), the downstream Cube Store LOAD ROWS step still
+    // expects a value per (row × type) tuple. We null-fill so the
+    // contract holds.
+    installMockNative({
+      query: mockQueryRows(
+        [{ configs: { id: 'c1' } }, { configs: { id: 'c2' } }],
+        [
+          { name: 'id', type: 'string' },
+          { name: 'agent_display_name', type: 'string' },
+        ],
+      ),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT id, agent_display_name FROM configs', []);
+    expect((result as { rows: unknown[] }).rows).toEqual([
+      { id: 'c1', agent_display_name: null },
+      { id: 'c2', agent_display_name: null },
+    ]);
+  });
+
+  it('null-fills sparse rows in the rows-with-types path (partial population)', async () => {
+    // Mongosql drops nested-path keys from a doc when the path is
+    // missing — so within a single result set some rows have a key and
+    // others don't. The authoritative type list names the column on
+    // BOTH the present-rows AND missing-rows; we null-fill the missing
+    // ones so Cube's first-row sniff finds the column.
+    installMockNative({
+      query: mockQueryRows(
+        [
+          // Row 0 is the sparse one (would be the case under
+          // ORDER BY agent_display_name ASC since missing → sorts first).
+          { configs: { id: 'c1' } },
+          { configs: { id: 'c2', agent_display_name: 'Alice' } },
+          { configs: { id: 'c3', agent_display_name: 'Bob' } },
+        ],
+        [
+          { name: 'id', type: 'string' },
+          { name: 'agent_display_name', type: 'string' },
+        ],
+      ),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults(
+      'SELECT id, agent_display_name FROM configs ORDER BY agent_display_name ASC',
+      [],
+    );
+    expect((result as { rows: unknown[] }).rows).toEqual([
+      { id: 'c1', agent_display_name: null },
+      { id: 'c2', agent_display_name: 'Alice' },
+      { id: 'c3', agent_display_name: 'Bob' },
+    ]);
+  });
+
+  it('falls back to union-of-keys normalization when the types list is empty (sparse rows)', async () => {
+    // Defensive: if the native binding hands back an empty `types` list
+    // (no authoritative projection metadata — should be rare but is
+    // representable on the type) the driver must still honor the FR-1
+    // contract that "every row has the same key set". The fallback is
+    // the same union-of-keys helper that `query()` uses.
+    installMockNative({
+      query: mockQueryRows(
+        [
+          // Row 0 sparse — same shape as the ORDER BY ASC case but
+          // without an authoritative type list driving the fill.
+          { configs: { id: 'c1' } },
+          { configs: { id: 'c2', agent_display_name: 'Alice' } },
+          { configs: { id: 'c3', agent_display_name: 'Bob' } },
+        ],
+        [], // <- empty types
+      ),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT id, agent_display_name FROM configs', []);
+    expect((result as { rows: unknown[] }).rows).toEqual([
+      { id: 'c1', agent_display_name: null },
+      { id: 'c2', agent_display_name: 'Alice' },
+      { id: 'c3', agent_display_name: 'Bob' },
+    ]);
+    // Every row should have the union of keys.
+    for (const r of (result as { rows: Array<Record<string, unknown>> }).rows) {
+      expect(Object.keys(r).sort()).toEqual(['agent_display_name', 'id']);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Row-shape normalization — see `normalizeRowShape` in src/MongoSqlDriver.ts
+// for the full motivation. Net: mongosql's `$project` of a nested-path
+// expression OMITS the field on rows where the source path is missing
+// (does NOT emit null). With `ORDER BY <nested> ASC` the sparse rows
+// sort to row 0; Cube's native `getFinalQueryResult` transform compiles
+// its row→member extraction from row 0's keys and drops the column from
+// every row in the response. Driver fix: union keys across all rows and
+// null-fill so row 0 carries the same shape as any other row.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — query() row-shape normalization', () => {
+  it('empty result set passes through unchanged', async () => {
+    installMockNative({ query: mockQueryRows([]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query('SELECT id, agent_display_name FROM configs');
+    expect(rows).toEqual([]);
+  });
+
+  it('uniform-shape rows pass through unchanged (no null-fill needed)', async () => {
+    installMockNative({
+      query: mockQueryRows([
+        { configs: { id: 'c1', agent_display_name: 'Alice' } },
+        { configs: { id: 'c2', agent_display_name: 'Bob' } },
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query('SELECT id, agent_display_name FROM configs');
+    expect(rows).toEqual([
+      { id: 'c1', agent_display_name: 'Alice' },
+      { id: 'c2', agent_display_name: 'Bob' },
+    ]);
+  });
+
+  it('sparse row 0 (lacks a key row 5 has) → row 0 gets null, others unchanged', async () => {
+    // The exact shape of the bug — `ORDER BY agent_display_name ASC` puts
+    // the missing-name row at index 0. Cube's first-row sniff would drop
+    // the column from every row pre-fix.
+    installMockNative({
+      query: mockQueryRows([
+        { configs: { id: 'c0' } }, // sparse — missing agent_display_name
+        { configs: { id: 'c1', agent_display_name: 'Alice' } },
+        { configs: { id: 'c2', agent_display_name: 'Bob' } },
+        { configs: { id: 'c3', agent_display_name: 'Carol' } },
+        { configs: { id: 'c4', agent_display_name: 'Dave' } },
+        { configs: { id: 'c5', agent_display_name: 'Eve' } },
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>(
+      'SELECT id, agent_display_name FROM configs ORDER BY agent_display_name ASC',
+    );
+    expect(rows).toHaveLength(6);
+    // Row 0 — the formerly-sparse one — now carries the key with `null`.
+    expect(rows[0]).toEqual({ id: 'c0', agent_display_name: null });
+    // Rows 1..5 unchanged.
+    expect(rows[5]).toEqual({ id: 'c5', agent_display_name: 'Eve' });
+    // Every row carries the same key set.
+    const allKeys = rows.map((r) => Object.keys(r).sort());
+    for (const keys of allKeys) {
+      expect(keys).toEqual(['agent_display_name', 'id']);
+    }
+  });
+
+  it('multiple sparse rows with different missing keys → union resolves; every row has every key', async () => {
+    // The general case — row 0 missing one key, row 2 missing another,
+    // row 4 missing a third. Union of `{a,b,c,d}` across all rows; every
+    // row null-filled to carry all four.
+    installMockNative({
+      query: mockQueryRows([
+        { configs: { a: 1, b: 2, c: 3 } }, // missing d
+        { configs: { a: 1, b: 2, c: 3, d: 4 } },
+        { configs: { a: 1, c: 3, d: 4 } }, // missing b
+        { configs: { a: 1, b: 2, c: 3, d: 4 } },
+        { configs: { b: 2, c: 3, d: 4 } }, // missing a
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>('SELECT a, b, c, d FROM configs');
+    for (const r of rows) {
+      expect(Object.keys(r).sort()).toEqual(['a', 'b', 'c', 'd']);
+    }
+    expect(rows[0]).toEqual({ a: 1, b: 2, c: 3, d: null });
+    expect(rows[2]).toEqual({ a: 1, b: null, c: 3, d: 4 });
+    expect(rows[4]).toEqual({ a: null, b: 2, c: 3, d: 4 });
+  });
+
+  it('JOIN-shape rows ({"": {table_a__col, table_b__col}}) normalize correctly', async () => {
+    // The empty-string envelope branch is the JOIN-projection case
+    // (`SELECT u.email, o.amount FROM u JOIN o ...`). Mongosql can drop
+    // a nested-path field from this envelope just like any other. The
+    // normalization must look at the POST-flatten keys, not pre-flatten.
+    installMockNative({
+      query: mockQueryRows([
+        // First-row sparse — missing `amount`.
+        { '': { email: 'a@b' } },
+        { '': { email: 'c@d', amount: '10.00' } },
+        { '': { email: 'e@f', amount: '20.00' } },
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>(
+      'SELECT users.email, orders.amount FROM users JOIN orders ON 1=1',
+    );
+    expect(rows).toEqual([
+      { email: 'a@b', amount: null },
+      { email: 'c@d', amount: '10.00' },
+      { email: 'e@f', amount: '20.00' },
+    ]);
+  });
+
+  it('multi-key JOIN envelope ({u: {...}, o: {...}}) normalizes correctly (table-prefixed keys)', async () => {
+    // The multi-key envelope branch — flattenRow produces
+    // `<table>__<col>` keys. If the missing-path field happens to live
+    // on one side and be present on others, the prefix-flattened key
+    // is what we union over.
+    installMockNative({
+      query: mockQueryRows([
+        // Row 0 — orders side missing `amount`.
+        { users: { email: 'a@b' }, orders: { id: 'o0' } },
+        { users: { email: 'c@d' }, orders: { id: 'o1', amount: '10.00' } },
+      ]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>('SELECT * FROM users JOIN orders');
+    expect(rows).toEqual([
+      { users__email: 'a@b', orders__id: 'o0', orders__amount: null },
+      { users__email: 'c@d', orders__id: 'o1', orders__amount: '10.00' },
+    ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Direct normalizeRowShape function tests (no driver, no mocks).
+  // -------------------------------------------------------------------------
+  describe('normalizeRowShape — direct unit tests', () => {
+    it('returns empty array unchanged', () => {
+      const rows: Array<Record<string, unknown>> = [];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out).toEqual([]);
+      expect(out).toBe(rows);
+    });
+
+    it('returns uniform-shape rows unchanged in content (no new keys)', () => {
+      const rows = [
+        { id: 1, name: 'Alice' },
+        { id: 2, name: 'Bob' },
+      ];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out).toEqual([
+        { id: 1, name: 'Alice' },
+        { id: 2, name: 'Bob' },
+      ]);
+    });
+
+    it('null-fills row 0 with a key only row 5 has', () => {
+      const rows = [
+        { id: 'r0' }, // sparse
+        { id: 'r1', name: 'A' },
+        { id: 'r2', name: 'B' },
+        { id: 'r3', name: 'C' },
+        { id: 'r4', name: 'D' },
+        { id: 'r5', name: 'E' },
+      ];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out[0]).toEqual({ id: 'r0', name: null });
+      expect(out[5]).toEqual({ id: 'r5', name: 'E' });
+      // Every row has the same key set.
+      for (const r of out) {
+        expect(Object.keys(r).sort()).toEqual(['id', 'name']);
+      }
+    });
+
+    it('resolves the union across multiple sparse rows with different missing keys', () => {
+      const rows = [
+        { a: 1, b: 2 },
+        { b: 2, c: 3 },
+        { a: 1, c: 3 },
+      ];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out[0]).toEqual({ a: 1, b: 2, c: null });
+      expect(out[1]).toEqual({ a: null, b: 2, c: 3 });
+      expect(out[2]).toEqual({ a: 1, b: null, c: 3 });
+    });
+
+    it('preserves existing null values (does not overwrite null with null)', () => {
+      // An explicit `null` is different from a missing key — both end up
+      // as null after normalize, but the input semantics must be preserved
+      // for the explicit case (no surprise rewrites).
+      const rows = [
+        { id: 'r0', name: null },
+        { id: 'r1', name: 'A' },
+      ];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out).toEqual([
+        { id: 'r0', name: null },
+        { id: 'r1', name: 'A' },
+      ]);
+    });
+
+    it('preserves falsy non-null values (0, "", false)', () => {
+      // `hasOwnProperty` handles falsy-but-present keys correctly —
+      // assert that explicit `0`, `""`, `false` are not clobbered.
+      const rows = [
+        { a: 0, b: '', c: false },
+        { a: 1, b: 'x', c: true, d: 'extra' },
+      ];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out[0]).toEqual({ a: 0, b: '', c: false, d: null });
+      expect(out[1]).toEqual({ a: 1, b: 'x', c: true, d: 'extra' });
+    });
+
+    it('single row is left unchanged (union = its own keys)', () => {
+      const rows = [{ id: 'r0', name: 'A' }];
+      const out = normalizeRowShape<Record<string, unknown>>(rows);
+      expect(out).toEqual([{ id: 'r0', name: 'A' }]);
+    });
   });
 });

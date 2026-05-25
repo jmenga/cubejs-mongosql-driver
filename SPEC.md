@@ -30,6 +30,10 @@ Implement Cube's `BaseDriver` interface. The driver MUST:
 - Implement `release()` — closes the underlying MongoDB connection pool and stops background tasks.
 - Provide a `static dialectClass()` returning the `MongoSqlQuery` class for SQL generation.
 
+#### Row-shape contract
+
+Both `query()` and `downloadQueryResults()` MUST return rows where every row in the result set carries the SAME key set — no row may be sparser than any other. mongosql's `$project` of a nested-path expression OMITS the field from output rows when the source document lacks the path (it does not emit `null`); the driver MUST null-fill the missing keys before returning. Rationale: Cube's native `getFinalQueryResult` transform compiles its row→member extraction plan from the keys present in row 0, and a sparse row 0 (e.g. after `ORDER BY <nested> ASC` puts a null-bearing row first) would cause the column to be dropped from every row in the response. Implementation: see `normalizeRowShape` in `src/MongoSqlDriver.ts` (`query()` uses union-of-keys across all rows; `downloadQueryResults` uses the authoritative type list from `mongosql::Translation::select_order` so columns absent from EVERY row are still represented).
+
 ### FR-2 — SQL dialect
 
 Implement `MongoSqlQuery extends BaseQuery` to generate MongoSQL-flavoured SQL. Required adjustments from SQL-92:

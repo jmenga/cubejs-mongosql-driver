@@ -126,22 +126,22 @@ function reseed(): void {
   }
 }
 
-async function waitForSchemaIncludesRevenueEvents(maxSeconds = 30): Promise<void> {
+async function waitForSchemaIncludesSeededCollections(maxSeconds = 30): Promise<void> {
   const deadline = Date.now() + maxSeconds * 1000;
   while (Date.now() < deadline) {
     try {
       const out = execSync(
-        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments({_id: "revenue_events"})'`,
+        `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --eval 'db.getSiblingDB("mongosql_test").getCollection("__sql_schemas").countDocuments({_id: {$in: ["revenue_events", "configs"]}})'`,
         { encoding: 'utf-8', cwd: REPO_ROOT },
       ).trim();
       const n = parseInt(out, 10);
-      if (n >= 1) return;
+      if (n >= 2) return;
     } catch {
       // ignore
     }
     await sleep(1500);
   }
-  throw new Error('revenue_events row never appeared in __sql_schemas after reseed');
+  throw new Error('revenue_events / configs rows never appeared in __sql_schemas after reseed');
 }
 
 async function waitForCubeReady(maxSeconds = 120): Promise<void> {
@@ -188,8 +188,8 @@ export default async function setup(): Promise<() => Promise<void>> {
   // guard on `countDocuments() === 0`).
   console.log('cube-e2e setup: re-applying seed scripts (idempotent)...');
   reseed();
-  await waitForSchemaIncludesRevenueEvents();
-  console.log('cube-e2e setup: revenue_events schema row confirmed');
+  await waitForSchemaIncludesSeededCollections();
+  console.log('cube-e2e setup: revenue_events + configs schema rows confirmed');
 
   await waitForCubeReady(180);
   console.log('cube-e2e setup: cube /readyz green');

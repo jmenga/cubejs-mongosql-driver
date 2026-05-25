@@ -437,6 +437,53 @@ envelope the name is `<namespace>__<column>` (an empty-string namespace
 yields `__<column>` to match flattenRow byte-for-byte); for a single-key
 envelope it's the bare column.
 
+#### Post-flatten row-shape normalization (`normalizeRowShape`)
+
+`flattenRow` unwraps mongosql's per-collection envelope into a flat
+JS object keyed by column name. But there's a second issue mongosql's
+`$project` introduces that `flattenRow` alone doesn't address:
+
+> **mongosql's `$project` of a nested-path expression (e.g.
+> `agent.displayName`) OMITS the field from the output row entirely
+> when the source document doesn't carry that path.** It does NOT emit
+> `null`. With a query that `ORDER BY <nested-field> ASC`, the rows
+> missing the field sort to the top of the result (nulls-first), so the
+> row at index 0 is sparse.
+
+Downstream consumers compile their row→member extraction plan from the
+keys present in **row 0**. Cube's native `getFinalQueryResult`
+transform (in `@cubejs-backend/native`) is the canonical example —
+a sparse row 0 causes it to drop the column from EVERY row in the
+response, even rows that DO have the value. The production symptom was
+the frontend's `useAgentsList` query (500 rows, 497 with names
+populated, 3 without; sorted ascending → row 0 sparse → all 500 rows
+missing the `configs.agent_display_name` key → KPI tiles showed 0).
+
+Fix lives in `src/MongoSqlDriver.ts::normalizeRowShape` and runs AFTER
+`flattenRows` on both the `query()` (regular `/load`) and
+`downloadQueryResults` (pre-aggregation build) paths:
+
+| Call site | Key source | Why |
+|---|---|---|
+| `query()` | Union of keys across all rows | See "Why union-of-keys at `query()`" below. |
+| `downloadQueryResults()` | `types.map(t => t.name)` from `mongosql::Translation::select_order`, then union-of-keys as a belt-and-braces second pass | Type list is deterministic and covers the (rare) edge case where a column is missing from EVERY row — a union alone would still miss it. The second union pass picks up any stray row keys outside the type list so the "every row has the same key set" contract holds symmetrically with `query()`. |
+
+**Why union-of-keys at the `query()` layer (rather than the typed null-fill used in `downloadQueryResults`)?** `BaseDriver.query()` returns rows only — the type list isn't part of its contract. Internally we could call `client.queryWithTypes()` and use the types, but it would buy nothing: union-of-keys produces the same result for any rowset where at least one row has each projected column (which is the actual on-the-wire shape — mongosql's sparse-omission only drops keys from individual rows, never from an entire column). `downloadQueryResults` uses the type list because its contract surfaces types to Cube Store anyway; `query()` uses union because it's all that's needed.
+
+Net effect: every row in the result set carries every key in the union
+(or in the type list, for the download path), with `null` filling any
+gap. `flattenRow` runs first to unwrap the envelope; `normalizeRowShape`
+runs second on the post-flatten rows. Iteration is O(rows × cols). At
+the `MAX_ROWS=100000` pre-agg cap with a ~20-column projection this is
+roughly 2M property-existence checks and stays under 100ms in practice.
+
+Regression harness: `tests/unit/driver.test.ts` (the
+"row-shape normalization" describe block + the direct
+`normalizeRowShape` test), `tests/integration/row-shape-normalization.test.ts`
+(real atlas-local with sparse-nested-path docs), and the
+`sparse nested-path` test in `tests/cube-e2e/cube-e2e.test.ts` (full
+Cube `/load` round-trip).
+
 ### 4.3 Errors mapped
 
 | Source | Internal `Error` variant | Cube error code |

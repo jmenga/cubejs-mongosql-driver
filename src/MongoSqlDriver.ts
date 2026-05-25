@@ -162,7 +162,8 @@ export class MongoSqlDriver extends BaseDriver {
     const signal = extractAbortSignal(options);
     const client = this.ensureClient();
     const raw = await client.query<Record<string, unknown>>(finalSql, signal);
-    return flattenRows<R>(raw);
+    const flat = flattenRows<Record<string, unknown>>(raw);
+    return normalizeRowShape<R>(flat);
   }
 
   public override async tablesSchema(): Promise<TablesSchema> {
@@ -209,7 +210,32 @@ export class MongoSqlDriver extends BaseDriver {
     }
     const client = this.ensureClient();
     const { rows, types } = await client.queryWithTypes<Record<string, unknown>>(finalSql, signal);
-    return { rows: flattenRows(rows), types: types.map(normalizeColumnType) };
+    // Use the authoritative type list (from `mongosql::Translation::select_order`)
+    // to null-fill any key that's expected by the projection but missing
+    // from some/all rows. Same root cause as `normalizeRowShape` — see its
+    // doc-comment. Here we prefer the type list over union-of-keys because
+    // (a) it's deterministic, and (b) it covers the edge case where a
+    // column is missing from EVERY row (a union would miss it; the type
+    // list still names it).
+    const flat = flattenRows<Record<string, unknown>>(rows);
+    const expected = types.map((t) => t.name);
+    // NOTE: Mutates `flat` in place (see `normalizeRowShape` doc-comment for the
+    // mutation contract). First pass: null-fill every projected column named in
+    // the authoritative type list — covers the rare case where a column is
+    // missing from EVERY row (a pure union-of-keys would miss it). If `expected`
+    // is empty (e.g. an empty native response with no types), the for-loop is a
+    // no-op and the union pass below alone honors the FR-1 contract.
+    for (const k of expected) {
+      for (const r of flat) {
+        if (!Object.hasOwn(r, k)) r[k] = null;
+      }
+    }
+    // Belt-and-braces union-of-keys pass — handles any row keys outside
+    // `expected` (e.g. a future mongosql version emitting an extra envelope
+    // field) so this path honors the FR-1 "every row has the same key set"
+    // contract symmetrically with `query()`.
+    normalizeRowShape<Record<string, unknown>>(flat);
+    return { rows: flat, types: types.map(normalizeColumnType) };
   }
 
   public override capabilities(): DriverCapabilities {
@@ -316,6 +342,66 @@ export class MongoSqlDriver extends BaseDriver {
 function flattenRows<R>(rows: Array<Record<string, unknown>>): R[] {
   return rows.map((row) => flattenRow<R>(row));
 }
+
+/**
+ * Make every row's key set identical by null-filling missing keys.
+ *
+ * **Mutates `rows` in place** — callers must not retain references to
+ * the pre-normalize array if they need the original sparse shape. The
+ * returned reference is the same array.
+ *
+ * **Why this exists.** Mongosql's `$project` stage that references a
+ * nested-path expression (e.g. `agent.displayName` on a docs collection)
+ * OMITS the field entirely when the source path is missing on the
+ * underlying document — it does not emit `null`. This bites downstream
+ * consumers whenever the row at index 0 happens to be sparser than later
+ * rows; `ORDER BY <nested-field> ASC` is the most common way this
+ * surfaces, but any query whose row 0 lacks a key that later rows have
+ * triggers the same.
+ *
+ * Downstream consumers (notably Cube's native `getFinalQueryResult`
+ * transform in `@cubejs-backend/native`) compile their row→member
+ * extraction plan from the keys present in **row 0**. A sparse row 0
+ * causes Cube to drop the column from every row in the response — even
+ * rows that DO have the value. Reproduced empirically against the
+ * `configs` collection (`SELECT id, agent_display_name FROM configs ...
+ * ORDER BY agent_display_name ASC LIMIT 500` → 500 rows, all missing
+ * `configs.agent_display_name`, even though 497/500 source docs have it).
+ *
+ * **Fix shape.** Take the union of keys across all rows and null-fill
+ * each row so every row has every key. We can't simply look at `row[0]`
+ * because that's the symptom. Iteration is O(rows × cols). At the
+ * `MAX_ROWS=100000` pre-agg cap with a ~20-column projection this is
+ * roughly 2M property-existence checks and stays under 100ms in practice.
+ *
+ * `downloadQueryResults` uses the authoritative type list instead of
+ * a key union (the union would miss columns absent from every row); that
+ * variant is implemented inline at the call site, not via this helper.
+ */
+function normalizeRowShape<R>(rows: Array<Record<string, unknown>>): R[] {
+  if (rows.length === 0) return rows as unknown as R[];
+  const union = new Set<string>();
+  for (const r of rows) {
+    for (const k of Object.keys(r)) union.add(k);
+  }
+  for (const r of rows) {
+    for (const k of union) {
+      // `Object.hasOwn` over `k in r` — the `in` operator traverses
+      // the prototype chain, which would diverge from `Object.keys(r)`
+      // above (own enumerable keys only) on rows that inherit through a
+      // non-default prototype.
+      if (!Object.hasOwn(r, k)) r[k] = null;
+    }
+  }
+  return rows as unknown as R[];
+}
+
+/**
+ * Test-only export. Lets `tests/unit/driver.test.ts` exercise the
+ * key-union null-fill in isolation without spinning up the driver.
+ * Not part of the public API.
+ */
+export const _normalizeRowShapeForTests = normalizeRowShape;
 
 function flattenRow<R>(row: Record<string, unknown>): R {
   const keys = Object.keys(row);

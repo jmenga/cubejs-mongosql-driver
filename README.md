@@ -375,6 +375,14 @@ const d = new Decimal(row.amount); // exact
 
 The string form is the canonical IEEE 754-2008 representation produced by `bson::Decimal128::to_string`.
 
+### Row-shape contract — every row has the same keys
+
+The driver guarantees that every row returned from `query()` and `downloadQueryResults()` carries the SAME key set — no row is sparser than any other. Missing values are returned as JSON `null` rather than as a missing key.
+
+Why this matters: mongosql's `$project` of a nested-path expression (e.g. `agent.displayName`) OMITS the field from the output row when the source document doesn't carry that path — it does not emit `null`. With a query that `ORDER BY <nested-field> ASC`, the rows missing the field sort to the top of the result, so the row at index 0 is sparse. Downstream consumers (notably Cube's native `getFinalQueryResult` transform in `@cubejs-backend/native`) compile their row→member extraction plan from the keys present in row 0, and a sparse row 0 causes Cube to drop the column from every row in the response. The driver normalizes the row shape (union of keys across all rows on the `/load` path; authoritative type list from `mongosql::Translation::select_order` on the pre-aggregation upload path) so the column survives.
+
+If you query the driver directly, you can rely on `row.<column>` returning either the value or `null` — never `undefined`-from-missing-key.
+
 ## Errors
 
 All driver errors thrown to Cube are `Error` instances with `name = 'MongoSqlError'` and a `code` for programmatic handling:
