@@ -1,6 +1,6 @@
 {
-  "name": "mongosql-cubejs-driver-darwin-x64",
-  "version": "0.1.0",
+  "name": "@effectuate/cubejs-mongosql-driver-darwin-x64",
+  "version": "1.0.0",
   "os": [
     "darwin"
   ],
@@ -15,9 +15,13 @@
   "engines": {
     "node": ">=18"
   },
-  "description": "macOS x64 prebuilt binary for mongosql-cubejs-driver",
+  "description": "macOS x64 prebuilt binary for @effectuate/cubejs-mongosql-driver",
   "repository": {
     "type": "git",
     "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

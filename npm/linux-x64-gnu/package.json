@@ -1,6 +1,6 @@
 {
-  "name": "mongosql-cubejs-driver-linux-x64-gnu",
-  "version": "0.1.0",
+  "name": "@effectuate/cubejs-mongosql-driver-linux-x64-gnu",
+  "version": "1.0.0",
   "os": [
     "linux"
   ],
@@ -18,9 +18,13 @@
   "libc": [
     "glibc"
   ],
-  "description": "Linux x64 (glibc) prebuilt binary for mongosql-cubejs-driver",
+  "description": "Linux x64 (glibc) prebuilt binary for @effectuate/cubejs-mongosql-driver",
   "repository": {
     "type": "git",
     "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

@@ -1,0 +1,251 @@
+name: Release
+
+# Builds platform-specific napi-rs `.node` binaries and publishes the main
+# package plus its 6 prebuilt sub-packages to npm. Trigger is the changesets
+# version-bump landing on `main` — the workflow compares `package.json`
+# version vs the `latest` tag on npm; if unchanged (e.g. a chore PR), it
+# exits early.
+#
+# Authentication is npm Trusted Publishing (OIDC). Each of the 7 npm packages
+# must be configured at npmjs.com to trust this repo + this workflow file —
+# see PUBLISH.md > "One-time npm setup".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+env:
+  DEBUG: napi:*
+  NATIVE_NAME: cubejs-mongosql-driver-native
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+jobs:
+  detect:
+    name: Detect new version
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.detect.outputs.should_publish }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Compare package.json vs npm latest
+        id: detect
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "$PKG_NAME current version: $CURRENT"
+
+          PUBLISHED='0.0.0'
+          if VIEW_OUT=$(npm view "$PKG_NAME@latest" version 2>/dev/null); then
+            PUBLISHED=$(echo "$VIEW_OUT" | tr -d '[:space:]')
+          fi
+          echo "$PKG_NAME published: ${PUBLISHED:-<none>}"
+
+          if [ "$CURRENT" = "$PUBLISHED" ]; then
+            echo "No version change; skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will publish $PKG_NAME $PUBLISHED -> $CURRENT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build - ${{ matrix.settings.target }}
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            short: linux-x64-gnu
+            build: pnpm build:rust --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            short: linux-arm64-gnu
+            build: pnpm build:rust --target aarch64-unknown-linux-gnu --use-cross
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            short: linux-x64-musl
+            build: pnpm build:rust --target x86_64-unknown-linux-musl --use-cross
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            short: linux-arm64-musl
+            build: pnpm build:rust --target aarch64-unknown-linux-musl --use-cross
+          - host: macos-13
+            target: x86_64-apple-darwin
+            short: darwin-x64
+            build: pnpm build:rust --target x86_64-apple-darwin
+          - host: macos-14
+            target: aarch64-apple-darwin
+            short: darwin-arm64
+            build: pnpm build:rust --target aarch64-apple-darwin
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Install cross (linux cross-compile targets)
+        if: contains(matrix.settings.build, '--use-cross')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.settings.target }}
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build native binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ matrix.settings.build }}
+
+      # T10 dylib-name workaround: @napi-rs/cli v2.x expects a hyphenated
+      # dylib filename matching the crate `name`, but cargo emits an
+      # underscore-normalised variant on some platforms. Idempotent rename
+      # before napi's post-build copy phase.
+      - name: Normalise dylib filename
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in *.node; do
+            normalised="${f//cubejs_mongosql_driver_native/cubejs-mongosql-driver-native}"
+            if [ "$f" != "$normalised" ] && [ ! -f "$normalised" ]; then
+              echo "Renaming $f -> $normalised"
+              mv "$f" "$normalised"
+            fi
+          done
+          ls -la *.node || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.short }}
+          path: ${{ env.NATIVE_NAME }}.${{ matrix.settings.short }}.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm + GitHub Release
+    needs: [detect, build]
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      # Node 24 ships with npm 11.x, which already satisfies Trusted
+      # Publishing's >= 11.5.1 requirement — no manual upgrade step needed.
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build TypeScript
+        run: pnpm build:ts
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage binaries into per-platform npm sub-packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in artifacts/bindings-*; do
+            short="${dir#artifacts/bindings-}"
+            mkdir -p "npm/$short"
+            mv "$dir"/*.node "npm/$short/"
+          done
+          ls -laR npm
+
+      # `napi prepublish` syncs versions + adds README references to every
+      # `npm/<short>/package.json` so they line up with the root package.
+      - name: Prepare per-platform sub-packages
+        run: pnpm exec napi prepublish -t npm --skip-gh-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish sub-packages FIRST. The main package's optionalDependencies
+      # references them by name+version; if main publishes before the
+      # sub-packages exist on the registry, downstream `npm install` fails to
+      # resolve. `--provenance` requires Trusted Publishing OIDC (CI only).
+      - name: Publish sub-packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pkg in npm/*/; do
+            echo "::group::Publishing $pkg"
+            (cd "$pkg" && npm publish --provenance --access public)
+            echo "::endgroup::"
+          done
+
+      - name: Publish main package
+        run: npm publish --provenance --access public
+
+      - name: Tag release + create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ needs.detect.outputs.version }}"
+          TAG="v$VER"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+          PREV_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            gh release create "$TAG" --title "$TAG" --generate-notes --notes-start-tag "$PREV_TAG"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi

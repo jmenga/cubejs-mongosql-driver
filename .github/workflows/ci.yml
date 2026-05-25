@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, Typecheck, Build, Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v5
+        with:
+          # Pin to pnpm 10 — matches release.yml. pnpm 11 tightened
+          # ERR_PNPM_IGNORED_BUILDS in a way that breaks napi-rs
+          # postinstall scripts even when declared in pnpm.onlyBuiltDependencies.
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (biome + cargo fmt + clippy)
+        run: pnpm lint
+
+      - name: Build Rust (host target)
+        run: pnpm build:rust:debug
+
+      - name: Build TypeScript
+        run: pnpm build:ts
+
+      - name: Type check
+        run: pnpm typecheck
+
+      - name: Rust tests
+        run: cargo test --release
+
+      - name: TS unit tests
+        run: pnpm test:unit
+
+      - name: TS integration tests (atlas-local via docker compose)
+        run: pnpm test:integration
+
+      - name: TS cube-e2e tests
+        run: pnpm test:cube-e2e
+
+      # Per PUBLISH.md > Release Workflow: any PR declaring a release must run
+      # `pnpm version` (= `changeset version`) as part of the SAME PR so the
+      # changeset is consumed and package.json / CHANGELOG are bumped in the PR
+      # itself — not in a follow-up bot PR. Empty chore changesets (no packages
+      # listed) are fine and pass this check.
+      - name: Enforce changeset-version consumption
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const dir = '.changeset';
+          const files = fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'README.md')
+            : [];
+
+          const pending = [];
+          for (const f of files) {
+            const raw = fs.readFileSync(path.join(dir, f), 'utf8');
+            const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+            if (!match) continue;
+            const body = match[1];
+            const hasRelease = /^"[^"]+"\s*:\s*(patch|minor|major)\s*$/m.test(body);
+            if (hasRelease) pending.push(f);
+          }
+
+          if (pending.length > 0) {
+            console.error('::error::Unconsumed release-declaring changesets found:');
+            for (const f of pending) console.error(`::error::  .changeset/${f}`);
+            console.error(
+              '::error::Per PUBLISH.md > Release Workflow, every PR that bumps a release must run ' +
+                "'pnpm version' (= 'changeset version') as part of that same PR. Run it locally and " +
+                'commit the result (bumped package.json + npm/*/package.json versions, regenerated ' +
+                'CHANGELOG.md, deleted changeset) before merging.',
+            );
+            process.exit(1);
+          }
+          EOF
+
+      - name: Require changeset or version bump
+        run: |
+          # Pass if there's any changeset file (any *.md other than README.md).
+          # The step above already confirmed no unconsumed release-declarations.
+          HAS_CHANGESET=false
+          if ls .changeset/*.md 1>/dev/null 2>&1; then
+            EXTRA=$(ls .changeset/*.md | grep -v '/README.md$' || true)
+            if [ -n "$EXTRA" ]; then HAS_CHANGESET=true; fi
+          fi
+
+          # Or pass if package.json version differs from the base branch.
+          HAS_VERSION_BUMP=false
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CURRENT=$(node -p "require('./package.json').version")
+          BASE=$(git show origin/${{ github.base_ref }}:package.json 2>/dev/null \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{process.stdout.write(JSON.parse(d).version)}catch{process.stdout.write('')}})")
+          if [ -n "$BASE" ] && [ "$CURRENT" != "$BASE" ]; then
+            echo "Version bump in package.json: $BASE -> $CURRENT"
+            HAS_VERSION_BUMP=true
+          fi
+
+          if [ "$HAS_CHANGESET" = "true" ]; then
+            echo "Changeset found"
+          elif [ "$HAS_VERSION_BUMP" = "true" ]; then
+            echo "Version bump detected"
+          else
+            echo "::error::No changeset found. Run 'pnpm changeset' and commit the generated file."
+            exit 1
+          fi

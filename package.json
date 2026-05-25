@@ -1,6 +1,6 @@
 {
-  "name": "mongosql-cubejs-driver",
-  "version": "0.1.0",
+  "name": "@effectuate/cubejs-mongosql-driver",
+  "version": "1.0.0",
   "description": "Cube.js native data source driver for MongoDB via the MongoSQL translator (Rust + napi-rs). Replacement for the EOL'd BI Connector path.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -15,10 +15,14 @@
   "engines": {
     "node": ">=18"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "napi": {
     "name": "cubejs-mongosql-driver-native",
     "package": {
-      "name": "mongosql-cubejs-driver"
+      "name": "@effectuate/cubejs-mongosql-driver"
     },
     "triples": {
       "defaults": false,
@@ -54,7 +58,10 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist node_modules target npm/*/cubejs-mongosql-driver-native.*.node"
+    "clean": "rm -rf dist node_modules target npm/*/cubejs-mongosql-driver-native.*.node",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "pnpm build && changeset publish"
   },
   "keywords": [
     "cubejs",
@@ -72,20 +79,26 @@
     "type": "git",
     "url": "https://github.com/jmenga/cubejs-mongosql-driver.git"
   },
+  "homepage": "https://github.com/jmenga/cubejs-mongosql-driver#readme",
+  "bugs": {
+    "url": "https://github.com/jmenga/cubejs-mongosql-driver/issues"
+  },
   "peerDependencies": {
     "@cubejs-backend/base-driver": "^1.6.0",
     "@cubejs-backend/schema-compiler": "^1.6.0"
   },
   "optionalDependencies": {
-    "mongosql-cubejs-driver-linux-x64-gnu": "0.1.0",
-    "mongosql-cubejs-driver-linux-arm64-gnu": "0.1.0",
-    "mongosql-cubejs-driver-linux-x64-musl": "0.1.0",
-    "mongosql-cubejs-driver-linux-arm64-musl": "0.1.0",
-    "mongosql-cubejs-driver-darwin-x64": "0.1.0",
-    "mongosql-cubejs-driver-darwin-arm64": "0.1.0"
+    "@effectuate/cubejs-mongosql-driver-linux-x64-gnu": "1.0.0",
+    "@effectuate/cubejs-mongosql-driver-linux-arm64-gnu": "1.0.0",
+    "@effectuate/cubejs-mongosql-driver-linux-x64-musl": "1.0.0",
+    "@effectuate/cubejs-mongosql-driver-linux-arm64-musl": "1.0.0",
+    "@effectuate/cubejs-mongosql-driver-darwin-x64": "1.0.0",
+    "@effectuate/cubejs-mongosql-driver-darwin-arm64": "1.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.15",
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.31.0",
     "@cubejs-backend/base-driver": "^1.6.26",
     "@cubejs-backend/schema-compiler": "^1.6.26",
     "@napi-rs/cli": "^2.18.4",

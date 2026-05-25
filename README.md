@@ -1,15 +1,23 @@
-# mongosql-cubejs-driver
+# @effectuate/cubejs-mongosql-driver
 
-[![ci](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yaml/badge.svg)](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yaml)
-[![e2e](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/e2e.yaml/badge.svg)](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/e2e.yaml)
-[![npm version](https://img.shields.io/npm/v/mongosql-cubejs-driver.svg)](https://www.npmjs.com/package/mongosql-cubejs-driver)
+[![CI](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/jmenga/cubejs-mongosql-driver/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@effectuate/cubejs-mongosql-driver.svg)](https://www.npmjs.com/package/@effectuate/cubejs-mongosql-driver)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 A native [Cube.js](https://cube.dev) data source driver for MongoDB. Translates SQL to MongoDB Aggregation Pipeline (MQL) **client-side** via the open-source [`mongosql`](https://github.com/mongodb/mongosql) Rust crate, then executes the pipeline directly against your MongoDB cluster over the standard wire protocol on port 27017. No JDBC, no JVM, no `mongosqld` — and a drop-in replacement for the EOL'd MongoDB BI Connector path (`@cubejs-backend/mongobi-driver`).
 
-## Status
+## Install
 
-> **Pre-alpha (0.1.0).** Functional end-to-end against [`mongodb-atlas-local`](https://www.mongodb.com/docs/atlas/cli/current/atlas-cli-deploy-local/); not yet validated against production Atlas at scale. Track progress in [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md).
+```bash
+pnpm add @effectuate/cubejs-mongosql-driver
+# or: npm install @effectuate/cubejs-mongosql-driver
+# or: yarn add @effectuate/cubejs-mongosql-driver
+```
+
+The npm package ships prebuilt napi-rs binaries for `linux-x64-gnu`,
+`linux-arm64-gnu`, `linux-x64-musl`, `linux-arm64-musl`, `darwin-x64`,
+and `darwin-arm64`. npm picks the right one at install time via
+`optionalDependencies` — no Rust toolchain required on consumer machines.
 
 ## Why this exists
 
