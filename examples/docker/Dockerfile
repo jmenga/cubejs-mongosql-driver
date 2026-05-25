@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# Cube image extended with mongosql-cubejs-driver.
+# Cube image extended with @effectuate/cubejs-mongosql-driver.
 #
 # Strategy:
 #   * Stage 1 (`builder`): native-Linux Rust toolchain compiles the
@@ -19,14 +19,17 @@
 #   which checks (in order):
 #     1. The closed `DriverDependencies` map — `mongosql` is NOT listed.
 #     2. `@cubejs-backend/${type}-driver` — we are not under that scope.
-#     3. `${type}-cubejs-driver` — our package is `mongosql-cubejs-driver`,
-#        which now matches this convention. T19b rename eliminated the
-#        previous dual-install workaround (canonical + alias).
-#   We still wire `driverFactory` + `dialectFactory` in `cube.js` because
-#   `OptsHandler.getDriverConcurrency` (v1.6.44 OptsHandler.ts:288) calls
-#   `lookupDriverClass(dbType)` unconditionally; with the matching name,
-#   that lookup succeeds and the explicit factories ensure Cube picks up
-#   our typed exports.
+#     3. `${type}-cubejs-driver` — the real package is now scoped
+#        (`@effectuate/cubejs-mongosql-driver`), so it does NOT match
+#        this convention either. Stage 2 below installs a tiny
+#        re-export shim at `node_modules/mongosql-cubejs-driver/` so
+#        `OptsHandler.getDriverConcurrency` (v1.6.44 OptsHandler.ts:288)
+#        — which calls `lookupDriverClass(dbType)` unconditionally and
+#        throws "Unsupported db type" if the resolver can't find a
+#        package — sees the shim and short-circuits. `cube.js` itself
+#        uses the scoped name and provides explicit `driverFactory` +
+#        `dialectFactory` so the runtime driver/dialect picks are
+#        unambiguous.
 
 ARG CUBE_VERSION=v1.6.44
 ARG TARGETARCH
@@ -116,37 +119,42 @@ FROM cubejs/cube:${CUBE_VERSION}
 WORKDIR /cube/conf
 
 # Copy the npm-pack tarball produced by the build script. The tarball
-# carries `dist/`, `package.json`, README, LICENSE — but not the napi
-# loader (root `index.js`/`index.d.ts`) nor the .node binary, both of
-# which are excluded by `package.json#files`. We add them manually
-# below.
+# carries `dist/`, `package.json`, the napi loader (`index.js`/
+# `index.d.ts`), README and LICENSE. The platform `.node` binary lives
+# in the per-arch optionalDependencies sub-packages (or is spliced in
+# below when we host-build it).
 # Path relative to the repo-root build context.
-COPY examples/docker/pkg/mongosql-cubejs-driver-*.tgz /tmp/
+COPY examples/docker/pkg/effectuate-cubejs-mongosql-driver-*.tgz /tmp/
 
 # Install the tarball into /cube/conf/node_modules. `npm install --no-save`
-# avoids editing any package.json. Single install — the package name
-# (`mongosql-cubejs-driver`) matches Cube's resolver convention
-# `${type}-cubejs-driver`, so no alias install is needed.
+# avoids editing any package.json. The package is scoped
+# (`@effectuate/cubejs-mongosql-driver`), so it does NOT match Cube's
+# `${type}-cubejs-driver` resolver convention. `cube.js` wires
+# `driverFactory` + `dialectFactory` explicitly, but Cube's
+# `OptsHandler.getDriverConcurrency` still calls
+# `lookupDriverClass(dbType)` unconditionally and throws
+# "Unsupported db type: mongosql" before our factories ever run if the
+# package can't be resolved at the convention name. The shim package
+# below (a 2-file re-export) satisfies the resolver without forcing the
+# real package to publish under the unscoped name.
 RUN cd /cube/conf \
     && npm init -y >/dev/null \
-    && npm install --no-save /tmp/mongosql-cubejs-driver-*.tgz
+    && npm install --no-save /tmp/effectuate-cubejs-mongosql-driver-*.tgz \
+    && mkdir -p /cube/conf/node_modules/mongosql-cubejs-driver \
+    && printf '{"name":"mongosql-cubejs-driver","main":"index.js"}\n' \
+       > /cube/conf/node_modules/mongosql-cubejs-driver/package.json \
+    && printf "module.exports = require('@effectuate/cubejs-mongosql-driver');\n" \
+       > /cube/conf/node_modules/mongosql-cubejs-driver/index.js
 
-# Splice in the napi loader + native binary that the tarball misses.
-# Path the loader expects at runtime:
-#   /cube/conf/node_modules/mongosql-cubejs-driver/index.js
-#   /cube/conf/node_modules/mongosql-cubejs-driver/index.d.ts
-#   /cube/conf/node_modules/mongosql-cubejs-driver/cubejs-mongosql-driver-native.<triple>.node
-#
-# Note the `.node` filename keeps the `cubejs-mongosql-driver-native.*`
-# basename — that's the napi.name (preserved deliberately during the
-# T19b rename), not the npm package name. `dist/src/native.js` does
-# `require('../../index.js')` first then `require('../index.js')` —
-# copying to the package root satisfies the second branch (consumed
-# via `dist/index.js` → `dist/src/native.js`).
-COPY --from=builder /build/index.js     /cube/conf/node_modules/mongosql-cubejs-driver/index.js
-COPY --from=builder /build/index.d.ts   /cube/conf/node_modules/mongosql-cubejs-driver/index.d.ts
+# Splice the in-image-built native binary into the installed package
+# directory. We rebuild it from source in the builder stage rather than
+# rely on the per-arch optionalDependencies sub-package; both paths
+# work, but the in-image build keeps the example self-contained and
+# matches whatever the working tree is at build time. The napi loader
+# (`index.js`) probes `__dirname/cubejs-mongosql-driver-native.*.node`
+# first, so placing the binary at the package root is what it expects.
 COPY --from=builder /build/cubejs-mongosql-driver-native.*.node \
-                   /cube/conf/node_modules/mongosql-cubejs-driver/
+                   /cube/conf/node_modules/@effectuate/cubejs-mongosql-driver/
 
 # Drop the cube.js + model in place. These are bind-mounted at run time
 # in docker-compose for iterative dev, but baking them in lets

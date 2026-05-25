@@ -1,5 +1,5 @@
 /**
- * Cube configuration for the mongosql-cubejs-driver E2E example.
+ * Cube configuration for the @effectuate/cubejs-mongosql-driver E2E example.
  *
  * Driver-name resolution (verified against
  * `@cubejs-backend/server-core@v1.6.44`'s
@@ -8,21 +8,17 @@
  *   The order of lookups is:
  *     1. closed `DriverDependencies` map — `mongosql` is NOT listed.
  *     2. `@cubejs-backend/${type}-driver` — we are not under that scope.
- *     3. `${type}-cubejs-driver` — our package is `mongosql-cubejs-driver`,
- *        which matches this convention (T19b rename eliminated the prior
- *        dual-install workaround).
+ *     3. `${type}-cubejs-driver` — our package is now scoped
+ *        (`@effectuate/cubejs-mongosql-driver`), so it does NOT match
+ *        this convention either.
  *
- *   With `CUBEJS_DB_TYPE=mongosql`, lookup (3) resolves to our package
- *   automatically. We still set `driverFactory` + `dialectFactory`
- *   explicitly because Cube's default `dialectFactory` calls
- *   `lookupDriverClass(ctx.dbType).dialectClass()` and our driver uses
- *   a separately-exported `MongoSqlQuery` class — wiring the dialect
- *   directly gives Cube the full type info without depending on a
- *   `dialectClass` static method on the driver. (Driver authors can
- *   alternatively expose `MongoSqlDriver.dialectClass = () =>
- *   MongoSqlQuery` and skip the dialectFactory override.)
+ *   None of the auto-resolvers find the driver, so the explicit
+ *   `driverFactory` + `dialectFactory` below are required (not just
+ *   nice-to-have). They also short-circuit `OptsHandler`'s
+ *   `lookupDriverClass(ctx.dbType).dialectClass()` path, which would
+ *   otherwise throw "Unsupported db type: mongosql".
  */
-const { MongoSqlDriver, MongoSqlQuery } = require('mongosql-cubejs-driver');
+const { MongoSqlDriver, MongoSqlQuery } = require('@effectuate/cubejs-mongosql-driver');
 
 // Resolve which Mongo database a request maps to based on the Cube
 // `dataSource` configured on each cube model. This is the

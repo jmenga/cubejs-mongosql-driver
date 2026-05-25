@@ -23,7 +23,13 @@ pnpm exec tsc -p tsconfig.build.json
 
 echo "==> npm pack"
 mkdir -p "${PKG_DIR}"
-rm -f "${PKG_DIR}"/mongosql-cubejs-driver-*.tgz "${PKG_DIR}"/cubejs-mongosql-driver-*.tgz
+# Wipe any prior pack from this dir. The first glob covers the current
+# scoped name (`@effectuate/cubejs-mongosql-driver` →
+# `effectuate-cubejs-mongosql-driver-*.tgz`); the next two cover the
+# pre-rename names so cleanup stays safe across history.
+rm -f "${PKG_DIR}"/effectuate-cubejs-mongosql-driver-*.tgz \
+      "${PKG_DIR}"/mongosql-cubejs-driver-*.tgz \
+      "${PKG_DIR}"/cubejs-mongosql-driver-*.tgz
 TARBALL="$(npm pack --silent)"
 mv "${REPO_ROOT}/${TARBALL}" "${PKG_DIR}/"
 echo "    -> ${PKG_DIR}/${TARBALL}"
