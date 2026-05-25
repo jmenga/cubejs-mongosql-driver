@@ -7,6 +7,25 @@ settings:
 importers:
 
   .:
+    optionalDependencies:
+      '@effectuate/cubejs-mongosql-driver-darwin-arm64':
+        specifier: 1.0.0
+        version: 1.0.0
+      '@effectuate/cubejs-mongosql-driver-darwin-x64':
+        specifier: 1.0.0
+        version: 1.0.0
+      '@effectuate/cubejs-mongosql-driver-linux-arm64-gnu':
+        specifier: 1.0.0
+        version: 1.0.0
+      '@effectuate/cubejs-mongosql-driver-linux-arm64-musl':
+        specifier: 1.0.0
+        version: 1.0.0
+      '@effectuate/cubejs-mongosql-driver-linux-x64-gnu':
+        specifier: 1.0.0
+        version: 1.0.0
+      '@effectuate/cubejs-mongosql-driver-linux-x64-musl':
+        specifier: 1.0.0
+        version: 1.0.0
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.4.15
@@ -933,6 +952,42 @@ packages:
     resolution: {integrity: sha512-9P2cY8V0mqH+FvzVM/Z43fJmuKisln4xKjZaoQi1gLygNX0wooWzGcehibqBOkeKVMg31JBRaAQrxltIaa2rYA==}
     engines: {node: '>=14.0.0'}
     hasBin: true
+
+  '@effectuate/cubejs-mongosql-driver-darwin-arm64@1.0.0':
+    resolution: {integrity: sha512-4wrOO8KmDI28uDwwZa9rY1AzOQ/cBrhUZNMN1x+Waoa7vhdjC9nHPwU34UM0VBvXaXnsAOy3GHBn/SPuFK/ihQ==}
+    engines: {node: '>=18'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@effectuate/cubejs-mongosql-driver-darwin-x64@1.0.0':
+    resolution: {integrity: sha512-UgTKbHcWpihH8HD82Dt+ziy/1tiRQ26d9KovuWzgeo1qKM0tAWmuJtlDJoQ28bDTsRP2uGusn3evVIu73HqbrA==}
+    engines: {node: '>=18'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@effectuate/cubejs-mongosql-driver-linux-arm64-gnu@1.0.0':
+    resolution: {integrity: sha512-AE+6liZsMg2FKiNIicrXs1md0Ii4/h/r59bxy7BiEbD5fOe7FW+cOF2GnOjZ+3vUFP522e6+qyzAMgbpORaVzw==}
+    engines: {node: '>=18'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@effectuate/cubejs-mongosql-driver-linux-arm64-musl@1.0.0':
+    resolution: {integrity: sha512-AVj6qMRSx0Lp0fWAFhuVCD9ONfpdV4pR4Xcic4JpThtwyYO1ez1tI8e36UaZdRAJ7MGX+q9VM+FDW06QiaKi0A==}
+    engines: {node: '>=18'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@effectuate/cubejs-mongosql-driver-linux-x64-gnu@1.0.0':
+    resolution: {integrity: sha512-8MmEHKgL+cG7ENIM9oVYoQpfy8Os5bFNRzm9TcxMxEU//bp2xT+ZR6sjxe07Tnm5q145uSrLmIZHLj0+uGfdcA==}
+    engines: {node: '>=18'}
+    cpu: [x64]
+    os: [linux]
+
+  '@effectuate/cubejs-mongosql-driver-linux-x64-musl@1.0.0':
+    resolution: {integrity: sha512-tcWQY3iZpY01XRix6eaBLhR7kti2QL/MLU7OFhU2RGbK+jSkhVGSTiel7Il+IaT4myAQPCOSH79Zdj4MqEBeXg==}
+    engines: {node: '>=18'}
+    cpu: [x64]
+    os: [linux]
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -4750,6 +4805,24 @@ snapshots:
       - encoding
       - moment
       - supports-color
+
+  '@effectuate/cubejs-mongosql-driver-darwin-arm64@1.0.0':
+    optional: true
+
+  '@effectuate/cubejs-mongosql-driver-darwin-x64@1.0.0':
+    optional: true
+
+  '@effectuate/cubejs-mongosql-driver-linux-arm64-gnu@1.0.0':
+    optional: true
+
+  '@effectuate/cubejs-mongosql-driver-linux-arm64-musl@1.0.0':
+    optional: true
+
+  '@effectuate/cubejs-mongosql-driver-linux-x64-gnu@1.0.0':
+    optional: true
+
+  '@effectuate/cubejs-mongosql-driver-linux-x64-musl@1.0.0':
+    optional: true
 
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
