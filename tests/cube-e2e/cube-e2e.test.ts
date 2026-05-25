@@ -538,6 +538,48 @@ describe('Cube E2E — mongosql-cubejs-driver via cubejs/cube image', () => {
     expect(byStatus.pending).toBe(1);
     expect(byStatus.refunded).toBe(1);
   });
+
+  // ---------------------------------------------------------------------------
+  // User-reported failure shape — Cube /load with a GROUP BY measure +
+  // 161 `equals` filter values (mirrors the original `agent_id IN (161
+  // ids)` query that triggered the BSON-depth overflow). Mongosql v1.8.5
+  // emits the `$let`-wrapped IN-list shape for this combination, which
+  // the flat-`$or` flattener can't recognise; the new
+  // `pipeline_rewrite::collapse_mongosql_in_list_let` rewrite replaces
+  // the entire `$let` with a `$cond`-wrapped `$in`. This atlas-local
+  // test pins the end-to-end correctness path — the dedicated Atlas-SQL
+  // test (`query_with_groupby_in_list_against_atlas_sql`) covers the
+  // actual re-expansion failure mode against the real cloud endpoint.
+  // ---------------------------------------------------------------------------
+  it('user-shape — GROUP BY + 161 equals values returns rows (let-wrapped IN-list collapse)', async () => {
+    const values: string[] = [];
+    for (let i = 0; i < 161; i++) values.push(`groupby_in_user_test_v${i}`);
+    // Append a real seeded `acct_a` value so the query returns a
+    // non-empty grouped result (the seed has 3 `acct_a` orders).
+    values.push('acct_a');
+
+    const body = await loadQuery({
+      query: {
+        measures: ['orders.count'],
+        dimensions: ['orders.accountId'],
+        filters: [
+          {
+            member: 'orders.accountId',
+            operator: 'equals',
+            values,
+          },
+        ],
+      },
+    });
+
+    expect(body).toHaveProperty('data');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.dbType).toBe('mongosql');
+    // 3 `acct_a` orders group into a single row with count=3.
+    expect(body.data.length).toBe(1);
+    expect(body.data[0]?.['orders.accountId']).toBe('acct_a');
+    expect(Number(body.data[0]?.['orders.count'])).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------

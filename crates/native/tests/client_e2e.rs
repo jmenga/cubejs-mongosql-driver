@@ -921,3 +921,181 @@ async fn query_with_large_in_list_against_atlas_sql() {
     assert!(obj.contains_key("types"));
     client.close().await.expect("close");
 }
+
+/// User-reported failure shape: `SELECT <projection>, COUNT(*) FROM <coll>
+/// WHERE <id_col> IN (161 values) GROUP BY <projection>`.
+///
+/// Mongosql v1.8.5 emits the IN-list in the `$let`-wrapped shape for this
+/// query (the per-operand-`$let` diagram is documented in
+/// `crates/native/src/pipeline_rewrite.rs` under the "$let-wrapped IN-list
+/// shape" section; shape detection is also exercised by the
+/// `probe_atlas_sql_in_list_shape` probe in `critic_probe.rs`).
+/// Pre-fix, this shape passes the flat-`$or` flattener unchanged, the
+/// Atlas SQL proxy re-expands the inner `$or` server-side, and the
+/// resulting BSON exceeds the 100-deep nested-object limit (Error 15
+/// Overflow). Post-fix, `pipeline_rewrite::collapse_mongosql_in_list_let`
+/// replaces the entire `$let` with a `$cond`-wrapped `$in`, so the proxy
+/// has nothing to chain-ify.
+///
+/// This test asserts:
+///   (1) the rewritten pipeline contains at least one `$in` and no
+///       remaining $or array with more than a handful of operands
+///       (the rewriter fired on the IN-list slot);
+///   (2) the query SUCCEEDS against the real Atlas SQL endpoint
+///       (Error 15 Overflow was the pre-fix failure).
+#[tokio::test]
+#[ignore = "atlas-sql: requires ATLAS_SQL_URI + ATLAS_SQL_DB env vars"]
+async fn query_with_groupby_in_list_against_atlas_sql() {
+    use cubejs_mongosql_driver_native::schema::load_from_atlas_sql_with_columns;
+    use cubejs_mongosql_driver_native::translate::translate;
+
+    let (uri, db) = expect_atlas_sql_env();
+    let client = MongoSqlClient::new(atlas_sql_mode_config(uri.clone(), db.clone()));
+    client.test_connection(None).await.expect("test_connection");
+
+    // Discover a (collection, string-typed column) pair the same way
+    // `query_with_large_in_list_against_atlas_sql` does, so the test
+    // does not depend on a particular Atlas SQL endpoint having a
+    // hard-coded `calllogs` collection. The GROUP BY column is the
+    // same string-typed column (any string column will trigger the
+    // `$let`-wrapped IN-list emission when combined with GROUP BY).
+    let schema_v = client.tables_schema(None).await.expect("tables_schema");
+    let inner = schema_v
+        .as_object()
+        .and_then(|m| m.get(&db))
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("no collections in catalog under `{db}`"));
+    let (coll, field) = inner
+        .iter()
+        .find_map(|(coll_name, cols_value)| {
+            let cols = cols_value.as_array()?;
+            let f = cols.iter().find_map(|c| {
+                let obj = c.as_object()?;
+                let name = obj.get("name").and_then(|v| v.as_str())?;
+                let ty = obj.get("type").and_then(|v| v.as_str())?;
+                if name == "_id" {
+                    return None;
+                }
+                if ty == "string" || ty == "text" {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            })?;
+            Some((coll_name.clone(), f))
+        })
+        .unwrap_or_else(|| {
+            panic!("could not find a string-typed column in any collection under `{db}`");
+        });
+    eprintln!("[atlas-sql groupby IN-list test] using collection=`{coll}`, field=`{field}`");
+
+    // Build SQL: 161 synthetic IN values + GROUP BY on the same column.
+    // 161 matches the user-reported failure size exactly. The synthetic
+    // values almost certainly don't match real rows — the test asserts
+    // the query SUCCEEDS (not what it returns), since pre-fix this
+    // shape is what triggers the BSON-depth overflow on Atlas SQL.
+    let n = 161;
+    let mut sql =
+        format!("SELECT `{field}` AS grp, COUNT(*) AS n FROM `{coll}` WHERE `{field}` IN (");
+    for i in 0..n {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("'groupby_in_test_v{i}'"));
+    }
+    sql.push_str(&format!(") GROUP BY `{field}` LIMIT 30"));
+
+    // First inspect the rewritten pipeline shape to confirm the
+    // `collapse_mongosql_in_list_let` rewrite fired: the IN-list `$let`
+    // must be gone, replaced by a `$cond`-wrapped `$in`. Surviving
+    // `$or` arrays may exist (e.g. null-propagation wrappers in other
+    // parts of the query) but none may carry hundreds of operands.
+    let mongo = mongodb::Client::with_uri_str(&uri)
+        .await
+        .expect("mongo client");
+    let loaded = load_from_atlas_sql_with_columns(&mongo, &db)
+        .await
+        .expect("atlas-sql catalog loads");
+    let translation = translate(&sql, &loaded.catalog, &db).expect("translate");
+
+    fn count_keys(b: &bson::Bson, key: &str) -> usize {
+        match b {
+            bson::Bson::Document(d) => {
+                let here = d.iter().filter(|(k, _)| k.as_str() == key).count();
+                let child: usize = d.iter().map(|(_, v)| count_keys(v, key)).sum();
+                here + child
+            }
+            bson::Bson::Array(a) => a.iter().map(|v| count_keys(v, key)).sum(),
+            _ => 0,
+        }
+    }
+    fn max_or_array_len(b: &bson::Bson) -> usize {
+        match b {
+            bson::Bson::Document(d) => {
+                let here = if let Some(bson::Bson::Array(arr)) = d.get("$or") {
+                    arr.len()
+                } else {
+                    0
+                };
+                let child: usize = d
+                    .iter()
+                    .map(|(_, v)| max_or_array_len(v))
+                    .max()
+                    .unwrap_or(0);
+                here.max(child)
+            }
+            bson::Bson::Array(a) => a.iter().map(max_or_array_len).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    let in_total: usize = translation
+        .pipeline
+        .iter()
+        .map(|s| count_keys(&bson::Bson::Document(s.clone()), "$in"))
+        .sum();
+    let or_total: usize = translation
+        .pipeline
+        .iter()
+        .map(|s| count_keys(&bson::Bson::Document(s.clone()), "$or"))
+        .sum();
+    let max_or_len = translation
+        .pipeline
+        .iter()
+        .map(|s| max_or_array_len(&bson::Bson::Document(s.clone())))
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "[groupby IN-list rewritten] $in_count={in_total} $or_count={or_total} max_or_array_len={max_or_len}",
+    );
+    assert!(
+        in_total >= 1,
+        "rewriter must produce at least one $in (the IN-list collapse fired); got in_total={in_total}, or_total={or_total}",
+    );
+    // The IN-list `$or` originally had 161 operands. Post-collapse any
+    // remaining `$or` must be a small constant (null-propagation or
+    // similar) — double-digit operand counts would mean the IN-list
+    // collapse silently failed and we're back to the BSON-depth cliff.
+    assert!(
+        max_or_len < 10,
+        "post-rewrite pipeline still has a large `$or` (likely the IN-list collapse failed); max_or_array_len={max_or_len}",
+    );
+
+    // Now run end-to-end via the public client path. Pre-fix this
+    // would fail with `MONGOSQL_QUERY_FAILED` and an underlying
+    // `BSONObj exceeds maximum nested object depth` message.
+    let v = client
+        .query(sql, None)
+        .await
+        .expect("user-shape groupby IN-list query must not overflow BSON depth");
+    let obj = v.as_object().expect("object");
+    assert!(obj.contains_key("rows"));
+    assert!(obj.contains_key("types"));
+    eprintln!(
+        "[groupby IN-list e2e] returned {} rows",
+        obj.get("rows")
+            .and_then(|r| r.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+    );
+    client.close().await.expect("close");
+}
