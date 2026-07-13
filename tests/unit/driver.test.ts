@@ -564,6 +564,47 @@ describe('MongoSqlDriver — testConnection / lifecycle', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Issue #2 — the query paths must NOT require a prior testConnection() at the
+// driver layer. The native side lazily primes the schema catalog (shared
+// `init_once` guard — see crates/native/src/client.rs::ensure_schema_loaded
+// and the Rust regression tests); these unit tests pin the TS-layer contract
+// that MongoSqlDriver does not add its own "must testConnection() first" gate.
+// A future refactor that gated query()/downloadQueryResults()/tablesSchema()
+// on a prior testConnection() would reintroduce the crash-loop the refresh
+// worker hit, and must fail here.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — query paths do not require a prior testConnection() (Issue #2)', () => {
+  it('query() resolves and calls the native client without a prior testConnection()', async () => {
+    installMockNative({ query: mockQueryRows([{ users: { n: 4 } }]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>('SELECT COUNT(*) AS n FROM users');
+    expect(rows).toEqual([{ n: 4 }]);
+    // The native client was created and driven WITHOUT testConnection() first.
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+    expect(lastClient!.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('downloadQueryResults() resolves without a prior testConnection() (refresh-worker path)', async () => {
+    installMockNative({
+      query: mockQueryRows([{ orders: { amount: '1.00' } }], [{ name: 'amount', type: 'decimal' }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT amount FROM orders', []);
+    expect(result).toMatchObject({ rows: [{ amount: '1.00' }], types: [{ name: 'amount', type: 'decimal' }] });
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+  });
+
+  it('tablesSchema() resolves without a prior testConnection()', async () => {
+    const payload: TablesSchema = { analytics: { users: [{ name: '_id', type: 'string', attributes: [] }] } };
+    installMockNative({ tablesSchema: vi.fn().mockResolvedValue(payload) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await expect(d.tablesSchema()).resolves.toEqual(payload);
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+    expect(lastClient!.tablesSchema).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('MongoSqlDriver — tablesSchema', () => {
   it('returns the native shape unchanged', async () => {
     const payload: TablesSchema = {

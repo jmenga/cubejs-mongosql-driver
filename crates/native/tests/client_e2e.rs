@@ -110,6 +110,75 @@ async fn test_connection_succeeds_against_atlas_local() {
 
 #[tokio::test]
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn query_without_prior_test_connection_lazily_loads_schema() {
+    // Regression for the empty-catalog window (repo issue: query paths
+    // translate against an empty catalog when `test_connection()` hasn't
+    // primed the schema cache). Cube's pre-aggregation refresh worker can
+    // call `query()` / `downloadQueryResults()` on a driver instance that was
+    // never `test_connection()`'d. Pre-fix this translated against an empty
+    // catalog and failed with `MONGOSQL_TRANSLATE_FAILED` (algebrize:
+    // "cannot be resolved to any datasource"). Post-fix the query lazily
+    // primes the catalog and resolves normally.
+    let client = MongoSqlClient::new(collection_mode_config());
+    // NOTE: deliberately NO `client.test_connection(...)` here.
+    assert_eq!(client.refresh_spawn_count(), 0, "nothing loaded yet");
+
+    let v = client
+        .query("SELECT COUNT(*) AS n FROM users".to_string(), None)
+        .await
+        .expect("query must lazily load schema and succeed without test_connection");
+
+    let (rows, _types) = unwrap_query_result(&v);
+    assert!(!rows.is_empty(), "COUNT(*) should return one aggregate row");
+    // The lazy load ran exactly once via the shared init_once guard.
+    assert_eq!(
+        client.refresh_spawn_count(),
+        1,
+        "query() must prime the schema via the shared init_once load",
+    );
+
+    // A subsequent test_connection() must NOT re-load / re-spawn.
+    client
+        .test_connection(None)
+        .await
+        .expect("test_connection after a lazy-primed query");
+    assert_eq!(
+        client.refresh_spawn_count(),
+        1,
+        "test_connection after a lazy load must not spawn a second refresh task",
+    );
+
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn tables_schema_without_prior_test_connection_lazily_loads_schema() {
+    // Companion to the query lazy-load test for the introspection path
+    // (Cube's incremental-schema loading renders getSchemas /
+    // getTablesForSpecificSchemas / getColumnsForSpecificTables from this).
+    // Pre-fix, calling this before `test_connection()` returned `{<db>: {}}`
+    // (an empty snapshot) so Cube saw no tables.
+    let client = MongoSqlClient::new(collection_mode_config());
+    // NOTE: deliberately NO `client.test_connection(...)` here.
+    let v = client
+        .tables_schema(None)
+        .await
+        .expect("tables_schema must lazily load without test_connection");
+    let db = v
+        .as_object()
+        .and_then(|top| top.get(TEST_DB))
+        .and_then(|v| v.as_object())
+        .expect("configured db key present");
+    assert!(
+        db.contains_key("users") && db.contains_key("orders"),
+        "lazy load must surface seeded collections, got: {db:?}",
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn query_count_returns_at_least_one_row() {
     let client = MongoSqlClient::new(collection_mode_config());
     client.test_connection(None).await.expect("test_connection");
