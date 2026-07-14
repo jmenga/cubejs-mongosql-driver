@@ -616,10 +616,22 @@ impl MongoSqlClient {
             let config = config.clone();
             async move {
                 let LoadedSchema { catalog, columns } = load_for_refresh(&client, &config).await?;
+                // Never clobber a good catalog with an empty reload. An empty
+                // result is almost always transient (the cluster restarting,
+                // `__sql_schemas` briefly unreadable) rather than a real "all
+                // collections dropped" event; applying it would leave every
+                // query failing the algebrize step with "cannot be resolved to
+                // any datasource" until the next good tick. Signal "nothing to
+                // apply" so the refresh task retains the current schema. Also
+                // skip the column-map swap so `tables_schema()` stays
+                // consistent with the retained catalog.
+                if columns.is_empty() {
+                    return Ok(None);
+                }
                 // Swap the column map alongside the catalog so consumers of
                 // `tables_schema()` see consistent data.
                 *columns_mu.lock().await = columns;
-                Ok(catalog)
+                Ok(Some(catalog))
             }
         })
     }

@@ -1362,6 +1362,16 @@ impl SchemaRefreshHandle {
 /// and can leak the task for up to `refresh_sec` seconds. The `Notify` lets
 /// shutdown interrupt the sleep immediately.
 #[allow(dead_code)] // wired into MongoSqlClient by T09; exercised by tests today
+/// The loader returns:
+///
+/// * `Ok(Some(catalog))` — a fresh catalog; swap it into the cache.
+/// * `Ok(None)` — nothing to apply (e.g. the reload found an empty catalog);
+///   **retain** the current cache. This is what prevents a transient empty
+///   read (a cluster restarting, `__sql_schemas` briefly unreadable) from
+///   clobbering a good catalog — which would otherwise leave every query
+///   failing the algebrize step with "cannot be resolved to any datasource"
+///   until the next good tick.
+/// * `Err(_)` — load failed; retain the current cache and retry next tick.
 pub fn spawn_refresh_task<F, Fut>(
     cache: SchemaCache,
     refresh_sec: u64,
@@ -1369,7 +1379,7 @@ pub fn spawn_refresh_task<F, Fut>(
 ) -> SchemaRefreshHandle
 where
     F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<MongoSqlCatalog>> + Send,
+    Fut: std::future::Future<Output = Result<Option<MongoSqlCatalog>>> + Send,
 {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
@@ -1390,11 +1400,17 @@ where
             }
 
             match loader().await {
-                Ok(new_catalog) => {
+                Ok(Some(new_catalog)) => {
                     cache.write(Arc::new(new_catalog));
                     tracing::debug!(
                         target: "mongosql_driver::schema",
                         "schema cache refreshed",
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "mongosql_driver::schema",
+                        "schema refresh produced no catalog to apply; retaining current cache",
                     );
                 }
                 Err(e) => {
@@ -2072,7 +2088,7 @@ mod tests {
             // First call returns "users", second returns "orders" so we can
             // detect distinct refreshes by inspecting the cache content.
             let coll = if n == 1 { "users" } else { "orders" };
-            async move { Ok(tiny_catalog("mydb", coll)) }
+            async move { Ok(Some(tiny_catalog("mydb", coll))) }
         });
 
         // Yield so the spawned task gets a chance to enter its select loop
@@ -2128,7 +2144,7 @@ mod tests {
                 } else {
                     // Second refresh: succeed with a *different* catalog so
                     // we can prove the retry actually swapped.
-                    Ok(tiny_catalog("mydb", "orders"))
+                    Ok(Some(tiny_catalog("mydb", "orders")))
                 }
             }
         });
@@ -2157,6 +2173,59 @@ mod tests {
         handle.shutdown().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn refresh_none_retains_stale_cache() {
+        // A refresh that returns `Ok(None)` — the client wraps an
+        // empty/transient reload as "nothing to apply" — must NOT clobber a
+        // good catalog. Regression for the cube-e2e failure: with a 60s
+        // refresh, a transient empty read during the cluster's post-initdb
+        // restart wiped the catalog, and every subsequent query failed the
+        // algebrize step with "cannot be resolved to any datasource".
+        let cache = SchemaCache::new_empty();
+        cache.write(Arc::new(tiny_catalog("mydb", "users")));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_loader = Arc::clone(&calls);
+
+        let handle = spawn_refresh_task(cache.clone(), 10, move || {
+            let n = calls_loader.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n == 1 {
+                    // First refresh: empty/transient reload → keep current.
+                    Ok(None)
+                } else {
+                    // Second refresh: a real catalog swaps in.
+                    Ok(Some(tiny_catalog("mydb", "orders")))
+                }
+            }
+        });
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // First tick: `None`. Cache must remain at "users" (NOT wiped).
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            catalog_has_ns(&cache.read(), "mydb", "users"),
+            "Ok(None) refresh must retain the good catalog, not clobber it",
+        );
+
+        // Second tick: real catalog swaps in.
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(catalog_has_ns(&cache.read(), "mydb", "orders"));
+
+        handle.shutdown().await;
+    }
+
     #[tokio::test]
     async fn shutdown_stops_task_within_bounded_time() {
         // No paused clock here: real Tokio time so the shutdown bound is
@@ -2164,7 +2233,7 @@ mod tests {
         // task is guaranteed to be parked in `sleep` when we signal.
         let cache = SchemaCache::new_empty();
         let handle = spawn_refresh_task(cache.clone(), 3600, move || async move {
-            Ok(tiny_catalog("mydb", "users"))
+            Ok(Some(tiny_catalog("mydb", "users")))
         });
 
         // Give the task a moment to enter its select loop.
