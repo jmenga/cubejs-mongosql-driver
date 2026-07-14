@@ -110,6 +110,163 @@ async fn test_connection_succeeds_against_atlas_local() {
 
 #[tokio::test]
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn query_without_prior_test_connection_lazily_loads_schema() {
+    // Regression for the empty-catalog window (repo issue: query paths
+    // translate against an empty catalog when `test_connection()` hasn't
+    // primed the schema cache). Cube's pre-aggregation refresh worker can
+    // call `query()` / `downloadQueryResults()` on a driver instance that was
+    // never `test_connection()`'d. Pre-fix this translated against an empty
+    // catalog and failed with `MONGOSQL_TRANSLATE_FAILED` (algebrize:
+    // "cannot be resolved to any datasource"). Post-fix the query lazily
+    // primes the catalog and resolves normally.
+    let client = MongoSqlClient::new(collection_mode_config());
+    // NOTE: deliberately NO `client.test_connection(...)` here.
+    assert_eq!(client.refresh_spawn_count(), 0, "nothing loaded yet");
+
+    let v = client
+        .query("SELECT COUNT(*) AS n FROM users".to_string(), None)
+        .await
+        .expect("query must lazily load schema and succeed without test_connection");
+
+    let (rows, _types) = unwrap_query_result(&v);
+    assert!(!rows.is_empty(), "COUNT(*) should return one aggregate row");
+    // The lazy load ran exactly once via the shared init_once guard.
+    assert_eq!(
+        client.refresh_spawn_count(),
+        1,
+        "query() must prime the schema via the shared init_once load",
+    );
+
+    // A subsequent test_connection() must NOT re-load / re-spawn.
+    client
+        .test_connection(None)
+        .await
+        .expect("test_connection after a lazy-primed query");
+    assert_eq!(
+        client.refresh_spawn_count(),
+        1,
+        "test_connection after a lazy load must not spawn a second refresh task",
+    );
+
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn tables_schema_without_prior_test_connection_lazily_loads_schema() {
+    // Companion to the query lazy-load test for the introspection path
+    // (Cube's incremental-schema loading renders getSchemas /
+    // getTablesForSpecificSchemas / getColumnsForSpecificTables from this).
+    // Pre-fix, calling this before `test_connection()` returned `{<db>: {}}`
+    // (an empty snapshot) so Cube saw no tables.
+    let client = MongoSqlClient::new(collection_mode_config());
+    // NOTE: deliberately NO `client.test_connection(...)` here.
+    let v = client
+        .tables_schema(None)
+        .await
+        .expect("tables_schema must lazily load without test_connection");
+    let db = v
+        .as_object()
+        .and_then(|top| top.get(TEST_DB))
+        .and_then(|v| v.as_object())
+        .expect("configured db key present");
+    assert!(
+        db.contains_key("users") && db.contains_key("orders"),
+        "lazy load must surface seeded collections, got: {db:?}",
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn query_self_heals_when_schema_seeded_after_first_load() {
+    // Self-heal regression: a driver whose FIRST schema load runs before the
+    // database is seeded must NOT cache the empty catalog forever. Before this
+    // fix, the first load locked an empty catalog (`init_once`) and only the
+    // 300s background refresh could recover it — so every query in between
+    // failed the mongosql algebrize step with "cannot be resolved to any
+    // datasource". This is the deeper form of issue #2, and it's exactly what
+    // the cube-e2e suite hit when Cube's driver primed the catalog before
+    // atlas-local finished seeding.
+    use bson::doc;
+    use mongodb::Client as MongoClient;
+
+    // A throwaway database so we control the seeding timing precisely.
+    let db_name = "selfheal_test";
+    let mongo = MongoClient::with_uri_str(&uri())
+        .await
+        .expect("mongo client");
+    mongo.database(db_name).drop().await.ok(); // clean slate
+
+    let mut cfg = collection_mode_config();
+    cfg.database = db_name.to_string();
+    let client = MongoSqlClient::new(cfg);
+
+    // (1) First query against the UNSEEDED db: `__sql_schemas` is absent, so
+    // the catalog loads empty. `schema_ready` must stay false so the next call
+    // retries rather than being stuck on the empty catalog.
+    let first = client
+        .query("SELECT name FROM widgets".to_string(), None)
+        .await;
+    assert!(
+        first.is_err(),
+        "query against an unseeded db should fail, not translate against an empty catalog silently"
+    );
+    assert!(
+        !client.schema_ready(),
+        "an empty first load must NOT mark the schema ready (must remain retryable)"
+    );
+
+    // (2) Seed `__sql_schemas` for `widgets` (matching the seed-schemas.js
+    // `{_id, schema: {version, jsonSchema}}` shape) + insert a matching doc.
+    mongo
+        .database(db_name)
+        .collection::<bson::Document>("__sql_schemas")
+        .insert_one(doc! {
+            "_id": "widgets",
+            "schema": {
+                "version": 1_i64,
+                "jsonSchema": {
+                    "bsonType": "object",
+                    "properties": {
+                        "_id":  { "bsonType": "objectId" },
+                        "name": { "bsonType": "string" },
+                    },
+                },
+            },
+        })
+        .await
+        .expect("seed __sql_schemas");
+    mongo
+        .database(db_name)
+        .collection::<bson::Document>("widgets")
+        .insert_one(doc! { "name": "w1" })
+        .await
+        .expect("seed widgets doc");
+
+    // (3) Second query: `ensure_schema_loaded` must RE-LOAD (schema_ready was
+    // never set) and now resolve `widgets`. This is the self-heal.
+    let second = client
+        .query("SELECT name FROM widgets".to_string(), None)
+        .await
+        .expect("self-heal: query must succeed once __sql_schemas is seeded");
+    let (rows, _types) = unwrap_query_result(&second);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected the one seeded widgets row: {rows:?}"
+    );
+    assert!(
+        client.schema_ready(),
+        "a non-empty load must mark the schema ready so later queries fast-path"
+    );
+
+    mongo.database(db_name).drop().await.ok();
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn query_count_returns_at_least_one_row() {
     let client = MongoSqlClient::new(collection_mode_config());
     client.test_connection(None).await.expect("test_connection");

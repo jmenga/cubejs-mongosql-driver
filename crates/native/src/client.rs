@@ -14,12 +14,21 @@
 //! test_connection().await → validate, connect, ping, load schema, spawn refresh
 //!   │
 //!   ▼
-//! query(sql).await        → translate (against cached catalog) + execute
-//! tables_schema().await   → render the cached column map as Cube's nested shape
+//! query(sql).await        → ensure schema loaded, translate + execute
+//! tables_schema().await   → ensure schema loaded, render column map
 //!   │
 //!   ▼
 //! close().await           → shut down refresh task; mongodb client drops via Arc
 //! ```
+//!
+//! `test_connection()` is the *conventional* priming step, but it is not a
+//! precondition: `query()`, `downloadQueryResults()` (via `query`), and
+//! `tables_schema()` all call [`MongoSqlClient::ensure_schema_loaded`], which
+//! shares the same `init_once`-guarded load. So a query issued on a client
+//! that was never `test_connection()`'d lazily primes the catalog rather than
+//! translating against an empty one (Cube's pre-aggregation refresh worker
+//! hits exactly this path). The only thing `test_connection()` adds on top is
+//! the bounded connectivity `ping`.
 //!
 //! ## DB-name asymmetry (file mode)
 //!
@@ -35,7 +44,7 @@
 //! when the source is file mode, so consumers see a single coherent database
 //! name regardless of how the schema was loaded.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,11 +91,24 @@ pub struct MongoSqlClient {
     /// Handle to the background refresh task; populated by `test_connection`,
     /// taken (and `shutdown().await`-ed) by `close`.
     refresh_handle: Mutex<Option<SchemaRefreshHandle>>,
-    /// Init-once guard for the schema-load + refresh-spawn stage of
-    /// [`Self::test_connection`]. Concurrent callers block on the first
-    /// caller's load; subsequent callers (after success) short-circuit.
-    /// On `Err` the OnceCell stays uninitialised so a retry can re-attempt.
+    /// Init-once guard for the background refresh-task **spawn**. The task is
+    /// spawned exactly once for the lifetime of the client (on the first
+    /// successful load, empty or not), so concurrent/repeated loads never
+    /// race-spawn a second task. NOTE: this no longer gates the schema *load*
+    /// — that is gated by [`Self::schema_ready`] + [`Self::load_lock`] so an
+    /// empty first load can be retried (see [`Self::ensure_schema_loaded`]).
     init_once: OnceCell<()>,
+    /// `true` once a **non-empty** schema has been loaded. Until then,
+    /// [`Self::ensure_schema_loaded`] re-attempts the load on every call so a
+    /// driver whose first load ran before its database was reachable/seeded
+    /// self-heals, instead of caching an empty catalog forever (only the
+    /// background refresh — default 300s — would otherwise recover it). This
+    /// is the deeper form of the issue-#2 lifecycle gap: a query issued while
+    /// the catalog is still empty must not permanently poison the cache.
+    schema_ready: AtomicBool,
+    /// Serializes concurrent schema-priming loads so a burst of first queries
+    /// doesn't stampede the loader; the load itself is idempotent.
+    load_lock: Mutex<()>,
     /// Total number of times the refresh task has been spawned for this
     /// client. Concurrent `test_connection()` calls must not race-spawn —
     /// after `test_connection` succeeds this is exactly 1, regardless of
@@ -124,6 +146,8 @@ impl MongoSqlClient {
             table_columns: Arc::new(Mutex::new(TableColumns::new())),
             refresh_handle: Mutex::new(None),
             init_once: OnceCell::new(),
+            schema_ready: AtomicBool::new(false),
+            load_lock: Mutex::new(()),
             refresh_spawn_count: AtomicUsize::new(0),
             close_token: CancelToken::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -136,6 +160,14 @@ impl MongoSqlClient {
     #[doc(hidden)]
     pub fn refresh_spawn_count(&self) -> usize {
         self.refresh_spawn_count.load(Ordering::SeqCst)
+    }
+
+    /// Test-observability hook: whether a non-empty schema has been loaded.
+    /// Stays `false` after a successful-but-empty load so the next call
+    /// retries (self-heal); flips to `true` once the catalog has tables.
+    #[doc(hidden)]
+    pub fn schema_ready(&self) -> bool {
+        self.schema_ready.load(Ordering::SeqCst)
     }
 
     /// Verify cluster connectivity and load initial schema, then spawn the
@@ -186,24 +218,74 @@ impl MongoSqlClient {
         }
 
         // Initial schema load + refresh spawn — guarded by `init_once` so
-        // concurrent callers do this exactly once. Subsequent callers (after
-        // success) short-circuit; if the first attempt fails the OnceCell
-        // stays empty so a retry by any caller can re-attempt the work.
-        // Without this guard, two concurrent callers would each spawn a
-        // refresh task and the second would orphan the first's handle.
+        // concurrent callers do this exactly once. Shared with the query /
+        // tables_schema paths (see [`Self::ensure_schema_loaded`]) so whoever
+        // reaches it first primes the cache and the rest short-circuit.
+        self.ensure_schema_loaded(&client)
+            .await
+            .map_err(napi::Error::from)?;
+        Ok(())
+    }
+
+    /// Ensure a **non-empty** schema catalog is loaded, and spawn the
+    /// background refresh task (exactly once) for this client.
+    ///
+    /// Shared by [`Self::do_test_connection`] and the query / tables_schema
+    /// paths. The query paths call this so a `query()` /
+    /// `downloadQueryResults()` / `tables_schema()` issued *before* any
+    /// successful `test_connection()` lazily primes the catalog instead of
+    /// translating against an empty one — the failure mode where mongosql's
+    /// algebrizer reports the referenced table/alias as "cannot be resolved to
+    /// any datasource" (issue #2). Cube's pre-aggregation refresh-worker path
+    /// can invoke `downloadQueryResults()` on a driver instance that was never
+    /// `test_connection()`'d, which is exactly this window.
+    ///
+    /// **Self-healing on empty.** A *successful but empty* load is deliberately
+    /// NOT treated as final: [`Self::schema_ready`] is only set once the load
+    /// yields at least one table, so the next call re-attempts. This matters
+    /// when the first load races the database becoming reachable/seeded (a
+    /// mongod that answers `ping` before its collections/`__sql_schemas` exist)
+    /// — otherwise the empty catalog would be cached until the 300s background
+    /// refresh, and every query in between would fail the algebrize step.
+    ///
+    /// Race-safe: [`Self::load_lock`] serializes concurrent primers (each
+    /// re-checks `schema_ready` under the lock, so the load runs at most once
+    /// per unseeded→seeded transition), and the refresh task is spawned exactly
+    /// once via `init_once`, regardless of whether that first load was empty.
+    async fn ensure_schema_loaded(&self, client: &Arc<mongodb::Client>) -> Result<()> {
+        // Fast path: a non-empty catalog is already loaded — no lock, no I/O.
+        if self.schema_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _guard = self.load_lock.lock().await;
+        // Re-check under the lock: a concurrent primer may have just populated
+        // the catalog while we waited.
+        if self.schema_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let LoadedSchema { catalog, columns } = self.load_schema(client.as_ref()).await?;
+        let non_empty = !columns.is_empty();
+        self.schema_cache.write(Arc::new(catalog));
+        *self.table_columns.lock().await = columns;
+
+        // Spawn the refresh task exactly once — even if this first load was
+        // empty — so the catalog also self-heals via the periodic refresh.
         self.init_once
             .get_or_try_init(|| async {
-                let LoadedSchema { catalog, columns } = self.load_schema(client.as_ref()).await?;
-                self.schema_cache.write(Arc::new(catalog));
-                *self.table_columns.lock().await = columns;
-
-                let handle = self.spawn_refresh(Arc::clone(&client));
+                let handle = self.spawn_refresh(Arc::clone(client));
                 self.refresh_spawn_count.fetch_add(1, Ordering::SeqCst);
                 *self.refresh_handle.lock().await = Some(handle);
                 Ok::<(), Error>(())
             })
-            .await
-            .map_err(napi::Error::from)?;
+            .await?;
+
+        // Only now mark the schema "ready" — and only if it actually has
+        // tables. An empty load leaves `schema_ready` false so the next call
+        // retries once the database is seeded.
+        if non_empty {
+            self.schema_ready.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -230,6 +312,16 @@ impl MongoSqlClient {
 
     async fn do_query(&self, sql: String) -> napi::Result<Value> {
         let client = self.ensure_client().await.map_err(napi::Error::from)?;
+        // Lazily prime the schema catalog if no prior `test_connection()` did.
+        // Cube's pre-agg refresh-worker path can call `query()` /
+        // `downloadQueryResults()` on a driver instance that was never
+        // `test_connection()`'d; without this the translate below runs against
+        // an empty catalog and mongosql reports a misleading "cannot be
+        // resolved to any datasource" algebrize error. Shares the `init_once`
+        // guard so it's idempotent and races are handled.
+        self.ensure_schema_loaded(&client)
+            .await
+            .map_err(napi::Error::from)?;
         let catalog = self.schema_cache.read();
         let default_db = self.default_db_for_translate();
 
@@ -293,6 +385,16 @@ impl MongoSqlClient {
     }
 
     async fn do_tables_schema(&self) -> napi::Result<Value> {
+        // Lazily prime the schema catalog if no prior `test_connection()` did,
+        // so Cube's incremental-schema introspection (getSchemas /
+        // getTablesForSpecificSchemas / getColumnsForSpecificTables, all of
+        // which render from this snapshot) sees the real catalog instead of an
+        // empty one. Shares the `init_once` guard with `test_connection` and
+        // `query`. For file mode this reads the YAML with no network I/O.
+        let client = self.ensure_client().await.map_err(napi::Error::from)?;
+        self.ensure_schema_loaded(&client)
+            .await
+            .map_err(napi::Error::from)?;
         let columns = self.table_columns.lock().await.clone();
         let target_db = self.config.database.clone();
 
@@ -514,10 +616,22 @@ impl MongoSqlClient {
             let config = config.clone();
             async move {
                 let LoadedSchema { catalog, columns } = load_for_refresh(&client, &config).await?;
+                // Never clobber a good catalog with an empty reload. An empty
+                // result is almost always transient (the cluster restarting,
+                // `__sql_schemas` briefly unreadable) rather than a real "all
+                // collections dropped" event; applying it would leave every
+                // query failing the algebrize step with "cannot be resolved to
+                // any datasource" until the next good tick. Signal "nothing to
+                // apply" so the refresh task retains the current schema. Also
+                // skip the column-map swap so `tables_schema()` stays
+                // consistent with the retained catalog.
+                if columns.is_empty() {
+                    return Ok(None);
+                }
                 // Swap the column map alongside the catalog so consumers of
                 // `tables_schema()` see consistent data.
                 *columns_mu.lock().await = columns;
-                Ok(catalog)
+                Ok(Some(catalog))
             }
         })
     }
@@ -608,6 +722,35 @@ mod tests {
         }
     }
 
+    /// File-mode config pointing at the YAML fixture. File mode loads the
+    /// catalog off disk with **no network I/O**, so it lets us exercise the
+    /// lazy-schema-load path (and the shared `init_once` guard) fully offline
+    /// — the schema is real, only query *execution* would need a live cluster.
+    /// The long refresh interval keeps the background task parked on its first
+    /// `sleep` so it never does I/O during the test.
+    fn file_mode_fixture_config() -> ClientConfig {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = crate_dir
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("integration")
+            .join("fixtures")
+            .join("mongo-schema.yaml");
+        ClientConfig {
+            uri: "mongodb://host/db".to_string(),
+            database: "mydb".to_string(),
+            schema_source: Some(SchemaSource {
+                kind: "file".to_string(),
+                path: Some(fixture.to_string_lossy().to_string()),
+            }),
+            schema_refresh_sec: Some(3600),
+            schema_fail_open: Some(false),
+            query_timeout_ms: Some(5_000),
+            max_rows: Some(1_000),
+        }
+    }
+
     #[test]
     fn constructor_stores_config_without_io() {
         let c = MongoSqlClient::new(fixture_config());
@@ -687,16 +830,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tables_schema_before_load_returns_empty_db_object() {
-        // Before any schema is loaded the column map is empty; the rendered
-        // `{<db>: {}}` shape must still parse — Cube's introspection code
-        // tolerates an empty schema, just not a missing one.
-        let c = MongoSqlClient::new(fixture_config());
-        let v = c.tables_schema(None).await.expect("tables_schema");
+    async fn tables_schema_lazily_loads_schema_when_test_connection_skipped() {
+        // Regression for the empty-catalog window: before this fix,
+        // `tables_schema()` rendered the (empty) column map without ever
+        // loading the schema, so a caller that skipped `test_connection()`
+        // saw `{<db>: {}}` — Cube's incremental-schema introspection then
+        // believed the database had no tables. Now `tables_schema()` shares
+        // the `init_once`-guarded load, so it lazily primes the catalog.
+        //
+        // File mode loads the YAML fixture with no network I/O, so we can
+        // assert the real tables appear WITHOUT a live cluster and WITHOUT
+        // ever calling `test_connection()`.
+        let c = MongoSqlClient::new(file_mode_fixture_config());
+        assert_eq!(c.refresh_spawn_count(), 0, "no load before first use");
+
+        let v = c
+            .tables_schema(None)
+            .await
+            .expect("tables_schema must lazily load the file-mode catalog");
         let obj = v.as_object().expect("top level is an object");
-        assert!(obj.contains_key("mydb"), "must expose configured db key");
-        let inner = obj.get("mydb").and_then(|v| v.as_object()).expect("db obj");
-        assert!(inner.is_empty(), "no tables loaded yet");
+        let inner = obj
+            .get("mydb")
+            .and_then(|v| v.as_object())
+            .expect("configured db key present");
+        // The fixture declares `users`, `accounts`, `orders`, ... — the lazy
+        // load must surface them instead of an empty map.
+        assert!(
+            inner.contains_key("orders") && inner.contains_key("users"),
+            "lazy load must expose the fixture's tables, got: {inner:?}",
+        );
+        // The shared load ran exactly once (catalog + refresh-task spawn).
+        assert_eq!(
+            c.refresh_spawn_count(),
+            1,
+            "tables_schema must reuse the init_once schema load",
+        );
+
+        c.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn query_lazily_loads_schema_before_translate_when_test_connection_skipped() {
+        // Core issue: `query()` / `downloadQueryResults()` translated against
+        // an empty catalog when `test_connection()` had not primed it, so
+        // mongosql's algebrizer failed with a misleading "cannot be resolved
+        // to any datasource" (`MONGOSQL_TRANSLATE_FAILED`). With the lazy load
+        // the catalog is populated from the file fixture first, so translate
+        // succeeds and the query proceeds to EXECUTE — which then fails on the
+        // unreachable cluster with `MONGOSQL_CONNECT_FAILED` (fast, bounded by
+        // the tiny serverSelectionTimeoutMS). Reaching the connect error is
+        // exactly the proof that translation no longer hit the empty catalog.
+        let mut cfg = file_mode_fixture_config();
+        cfg.uri = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=150".to_string();
+        let c = MongoSqlClient::new(cfg);
+        assert_eq!(c.refresh_spawn_count(), 0, "no load before first use");
+
+        let err = c
+            .query("SELECT account_id FROM orders".to_string(), None)
+            .await
+            .expect_err("query against the unreachable cluster must fail at execute");
+
+        // The lazy schema load ran (so translate had a real catalog).
+        assert_eq!(
+            c.refresh_spawn_count(),
+            1,
+            "query must lazily prime the schema via the shared init_once load",
+        );
+        // Post-fix the failure is a connectivity error, NOT a translate error
+        // against an empty catalog.
+        assert!(
+            !err.reason.starts_with("MONGOSQL_TRANSLATE_FAILED"),
+            "translate must succeed against the lazily-loaded catalog; got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.starts_with("MONGOSQL_CONNECT_FAILED"),
+            "expected a connect failure after successful translate, got: {}",
+            err.reason
+        );
+
+        c.close().await.expect("close");
     }
 
     #[tokio::test]

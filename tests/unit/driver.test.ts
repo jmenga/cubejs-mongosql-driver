@@ -9,7 +9,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { _resetNativeModuleForTests, _setNativeModuleForTests, type TablesSchema } from '../../src/native.js';
 import { MongoSqlDriver, MongoSqlQuery } from '../../src/index.js';
-import { _normalizeRowShapeForTests as normalizeRowShape } from '../../src/MongoSqlDriver.js';
+import {
+  _normalizeRowShapeForTests as normalizeRowShape,
+  _rewritePositionalGroupByForTests as rewritePositionalGroupBy,
+} from '../../src/MongoSqlDriver.js';
 import type { MongoSqlError } from '../../src/types.js';
 
 interface FakeClient {
@@ -455,6 +458,18 @@ describe('MongoSqlDriver — query() row flattening', () => {
     expect(sentSql).toBe("SELECT * FROM users WHERE name = 'O''Brien'");
   });
 
+  it('rewrites positional GROUP BY to aliases in the SQL sent to native', async () => {
+    const queryMock = mockQueryRows([]);
+    installMockNative({ query: queryMock });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await d.query(
+      'SELECT `orders`.status `orders__status`, count(*) `orders__count` FROM orders AS `orders` GROUP BY 1',
+    );
+    const sentSql = queryMock.mock.calls[0][0] as string;
+    expect(sentSql).toContain('GROUP BY `orders__status`');
+    expect(sentSql).not.toMatch(/GROUP BY 1\b/);
+  });
+
   it('accepts query() with no values argument (Issue 4)', async () => {
     installMockNative({ query: mockQueryRows([]) });
     const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
@@ -561,6 +576,47 @@ describe('MongoSqlDriver — testConnection / lifecycle', () => {
     await d.release();
     await d.release();
     expect(lastClient!.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #2 — the query paths must NOT require a prior testConnection() at the
+// driver layer. The native side lazily primes the schema catalog (shared
+// `init_once` guard — see crates/native/src/client.rs::ensure_schema_loaded
+// and the Rust regression tests); these unit tests pin the TS-layer contract
+// that MongoSqlDriver does not add its own "must testConnection() first" gate.
+// A future refactor that gated query()/downloadQueryResults()/tablesSchema()
+// on a prior testConnection() would reintroduce the crash-loop the refresh
+// worker hit, and must fail here.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — query paths do not require a prior testConnection() (Issue #2)', () => {
+  it('query() resolves and calls the native client without a prior testConnection()', async () => {
+    installMockNative({ query: mockQueryRows([{ users: { n: 4 } }]) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const rows = await d.query<Record<string, unknown>>('SELECT COUNT(*) AS n FROM users');
+    expect(rows).toEqual([{ n: 4 }]);
+    // The native client was created and driven WITHOUT testConnection() first.
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+    expect(lastClient!.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('downloadQueryResults() resolves without a prior testConnection() (refresh-worker path)', async () => {
+    installMockNative({
+      query: mockQueryRows([{ orders: { amount: '1.00' } }], [{ name: 'amount', type: 'decimal' }]),
+    });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    const result = await d.downloadQueryResults('SELECT amount FROM orders', []);
+    expect(result).toMatchObject({ rows: [{ amount: '1.00' }], types: [{ name: 'amount', type: 'decimal' }] });
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+  });
+
+  it('tablesSchema() resolves without a prior testConnection()', async () => {
+    const payload: TablesSchema = { analytics: { users: [{ name: '_id', type: 'string', attributes: [] }] } };
+    installMockNative({ tablesSchema: vi.fn().mockResolvedValue(payload) });
+    const d = new MongoSqlDriver({ uri: 'mongodb://h/db', database: 'analytics' });
+    await expect(d.tablesSchema()).resolves.toEqual(payload);
+    expect(lastClient!.testConnection).not.toHaveBeenCalled();
+    expect(lastClient!.tablesSchema).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1318,6 +1374,69 @@ describe('MongoSqlDriver — query() row-shape normalization', () => {
 // to branch on `ctx.dataSource`, and queries through both cubes asserting
 // distinct row counts.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Positional GROUP BY rewrite — mongosql does NOT support ordinal GROUP BY
+// (`GROUP BY 1` is the literal integer, and its algebrizer then intermittently
+// fails to resolve the FROM table). Cube's tesseract template path emits
+// positional GROUP BY for time-dimension/granularity queries; the driver
+// rewrites those to the SELECT projection aliases, which mongosql resolves
+// reliably. See `rewritePositionalGroupBy` in src/MongoSqlDriver.ts and the
+// Rust regression `crates/native/tests/translate_group_by.rs`.
+// ---------------------------------------------------------------------------
+describe('MongoSqlDriver — rewritePositionalGroupBy', () => {
+  it('rewrites single positional key to the projection alias', () => {
+    const sql =
+      'SELECT DATETRUNC(HOUR, `granular_events`.occurred_at) `granular_events__occurred_at_hour`, ' +
+      'count(`granular_events`.id) `granular_events__count` FROM granular_events AS `granular_events` ' +
+      'GROUP BY 1 ORDER BY 1 ASC LIMIT 10000';
+    expect(rewritePositionalGroupBy(sql)).toContain('GROUP BY `granular_events__occurred_at_hour` ');
+    // ORDER BY is left positional (mongosql accepts it) — only GROUP BY changes.
+    expect(rewritePositionalGroupBy(sql)).toContain('ORDER BY 1 ASC');
+  });
+
+  it('rewrites a multi-key positional GROUP BY', () => {
+    const sql =
+      'SELECT `revenue_events`.category `revenue_events__category`, ' +
+      'DATETRUNC(MONTH, `revenue_events`.occurred_at) `revenue_events__occurred_at_month`, ' +
+      'count(*) `revenue_events__count` FROM revenue_events AS `revenue_events` GROUP BY 1, 2';
+    expect(rewritePositionalGroupBy(sql)).toContain(
+      'GROUP BY `revenue_events__category`, `revenue_events__occurred_at_month`',
+    );
+  });
+
+  it('does NOT miscount commas inside function arguments', () => {
+    // DATETRUNC(WEEK, x, 'sunday') has commas that must not be read as extra
+    // projection items / positions.
+    const sql = "SELECT DATETRUNC(WEEK, `g`.occurred_at, 'sunday') `g__w`, count(*) `n` FROM g AS `g` GROUP BY 1, 2";
+    expect(rewritePositionalGroupBy(sql)).toContain('GROUP BY `g__w`, `n`');
+  });
+
+  it('leaves an already-expression/alias GROUP BY untouched', () => {
+    const sql = 'SELECT `o`.status `s` FROM orders AS `o` GROUP BY `o`.status';
+    expect(rewritePositionalGroupBy(sql)).toBe(sql);
+  });
+
+  it('leaves a query with no GROUP BY untouched', () => {
+    const sql = 'SELECT `o`.status `s` FROM orders AS `o` ORDER BY 1';
+    expect(rewritePositionalGroupBy(sql)).toBe(sql);
+  });
+
+  it('rewrites nested subquery and outer GROUP BY to their own scope aliases', () => {
+    const sql = 'SELECT `t`.a `t__a` FROM (SELECT `x`.a `a`, count(*) `c` FROM x AS `x` GROUP BY 1) AS `t` GROUP BY 1';
+    const out = rewritePositionalGroupBy(sql);
+    // Inner GROUP BY 1 -> the inner projection alias `a`.
+    expect(out).toContain('GROUP BY `a`)');
+    // Outer GROUP BY 1 -> the outer projection alias `t__a`.
+    expect(out.endsWith('GROUP BY `t__a`')).toBe(true);
+  });
+
+  it('does not touch positional GROUP BY when the projection has no backtick alias (conservative)', () => {
+    // Without a recoverable alias we must not fabricate one — leave as-is.
+    const sql = 'SELECT status FROM orders AS `o` GROUP BY 1';
+    expect(rewritePositionalGroupBy(sql)).toBe(sql);
+  });
+});
+
 describe('MongoSqlDriver — Gap 8 driverFactory(ctx) constructor-independence', () => {
   it('two drivers with distinct configs route to distinct native clients', async () => {
     installMockNative();

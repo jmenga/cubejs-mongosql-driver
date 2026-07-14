@@ -546,6 +546,21 @@ export class MongoSqlQuery extends BaseQuery {
       delete templates.statements.generated_time_series_with_cte_range_source;
     }
 
+    // mongosql has no `ILIKE` operator (`Error 2001: Unrecognized token
+    // ILIKE`). Cube's BaseFilter path already rewrites case-insensitive LIKE
+    // via the `likeIgnoreCase()` override below, but the tesseract template
+    // SQL path (used for member-expression / view filters) emits `ILIKE`
+    // directly through these templates, bypassing it. Rewrite to the same
+    // `LOWER(expr) LIKE LOWER(pattern)` form mongosql accepts.
+    const caseInsensitiveLike = 'LOWER({{ expr }}) {% if negated %}NOT {% endif %}LIKE LOWER({{ pattern }})';
+    const withTesseract = templates as { expressions?: Record<string, string>; tesseract?: Record<string, string> };
+    if (withTesseract.expressions?.ilike) {
+      withTesseract.expressions.ilike = caseInsensitiveLike;
+    }
+    if (withTesseract.tesseract?.ilike) {
+      withTesseract.tesseract.ilike = caseInsensitiveLike;
+    }
+
     return templates;
   }
 }

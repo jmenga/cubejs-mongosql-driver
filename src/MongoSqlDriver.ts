@@ -157,7 +157,8 @@ export class MongoSqlDriver extends BaseDriver {
     // We substitute the values into the SQL as quoted literals BEFORE
     // sending to mongosql — equivalent to what CubeJS's `BaseQuery.paramAllocator`
     // would emit when the dialect declares no param support.
-    const finalSql = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    const substituted = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    const finalSql = rewritePositionalGroupBy(substituted);
     if (projectionHasNameCollision(finalSql)) {
       throw translateFailed(
         'JOIN projection contains two or more qualified columns with the same name ' +
@@ -329,7 +330,8 @@ export class MongoSqlDriver extends BaseDriver {
     // so two translations of the same SQL produced different field
     // orders. Divergent column orders across partition rebuilds caused
     // Cube Store UNIONs to fail with `type_coercion ... Timestamp ... Int64`.
-    const finalSql = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    const substituted = values !== undefined && values.length > 0 ? substituteParameters(sql, values) : sql;
+    const finalSql = rewritePositionalGroupBy(substituted);
     if (projectionHasNameCollision(finalSql)) {
       throw translateFailed(
         'JOIN projection contains two or more qualified columns with the same name ' +
@@ -608,6 +610,230 @@ function projectionHasNameCollision(sql: string): boolean {
   }
   return false;
 }
+
+/**
+ * Rewrite positional `GROUP BY 1, 2, ...` clauses to reference the SELECT
+ * projection's column ALIASES of the same query scope.
+ *
+ * **Why.** mongosql does NOT support positional (ordinal) GROUP BY: its
+ * grammar's `GROUP BY` takes expressions (`CommaPlus<OptionallyAliasedExpr>`
+ * in `mongosql/src/parser/mongosql.lalrpop`), so `GROUP BY 1` is parsed as the
+ * literal integer `1`, not "the first select column". The algebrizer then
+ * intermittently fails to resolve the FROM table's datasource — the failure is
+ * HashMap-seed dependent, so it passes on some processes and fails on others
+ * (it surfaced only in CI). Reproduced deterministically against
+ * `mongosql::translate_sql` in `crates/native/tests/translate_concurrency.rs`:
+ * positional / raw-expression GROUP BY fail, GROUP BY by column ALIAS never
+ * does. Cube's dialect already emits aliases on its string-concat GROUP BY
+ * path (`MongoSqlQuery.groupByClause()`), but the newer tesseract template
+ * path (time-dimension / granularity queries, Cube >= 1.6.68) emits positional
+ * refs, which this rewrite repairs.
+ *
+ * **How.** Single scope-aware pass (tracks `` ` ``-quoted identifiers,
+ * `'`-strings, and parenthesis depth). For each query scope we record the
+ * trailing `` `alias` `` of every top-level projection item; when that scope's
+ * `GROUP BY` is a list made up ENTIRELY of positive integers, each integer `n`
+ * is replaced by the n-th projection alias.
+ *
+ * **Conservative.** A GROUP BY is left untouched unless (a) its whole key list
+ * is positional integers and (b) every referenced position maps to a known
+ * backtick alias in that scope. Non-positional GROUP BYs (already expressions
+ * or aliases) and anything ambiguous are passed through unchanged, so a query
+ * is never made *worse* than it was.
+ */
+function rewritePositionalGroupBy(sql: string): string {
+  interface Frame {
+    /** Parenthesis depth at which this scope's SELECT appeared. */
+    depth: number;
+    /** Trailing `` `alias` `` (unquoted) of each top-level projection item, in order. */
+    aliases: string[];
+    /** True while scanning between SELECT and its FROM (collecting the projection). */
+    collecting: boolean;
+    /** Buffer of the current projection item's text. */
+    itemBuf: string;
+  }
+
+  const stack: Frame[] = [];
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const n = sql.length;
+  let depth = 0;
+  let i = 0;
+
+  const top = (): Frame | undefined => stack[stack.length - 1];
+
+  const finishItem = (f: Frame): void => {
+    f.aliases.push(trailingBacktickAlias(f.itemBuf) ?? '');
+    f.itemBuf = '';
+  };
+  const feed = (s: string): void => {
+    const f = top();
+    if (f?.collecting) f.itemBuf += s;
+  };
+
+  while (i < n) {
+    const ch = sql[i];
+
+    // Backtick-quoted identifier — consume whole.
+    if (ch === '`') {
+      let j = i + 1;
+      while (j < n && sql[j] !== '`') j++;
+      feed(sql.slice(i, j + 1));
+      i = j + 1;
+      continue;
+    }
+    // Single-quoted string — consume whole (doubled '' is an escaped quote).
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      feed(sql.slice(i, j + 1));
+      i = j + 1;
+      continue;
+    }
+    if (ch === '(') {
+      depth++;
+      feed(ch);
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      depth--;
+      feed(ch);
+      // A closing paren ends any subquery scope opened at a deeper level.
+      while (stack.length && (top() as Frame).depth > depth) stack.pop();
+      i++;
+      continue;
+    }
+    if (ch === ',') {
+      const f = top();
+      if (f?.collecting && depth === f.depth) finishItem(f);
+      else feed(ch);
+      i++;
+      continue;
+    }
+    // Word (keyword or identifier).
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9_]/.test(sql[j])) j++;
+      const word = sql.slice(i, j);
+      const upper = word.toUpperCase();
+      const f = top();
+
+      if (upper === 'SELECT') {
+        feed(word);
+        stack.push({ depth, aliases: [], collecting: true, itemBuf: '' });
+        i = j;
+        continue;
+      }
+      if (upper === 'FROM' && f?.collecting && depth === f.depth) {
+        finishItem(f);
+        f.collecting = false;
+        i = j;
+        continue;
+      }
+      if (upper === 'GROUP') {
+        // Look for `BY` next.
+        let k = j;
+        while (k < n && /\s/.test(sql[k])) k++;
+        const by = sql.slice(k, k + 2).toUpperCase();
+        const byBoundary = !/[A-Za-z0-9_]/.test(sql[k + 2] ?? ' ');
+        if (by === 'BY' && byBoundary && f && !f.collecting && depth === f.depth) {
+          let m = k + 2;
+          while (m < n && /\s/.test(sql[m])) m++;
+          const list = parsePositionalGroupByList(sql, m, depth);
+          if (list) {
+            const mapped = list.positions.map((p) => f.aliases[p - 1]);
+            if (mapped.every((a) => a && a.length > 0)) {
+              edits.push({ start: m, end: list.end, text: mapped.map((a) => `\`${a}\``).join(', ') });
+            }
+          }
+          i = k + 2;
+          continue;
+        }
+        feed(word);
+        i = j;
+        continue;
+      }
+      feed(word);
+      i = j;
+      continue;
+    }
+
+    feed(ch);
+    i++;
+  }
+
+  if (edits.length === 0) return sql;
+  edits.sort((a, b) => b.start - a.start);
+  let out = sql;
+  for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  return out;
+}
+
+/**
+ * If `item` ends with a `` `backtick-quoted` `` identifier (Cube aliases every
+ * projection as `<expr> \`alias\``), return the unquoted alias; else null.
+ */
+function trailingBacktickAlias(item: string): string | null {
+  const trimmed = item.trimEnd();
+  if (!trimmed.endsWith('`')) return null;
+  const open = trimmed.lastIndexOf('`', trimmed.length - 2);
+  if (open < 0) return null;
+  const alias = trimmed.slice(open + 1, trimmed.length - 1);
+  return alias.length ? alias : null;
+}
+
+/**
+ * Parse a GROUP BY key list starting at `start` that is made up ENTIRELY of
+ * positive integer ordinals (`1, 2, 3`) at parenthesis depth `depth`. Returns
+ * the positions and the index just past the last integer, or null if the list
+ * is not purely positional (leaving expression/alias GROUP BYs untouched).
+ */
+function parsePositionalGroupByList(
+  sql: string,
+  start: number,
+  depth: number,
+): { positions: number[]; end: number } | null {
+  const positions: number[] = [];
+  let i = start;
+  const n = sql.length;
+  let localDepth = depth;
+  for (;;) {
+    while (i < n && /\s/.test(sql[i])) i++;
+    // Read an integer.
+    let j = i;
+    while (j < n && sql[j] >= '0' && sql[j] <= '9') j++;
+    if (j === i) return null; // not an integer → not a positional list
+    positions.push(Number.parseInt(sql.slice(i, j), 10));
+    const lastEnd = j;
+    // Skip whitespace; expect a comma (more keys) or end-of-clause.
+    let k = j;
+    while (k < n && /\s/.test(sql[k])) k++;
+    if (k >= n) return { positions, end: lastEnd };
+    const c = sql[k];
+    if (c === ',' && localDepth === depth) {
+      i = k + 1;
+      continue;
+    }
+    // Anything else (ORDER, LIMIT, HAVING, ), etc.) ends the list.
+    if (c === '(') localDepth++;
+    if (c === ')') localDepth--;
+    return { positions, end: lastEnd };
+  }
+}
+
+/**
+ * Test-only export for `rewritePositionalGroupBy`.
+ */
+export const _rewritePositionalGroupByForTests = rewritePositionalGroupBy;
 
 /**
  * Substitute `?` placeholders in `sql` with literal values from `values`.

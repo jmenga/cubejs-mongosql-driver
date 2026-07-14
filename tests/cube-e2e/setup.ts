@@ -101,7 +101,7 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
  * the schema registrations) so re-running is safe and a no-op on
  * fresh volumes.
  */
-function reseed(): void {
+async function reseed(): Promise<void> {
   // Idempotent re-seed of all four initdb scripts. atlas-local only runs
   // these once on volume init; we re-run them on every setup so a
   // pre-existing volume picks up newly-added rows (e.g. the secondary
@@ -113,31 +113,60 @@ function reseed(): void {
     '/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js',
   ];
   for (const script of scripts) {
-    const r = spawnSync(
-      'docker',
-      [
-        'compose',
-        '-f',
-        COMPOSE_FILE,
-        'exec',
-        '-T',
-        'atlas-local',
-        'mongosh',
-        '--quiet',
-        '-u',
-        'admin',
-        '-p',
-        'admin',
-        '--authenticationDatabase',
-        'admin',
-        '--file',
-        script,
-      ],
-      { stdio: 'inherit', cwd: REPO_ROOT },
-    );
-    if (r.status !== 0) {
+    await runSeedScript(script);
+  }
+}
+
+/**
+ * Run one seed script via `mongosh`, retrying on transient connection
+ * failures. atlas-local restarts its mongod shortly after its own initdb
+ * completes (to finalize the single-node replica-set config with the
+ * container hostname). That restart can land between `waitForSqlSchemas`
+ * returning and these sequential reseed execs, surfacing as
+ * `MongoNetworkError: connect ECONNREFUSED` / `not master` mid-reseed and
+ * failing the whole run before any test executes. The scripts are idempotent,
+ * so retrying is safe; genuine (non-connection) script errors are surfaced
+ * immediately rather than retried. Mirrors `tests/integration/setup.ts`.
+ */
+async function runSeedScript(script: string, maxAttempts = 8): Promise<void> {
+  const args = [
+    'compose',
+    '-f',
+    COMPOSE_FILE,
+    'exec',
+    '-T',
+    'atlas-local',
+    'mongosh',
+    '--quiet',
+    '-u',
+    'admin',
+    '-p',
+    'admin',
+    '--authenticationDatabase',
+    'admin',
+    '--file',
+    script,
+  ];
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const r = spawnSync('docker', args, { encoding: 'utf-8', cwd: REPO_ROOT });
+    if (r.status === 0) {
+      if (r.stdout?.trim()) console.log(r.stdout.trim());
+      return;
+    }
+    const detail = `${r.stdout ?? ''}${r.stderr ?? ''}${r.error?.message ?? ''}`;
+    const transient =
+      /ECONNREFUSED|connection refused|MongoNetworkError|connect failed|not master|no primary|ReplicaSetNoPrimary|socket exception|network error|Topology is closed/i.test(
+        detail,
+      );
+    if (!transient || attempt === maxAttempts) {
+      if (detail.trim()) console.error(detail.trim());
       throw new Error(`reseed: ${script} exited ${r.status}`);
     }
+    console.log(
+      `cube-e2e setup: ${script} attempt ${attempt}/${maxAttempts} hit a transient connection error ` +
+        '(atlas-local mongod restart window); retrying in 2s...',
+    );
+    await sleep(2000);
   }
 }
 
@@ -253,7 +282,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   // this is a no-op (initdb has already applied them and the inserts
   // guard on `countDocuments() === 0`).
   console.log('cube-e2e setup: re-applying seed scripts (idempotent)...');
-  reseed();
+  await reseed();
   await waitForSchemaIncludesSeededCollections();
   console.log('cube-e2e setup: revenue_events + configs schema rows confirmed');
 

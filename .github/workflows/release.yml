@@ -103,9 +103,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Version comes from the `packageManager` field in package.json
+      # (single source of truth — passing `version` too makes
+      # pnpm/action-setup@v5 fail with "Multiple versions of pnpm specified").
       - uses: pnpm/action-setup@v5
-        with:
-          version: 10
 
       - uses: actions/setup-node@v6
         with:
@@ -173,9 +174,10 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # Version comes from the `packageManager` field in package.json
+      # (single source of truth — passing `version` too makes
+      # pnpm/action-setup@v5 fail with "Multiple versions of pnpm specified").
       - uses: pnpm/action-setup@v5
-        with:
-          version: 10
 
       - uses: actions/setup-node@v6
         with:

@@ -77,7 +77,7 @@ async function waitForSqlSchemas(maxSeconds = 60): Promise<void> {
  * Issue #2 if the user's existing `atlas-data` volume predates the seed
  * change.
  */
-function reseed(): void {
+async function reseed(): Promise<void> {
   // All four initdb scripts. atlas-local runs these on first volume
   // init; we re-run each setup so pre-existing volumes pick up newly
   // added collections (e.g. the `mongosql_test_secondary` Gap 8
@@ -89,10 +89,45 @@ function reseed(): void {
     '/docker-entrypoint-initdb.d/04-seed-secondary-schemas.js',
   ];
   for (const script of scripts) {
-    execSync(
-      `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --file ${script}`,
-      { stdio: 'inherit' },
-    );
+    await runSeedScript(script);
+  }
+}
+
+/**
+ * Run one seed script via `mongosh`, retrying on transient connection
+ * failures. The atlas-local image restarts its mongod shortly after its own
+ * initdb completes (to finalize the single-node replica-set config with the
+ * container hostname). That restart can land between `waitForSqlSchemas`
+ * returning and these sequential reseed execs, surfacing as
+ * `MongoNetworkError: connect ECONNREFUSED` / `not master` mid-reseed and
+ * failing the whole run before any test executes. The scripts are idempotent,
+ * so retrying is safe; genuine (non-connection) script errors are surfaced
+ * immediately rather than retried.
+ */
+async function runSeedScript(script: string, maxAttempts = 8): Promise<void> {
+  const cmd = `docker compose -f ${COMPOSE_FILE} exec -T atlas-local mongosh --quiet -u admin -p admin --authenticationDatabase admin --file ${script}`;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const out = execSync(cmd, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+      if (out.trim()) console.log(out.trim());
+      return;
+    } catch (err) {
+      const e = err as { stdout?: string; stderr?: string; message?: string };
+      const detail = `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`;
+      const transient =
+        /ECONNREFUSED|connection refused|MongoNetworkError|connect failed|not master|no primary|ReplicaSetNoPrimary|socket exception|network error|Topology is closed/i.test(
+          detail,
+        );
+      if (!transient || attempt === maxAttempts) {
+        if (detail.trim()) console.error(detail.trim());
+        throw err;
+      }
+      console.log(
+        `integration setup: ${script} attempt ${attempt}/${maxAttempts} hit a transient connection error ` +
+          '(atlas-local mongod restart window); retrying in 2s...',
+      );
+      await sleep(2000);
+    }
   }
 }
 
@@ -114,7 +149,7 @@ export default async function setup() {
   // collections (revenue_events). On a fresh volume the initdb path
   // already ran them; this is a no-op there.
   console.log('integration setup: re-applying seed scripts (idempotent)...');
-  reseed();
+  await reseed();
 
   return async () => {
     if (teardownMode === 'keep') {
