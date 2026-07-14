@@ -179,6 +179,94 @@ async fn tables_schema_without_prior_test_connection_lazily_loads_schema() {
 
 #[tokio::test]
 #[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
+async fn query_self_heals_when_schema_seeded_after_first_load() {
+    // Self-heal regression: a driver whose FIRST schema load runs before the
+    // database is seeded must NOT cache the empty catalog forever. Before this
+    // fix, the first load locked an empty catalog (`init_once`) and only the
+    // 300s background refresh could recover it — so every query in between
+    // failed the mongosql algebrize step with "cannot be resolved to any
+    // datasource". This is the deeper form of issue #2, and it's exactly what
+    // the cube-e2e suite hit when Cube's driver primed the catalog before
+    // atlas-local finished seeding.
+    use bson::doc;
+    use mongodb::Client as MongoClient;
+
+    // A throwaway database so we control the seeding timing precisely.
+    let db_name = "selfheal_test";
+    let mongo = MongoClient::with_uri_str(&uri())
+        .await
+        .expect("mongo client");
+    mongo.database(db_name).drop().await.ok(); // clean slate
+
+    let mut cfg = collection_mode_config();
+    cfg.database = db_name.to_string();
+    let client = MongoSqlClient::new(cfg);
+
+    // (1) First query against the UNSEEDED db: `__sql_schemas` is absent, so
+    // the catalog loads empty. `schema_ready` must stay false so the next call
+    // retries rather than being stuck on the empty catalog.
+    let first = client
+        .query("SELECT name FROM widgets".to_string(), None)
+        .await;
+    assert!(
+        first.is_err(),
+        "query against an unseeded db should fail, not translate against an empty catalog silently"
+    );
+    assert!(
+        !client.schema_ready(),
+        "an empty first load must NOT mark the schema ready (must remain retryable)"
+    );
+
+    // (2) Seed `__sql_schemas` for `widgets` (matching the seed-schemas.js
+    // `{_id, schema: {version, jsonSchema}}` shape) + insert a matching doc.
+    mongo
+        .database(db_name)
+        .collection::<bson::Document>("__sql_schemas")
+        .insert_one(doc! {
+            "_id": "widgets",
+            "schema": {
+                "version": 1_i64,
+                "jsonSchema": {
+                    "bsonType": "object",
+                    "properties": {
+                        "_id":  { "bsonType": "objectId" },
+                        "name": { "bsonType": "string" },
+                    },
+                },
+            },
+        })
+        .await
+        .expect("seed __sql_schemas");
+    mongo
+        .database(db_name)
+        .collection::<bson::Document>("widgets")
+        .insert_one(doc! { "name": "w1" })
+        .await
+        .expect("seed widgets doc");
+
+    // (3) Second query: `ensure_schema_loaded` must RE-LOAD (schema_ready was
+    // never set) and now resolve `widgets`. This is the self-heal.
+    let second = client
+        .query("SELECT name FROM widgets".to_string(), None)
+        .await
+        .expect("self-heal: query must succeed once __sql_schemas is seeded");
+    let (rows, _types) = unwrap_query_result(&second);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected the one seeded widgets row: {rows:?}"
+    );
+    assert!(
+        client.schema_ready(),
+        "a non-empty load must mark the schema ready so later queries fast-path"
+    );
+
+    mongo.database(db_name).drop().await.ok();
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires docker-compose; run with --ignored after `make e2e:up`"]
 async fn query_count_returns_at_least_one_row() {
     let client = MongoSqlClient::new(collection_mode_config());
     client.test_connection(None).await.expect("test_connection");

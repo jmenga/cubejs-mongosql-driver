@@ -44,7 +44,7 @@
 //! when the source is file mode, so consumers see a single coherent database
 //! name regardless of how the schema was loaded.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,11 +91,24 @@ pub struct MongoSqlClient {
     /// Handle to the background refresh task; populated by `test_connection`,
     /// taken (and `shutdown().await`-ed) by `close`.
     refresh_handle: Mutex<Option<SchemaRefreshHandle>>,
-    /// Init-once guard for the schema-load + refresh-spawn stage of
-    /// [`Self::test_connection`]. Concurrent callers block on the first
-    /// caller's load; subsequent callers (after success) short-circuit.
-    /// On `Err` the OnceCell stays uninitialised so a retry can re-attempt.
+    /// Init-once guard for the background refresh-task **spawn**. The task is
+    /// spawned exactly once for the lifetime of the client (on the first
+    /// successful load, empty or not), so concurrent/repeated loads never
+    /// race-spawn a second task. NOTE: this no longer gates the schema *load*
+    /// — that is gated by [`Self::schema_ready`] + [`Self::load_lock`] so an
+    /// empty first load can be retried (see [`Self::ensure_schema_loaded`]).
     init_once: OnceCell<()>,
+    /// `true` once a **non-empty** schema has been loaded. Until then,
+    /// [`Self::ensure_schema_loaded`] re-attempts the load on every call so a
+    /// driver whose first load ran before its database was reachable/seeded
+    /// self-heals, instead of caching an empty catalog forever (only the
+    /// background refresh — default 300s — would otherwise recover it). This
+    /// is the deeper form of the issue-#2 lifecycle gap: a query issued while
+    /// the catalog is still empty must not permanently poison the cache.
+    schema_ready: AtomicBool,
+    /// Serializes concurrent schema-priming loads so a burst of first queries
+    /// doesn't stampede the loader; the load itself is idempotent.
+    load_lock: Mutex<()>,
     /// Total number of times the refresh task has been spawned for this
     /// client. Concurrent `test_connection()` calls must not race-spawn —
     /// after `test_connection` succeeds this is exactly 1, regardless of
@@ -133,6 +146,8 @@ impl MongoSqlClient {
             table_columns: Arc::new(Mutex::new(TableColumns::new())),
             refresh_handle: Mutex::new(None),
             init_once: OnceCell::new(),
+            schema_ready: AtomicBool::new(false),
+            load_lock: Mutex::new(()),
             refresh_spawn_count: AtomicUsize::new(0),
             close_token: CancelToken::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -145,6 +160,14 @@ impl MongoSqlClient {
     #[doc(hidden)]
     pub fn refresh_spawn_count(&self) -> usize {
         self.refresh_spawn_count.load(Ordering::SeqCst)
+    }
+
+    /// Test-observability hook: whether a non-empty schema has been loaded.
+    /// Stays `false` after a successful-but-empty load so the next call
+    /// retries (self-heal); flips to `true` once the catalog has tables.
+    #[doc(hidden)]
+    pub fn schema_ready(&self) -> bool {
+        self.schema_ready.load(Ordering::SeqCst)
     }
 
     /// Verify cluster connectivity and load initial schema, then spawn the
@@ -204,8 +227,8 @@ impl MongoSqlClient {
         Ok(())
     }
 
-    /// Load the initial schema (catalog + column map) and spawn the background
-    /// refresh task **exactly once** for this client, guarded by `init_once`.
+    /// Ensure a **non-empty** schema catalog is loaded, and spawn the
+    /// background refresh task (exactly once) for this client.
     ///
     /// Shared by [`Self::do_test_connection`] and the query / tables_schema
     /// paths. The query paths call this so a `query()` /
@@ -213,31 +236,56 @@ impl MongoSqlClient {
     /// successful `test_connection()` lazily primes the catalog instead of
     /// translating against an empty one — the failure mode where mongosql's
     /// algebrizer reports the referenced table/alias as "cannot be resolved to
-    /// any datasource" (see repo issue: query paths translate against an empty
-    /// catalog when `test_connection()` hasn't primed the schema cache).
-    /// Cube's pre-aggregation refresh-worker path can invoke
-    /// `downloadQueryResults()` on a driver instance that was never
+    /// any datasource" (issue #2). Cube's pre-aggregation refresh-worker path
+    /// can invoke `downloadQueryResults()` on a driver instance that was never
     /// `test_connection()`'d, which is exactly this window.
     ///
-    /// Idempotent and race-safe: concurrent callers block on the first
-    /// caller's load; subsequent callers (after success) short-circuit. On
-    /// `Err` the `OnceCell` stays uninitialised so a retry by any caller can
-    /// re-attempt the work. Without the single-init guard, two concurrent
-    /// callers would each spawn a refresh task and the second would orphan the
-    /// first's handle.
+    /// **Self-healing on empty.** A *successful but empty* load is deliberately
+    /// NOT treated as final: [`Self::schema_ready`] is only set once the load
+    /// yields at least one table, so the next call re-attempts. This matters
+    /// when the first load races the database becoming reachable/seeded (a
+    /// mongod that answers `ping` before its collections/`__sql_schemas` exist)
+    /// — otherwise the empty catalog would be cached until the 300s background
+    /// refresh, and every query in between would fail the algebrize step.
+    ///
+    /// Race-safe: [`Self::load_lock`] serializes concurrent primers (each
+    /// re-checks `schema_ready` under the lock, so the load runs at most once
+    /// per unseeded→seeded transition), and the refresh task is spawned exactly
+    /// once via `init_once`, regardless of whether that first load was empty.
     async fn ensure_schema_loaded(&self, client: &Arc<mongodb::Client>) -> Result<()> {
+        // Fast path: a non-empty catalog is already loaded — no lock, no I/O.
+        if self.schema_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _guard = self.load_lock.lock().await;
+        // Re-check under the lock: a concurrent primer may have just populated
+        // the catalog while we waited.
+        if self.schema_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let LoadedSchema { catalog, columns } = self.load_schema(client.as_ref()).await?;
+        let non_empty = !columns.is_empty();
+        self.schema_cache.write(Arc::new(catalog));
+        *self.table_columns.lock().await = columns;
+
+        // Spawn the refresh task exactly once — even if this first load was
+        // empty — so the catalog also self-heals via the periodic refresh.
         self.init_once
             .get_or_try_init(|| async {
-                let LoadedSchema { catalog, columns } = self.load_schema(client.as_ref()).await?;
-                self.schema_cache.write(Arc::new(catalog));
-                *self.table_columns.lock().await = columns;
-
                 let handle = self.spawn_refresh(Arc::clone(client));
                 self.refresh_spawn_count.fetch_add(1, Ordering::SeqCst);
                 *self.refresh_handle.lock().await = Some(handle);
                 Ok::<(), Error>(())
             })
             .await?;
+
+        // Only now mark the schema "ready" — and only if it actually has
+        // tables. An empty load leaves `schema_ready` false so the next call
+        // retries once the database is seeded.
+        if non_empty {
+            self.schema_ready.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
