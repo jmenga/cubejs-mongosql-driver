@@ -53,7 +53,22 @@ jobs:
         run: pnpm typecheck
 
       - name: Rust tests
-        run: cargo test --release
+        # Run the pure-Rust lib unit tests, then compile-check (but do NOT
+        # run) the integration test binaries under tests/*.rs.
+        #
+        # Those integration binaries link the crate's napi registration code;
+        # on Linux a standalone ELF test binary resolves the napi symbols
+        # eagerly (`-z now`) and aborts at startup with
+        # `undefined symbol: napi_get_cb_info` — the napi symbols are provided
+        # by the host Node process at runtime, not present in a bare test
+        # executable. They are all `#[ignore]`-gated (require a live MongoDB
+        # via docker-compose) so they never run in this job anyway; the real
+        # end-to-end coverage of the native module runs through Node in the
+        # TS integration / cube-e2e steps below. `--no-run` still builds them
+        # so a compile break is caught here.
+        run: |
+          cargo test --release --lib
+          cargo test --release --no-run
 
       - name: TS unit tests
         run: pnpm test:unit
