@@ -228,33 +228,72 @@ jobs:
       # references them by name+version; if main publishes before the
       # sub-packages exist on the registry, downstream `npm install` fails to
       # resolve. `--provenance` requires Trusted Publishing OIDC (CI only).
+      #
+      # IDEMPOTENT: skip any package whose exact version is already on the
+      # registry. npm's client can publish a version successfully and STILL
+      # exit non-zero (e.g. a transient error triggers an internal retry that
+      # then gets `403 you cannot publish over the previously published
+      # versions`). Under `set -e` that used to abort the whole job AFTER the
+      # sub-packages were published but BEFORE the main package — leaving a
+      # half-published release that no re-run could finish (every retry died on
+      # the already-published sub-packages). Skipping already-published
+      # versions makes re-runs converge: they publish only what's missing.
       - name: Publish sub-packages
         shell: bash
         run: |
           set -euo pipefail
           for pkg in npm/*/; do
-            echo "::group::Publishing $pkg"
-            (cd "$pkg" && npm publish --provenance --access public)
+            dir="${pkg%/}"
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "::notice::$name@$ver already published — skipping"
+              continue
+            fi
+            echo "::group::Publishing $name@$ver"
+            (cd "$dir" && npm publish --provenance --access public)
             echo "::endgroup::"
           done
 
       - name: Publish main package
-        run: npm publish --provenance --access public
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "::notice::$name@$ver already published — skipping"
+          else
+            npm publish --provenance --access public
+          fi
 
       - name: Tag release + create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           VER="${{ needs.detect.outputs.version }}"
           TAG="v$VER"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
 
-          PREV_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
-          if [ -n "$PREV_TAG" ]; then
-            gh release create "$TAG" --title "$TAG" --generate-notes --notes-start-tag "$PREV_TAG"
+          # IDEMPOTENT: only create the tag / release if they don't exist yet,
+          # so a re-run that completes a half-published release doesn't fail
+          # here.
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::notice::tag $TAG already exists — skipping tag push"
           else
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git tag -a "$TAG" -m "$TAG"
+            git push origin "$TAG"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::GitHub release $TAG already exists — skipping"
+          else
+            PREV_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
+            if [ -n "$PREV_TAG" ]; then
+              gh release create "$TAG" --title "$TAG" --generate-notes --notes-start-tag "$PREV_TAG"
+            else
+              gh release create "$TAG" --title "$TAG" --generate-notes
+            fi
           fi
