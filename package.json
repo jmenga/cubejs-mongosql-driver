@@ -1,6 +1,6 @@
 {
   "name": "@effectuate/cubejs-mongosql-driver",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cube.js native data source driver for MongoDB via the MongoSQL translator (Rust + napi-rs). Replacement for the EOL'd BI Connector path.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
