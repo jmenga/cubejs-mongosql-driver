@@ -20,12 +20,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Version comes from the `packageManager` field in package.json
+      # (single source of truth — passing `version` here too makes
+      # pnpm/action-setup@v5 fail with "Multiple versions of pnpm specified").
+      # `packageManager` pins pnpm 9.x, which avoids pnpm 11's tightened
+      # ERR_PNPM_IGNORED_BUILDS that breaks napi-rs postinstall scripts even
+      # when declared in pnpm.onlyBuiltDependencies.
       - uses: pnpm/action-setup@v5
-        with:
-          # Pin to pnpm 10 — matches release.yml. pnpm 11 tightened
-          # ERR_PNPM_IGNORED_BUILDS in a way that breaks napi-rs
-          # postinstall scripts even when declared in pnpm.onlyBuiltDependencies.
-          version: 10
 
       - uses: actions/setup-node@v6
         with:
