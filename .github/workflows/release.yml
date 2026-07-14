@@ -217,12 +217,42 @@ jobs:
           done
           ls -laR npm
 
-      # `napi prepublish` syncs versions + adds README references to every
-      # `npm/<short>/package.json` so they line up with the root package.
-      - name: Prepare per-platform sub-packages
-        run: pnpm exec napi prepublish -t npm --skip-gh-release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Sync versions across the root package + every per-platform sub-package.
+      #
+      # We do NOT use `napi prepublish` here: despite its name it also runs
+      # `npm publish` for each sub-package, and it is NOT idempotent — once the
+      # sub-packages exist on the registry (e.g. a prior release that
+      # half-published), it aborts with `403 you cannot publish over the
+      # previously published versions`, blocking every recovery re-run before
+      # the main package can publish. The sub-package stubs already carry the
+      # full manifest (name/os/cpu/main/files/...) and the `.node` was staged
+      # above, so all that's actually needed is to line up the version numbers;
+      # the idempotent `npm publish` steps below then do the publishing.
+      - name: Sync sub-package + optionalDependency versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const ver = require("./package.json").version;
+            // Bump each per-platform sub-package to the release version.
+            for (const dir of fs.readdirSync("npm")) {
+              const f = path.join("npm", dir, "package.json");
+              if (!fs.existsSync(f)) continue;
+              const p = JSON.parse(fs.readFileSync(f, "utf8"));
+              p.version = ver;
+              fs.writeFileSync(f, JSON.stringify(p, null, 2) + "\n");
+            }
+            // Point the root optionalDependencies at the release version so
+            // the published main package resolves the matching binaries.
+            const root = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            for (const k of Object.keys(root.optionalDependencies || {})) {
+              root.optionalDependencies[k] = ver;
+            }
+            fs.writeFileSync("package.json", JSON.stringify(root, null, 2) + "\n");
+            console.log("synced all packages to " + ver);
+          '
 
       # Publish sub-packages FIRST. The main package's optionalDependencies
       # references them by name+version; if main publishes before the
